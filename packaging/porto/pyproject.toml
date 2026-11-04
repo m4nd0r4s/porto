@@ -7,6 +7,9 @@ name = "porto"
 description = "An async runtime for Python, written in Rust"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
+# Symlinks to the root license files: maturin rejects license-files paths with "..", but it
+# follows symlinks and copies the content into the wheel's dist-info/licenses and the sdist.
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 keywords = ["async", "runtime", "asyncio", "structured-concurrency", "rust"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
