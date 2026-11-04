@@ -2,7 +2,7 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:46cd31e7 -->
 ## Beads Issue Tracker
 
 This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
@@ -46,6 +46,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
    # Team-maintainer opt-in only, unless current instructions forbid it:
    git pull --rebase
+   bd dolt push
    git push
    git status
    ```
@@ -58,20 +59,57 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 
 
-## Build & Test
+## What this is
 
-_Add your build and test commands here_
+**Porto** is an async runtime for Python written in Rust (and a usable Rust
+runtime of its own). **Douro** is an HTTP framework built on Porto. Both are
+working names. The complete specification is in `docs/spec/` (start with
+`docs/spec/README.md`); it is normative (MUST/SHOULD), and code follows it.
+When code and spec disagree, fix one of them in the same change.
+
+Nothing is implemented yet. The roadmap is in beads: one epic per milestone
+(M0…M9), plus `Housekeeping`, `Decisions` and `External: oxiform`. Every bead
+names its spec section (`bd show <id>` → `Spec:`).
 
 ```bash
-# Example:
-# npm install
-# npm test
+bd ready                     # what can start now (milestone order is enforced by deps)
+bd list --label milestone:m1 # one milestone
+bd show <id>                 # description, acceptance, spec section, deps
 ```
 
-## Architecture Overview
+Order matters: M0 is a spike with a kill criterion (`spawn/switch >= 2x
+asyncio+uvloop`, else redesign). Nothing in M1 starts until that gate closes.
+Douro (M6) starts only after M3, and needs oxiform's OX-1…OX-5.
 
-_Add a brief overview of your project architecture_
+## Build & Test
 
-## Conventions & Patterns
+_Filled in by the housekeeping beads as the workspace lands (layout:
+`docs/spec/50-engineering/50-repository-layout.md`; checks:
+`docs/spec/50-engineering/51-build-ci-release.md`)._
 
-_Add your project-specific conventions here_
+## Conventions
+
+porto follows [kinemo](https://github.com/m4nd0r4s/kinemo) and
+[hapto](https://github.com/m4nd0r4s/hapto):
+
+- **Personal GitHub only.** Remote `git@github-m4nd0r4s:m4nd0r4s/porto.git`;
+  commits as `M4nd0r4s <25236463+m4nd0r4s@users.noreply.github.com>` (set in
+  this repo's git config). Never the work identity.
+- **English everywhere:** code, comments, docs, commit messages, beads.
+- **Descriptive names**, **small modules**, **typed public API** (pyright
+  strict, `.pyi` stubs).
+- **Every error says what to do**, and every new mistake a user can make gets
+  a test that triggers it.
+- **Commits** are small and focused, with a short imperative message
+  ("Add the timer wheel's level cascade").
+- Dual license MIT OR Apache-2.0 (ADR-029, pending acceptance).
+
+## Working with several agents
+
+- One agent per bead: `bd update <id> --claim` before starting, so two agents
+  never take the same one.
+- Each agent works in its own git worktree and branch; merge through a PR.
+- New work found on the way becomes a bead
+  (`bd create ... --deps discovered-from:<id>`), not a TODO in the code.
+- A spec gap becomes a bead in the milestone it blocks, or a `decision` in the
+  Decisions epic.

@@ -1,3 +1,21 @@
+/target
+.venv*/
+__pycache__/
+*.so
+*.pyd
+*.egg-info/
+/dist
+/out
+.DS_Store
+/site
+/bench/results/raw/
+.pytest_cache/
+.ruff_cache/
+
+# Local notes and the archive the spec came in
+.obsidian/
+/porto-douro-spec.zip
+
 
 # Beads / Dolt files (added by bd init)
 .dolt/

@@ -1,0 +1,90 @@
+# 15 — Structured Concurrency & Cancellation
+
+## 1. The Scope
+
+`porto.scope(...)` returns a `Scope`. It is both:
+- a **cancel scope**: it has a deadline, can be cancelled, and can be shielded;
+- a **nursery**: tasks spawned into it must finish before the `async with` block exits.
+
+```python
+async with porto.scope(timeout=None, deadline=None, shield=False,
+                       name=None, raise_on_timeout=True) as s:
+    t = s.spawn(work())          # Task[T]
+    value = await s.start(server, port=0)   # waits for started.set(value)
+```
+
+### 1.1 Scope tree (Rust)
+```rust
+struct ScopeNode {
+    id: u64,
+    parent: Option<Arc<ScopeNode>>,
+    owner_task: TaskId,            // the task whose `async with` created it
+    state: Mutex<ScopeState>,      // children list, cancel reason, deadline, shield, counters
+    cancel_epoch: AtomicU64,       // bumped on cancel; tasks compare to detect new cancels quickly
+    deadline_timer: TimerEntry,
+}
+struct ScopeState {
+    cancel_called: Option<CancelReason>,  // Explicit | Deadline | Parent | ChildFailed | Shutdown
+    deadline: Option<Instant>,
+    shield: bool,
+    live_children: u32,                   // tasks spawned into this scope, not complete
+    child_scopes: IntrusiveList<ScopeNode>, // nested scopes (for propagation)
+    errors: Vec<PyObj>,                   // failures collected (ExceptionGroup at exit)
+    exit_waiter: Option<Waker>,           // owner waiting in ScopeExit
+}
+```
+
+### 1.2 Effective cancellation of a task
+A task is **effectively cancelled** if walking from its innermost entered scope outward reaches a scope with `cancel_called` set before it reaches a scope with `shield=True`, counting the shielded scope itself: a shielded scope's own cancellation still counts.
+
+Tasks spawned into scope S start with S as their base scope. The walk continues through S's ancestors.
+
+Optimization: each task caches `(scope_ptr, cancel_epoch_snapshot)`. The global `cancel_generation: AtomicU64` is bumped on any cancel. The walk happens only if the generation changed since the last check, which makes the common case O(1).
+
+## 2. Semantics (normative)
+
+- **C1 Level-triggered:** while effectively cancelled, every checkpoint raises `Cancelled`.
+- **C2 Delivery:** cancellation is delivered only at checkpoints, meaning Porto awaits or traps. Pure Python code between awaits is never interrupted.
+- **C3 Absorption:** when a `Cancelled` propagates out of the `async with` of the scope that caused it, the scope swallows it. `scope.cancelled_caught` becomes `True`. If the reason was a deadline and `raise_on_timeout=True`, the scope raises `TimeoutError` (builtin) instead.
+- **C4 Child failure:** an exception in a child task (other than `Cancelled` from this scope) is recorded and **cancels the scope**, which cancels siblings and the body. At exit, the scope raises `ExceptionGroup("porto scope '<name>' failed", errors)` (`BaseExceptionGroup` if any is a BaseException). The body's own exception is included first.
+- **C5 Exit waits:** `__aexit__` waits (`TrapKind::ScopeExit`) until `live_children == 0`. While waiting it is itself a checkpoint, but cancellation only causes child cancellation; the exit never abandons children.
+- **C6 Spawn into a cancelled scope:** allowed. The child starts already cancelled and raises at its first checkpoint, as in Trio.
+- **C7 Spawn into a closed scope:** after `__aexit__` completes, `spawn` raises `RuntimeError("scope is closed")`.
+- **C8 Shield:** `porto.shield()` ≡ `porto.scope(shield=True)`. Common pattern:
+  ```python
+  finally:
+      with porto.shield(timeout=5):     # sync `with` allowed for shield-only scopes with no spawning
+          await conn.rollback()
+  ```
+  A scope used with sync `with` cannot `spawn`; calling it raises `RuntimeError`.
+- **C9 Deadlines nest:** the effective deadline is the min over unshielded ancestors. Setting `scope.deadline` later re-arms the timer.
+- **C10 Cross-lane:** scopes span lanes. `cancel()` from any lane or thread is safe. It bumps the epoch, then wakes every waiting task in the subtree whose pending trap is cancellable. Wakes are delivered to owning lanes via inbox.
+- **C11 Cancelled type:** `porto.Cancelled(asyncio.CancelledError)`. Users MUST NOT swallow it. The debug mode warns when a task finishes normally after having been delivered `Cancelled` inside an effectively-cancelled scope ("cancellation was swallowed").
+- **C12 Unhandled errors in the root scope:** if `main` raises, `porto.run` re-raises after shutdown. Background tasks in the root scope that fail cancel `main` (the root scope is a nursery).
+
+## 3. `start()` protocol
+```python
+async def server(port: int, *, started: porto.Started[int]) -> None:
+    listener = await porto.net.listen_tcp("0.0.0.0", port)
+    started.set(listener.port)
+    ...
+port = await s.start(server, 0)
+```
+- `start` spawns the task with `started=Started()` injected as a keyword argument. It awaits until `started.set(v)` and returns `v`.
+- Until `set`, the task belongs to a hidden scope owned by the caller. Exceptions before `set` propagate to the caller of `start`. After `set`, the task is re-parented into `s`. This matches Trio's `nursery.start` semantics.
+
+## 4. Task cancellation
+`task.cancel()` cancels an implicit per-task scope that wraps the task's coroutine. It is equivalent to the task having been spawned inside `porto.scope()` and that scope being cancelled. It does not cancel siblings, and the absorbed `Cancelled` does not count as a failure.
+
+## 5. Interaction with asyncio-style code (summary; details §22)
+`asyncio.CancelledError` raised by asyncio code inside a Porto task, when the Porto scope is not cancelled, is treated as a regular exception (a failure). This is deliberate. It surfaces bugs where asyncio libraries cancel things that aren't theirs.
+
+## 6. Exceptions table
+
+| Situation | Exception |
+|---|---|
+| deadline hit, `raise_on_timeout=True` | `TimeoutError` (builtin) |
+| child failed | `ExceptionGroup` / `BaseExceptionGroup` |
+| spawn after close | `RuntimeError` |
+| await outside a Porto task (no runtime) | `porto.NoRuntimeError(RuntimeError)` |
+| `started.set` twice | `RuntimeError` |

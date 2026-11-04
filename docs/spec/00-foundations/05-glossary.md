@@ -1,0 +1,22 @@
+# 05 — Glossary
+
+- **ABI (porto-abi):** the versioned `#[repr(C)]` function table, exported via PyCapsule `porto._core._ABI_V1`, that any native extension uses to talk to the single Porto runtime.
+- **Attach / detach:** making a thread's `PyThreadState` current (`PyEval_RestoreThread`) or not (`PyEval_SaveThread`). On GIL builds, attaching acquires the GIL.
+- **Budget (coop budget):** the number of operations a task may perform in one step before it is forced to yield (default 128).
+- **Checkpoint:** a point where a task may be cancelled *and* may be rescheduled. Every Porto await is a cancel point. Awaits that complete immediately are schedule points only when the budget is exhausted.
+- **Deadline:** an absolute monotonic time after which a scope is cancelled.
+- **Facade loop:** the asyncio `AbstractEventLoop` implementation, backed by Porto, that hosts asyncio code inside a lane.
+- **GIL-degraded mode:** the free-threaded runtime state entered after an extension re-enables the GIL. All Python tasks move to lane 0.
+- **Injector:** the global MPMC queue for tasks scheduled from outside a lane.
+- **Lane:** an OS thread owned by the runtime, with a local run queue and a LIFO slot. Python-capable lanes keep an attached thread state while running Python.
+- **LIFO slot:** a single-task slot. The task most recently woken by the running task runs next on this lane.
+- **Level-triggered cancellation:** once a scope is cancelled, every checkpoint inside it raises `Cancelled`, not just the first one, until the scope exits.
+- **Pin:** an attribute forbidding a task from migrating to another lane.
+- **Python lane / Rust lane:** a lane allowed to step Python tasks, or one that only polls Rust futures.
+- **Ready fast path:** an await whose result is available immediately. It returns without yielding to the scheduler.
+- **Root scope:** the runtime's top-level scope. It outlives `main` only during shutdown. It is reachable via `Runtime.root_scope` as an escape hatch.
+- **Scope:** Porto's unified cancel scope and nursery.
+- **Shield:** a scope property that makes it immune to cancellation from outer scopes (its own deadline still applies).
+- **Step:** one `PyIter_Send` call on a task's coroutine, which runs Python code until the next trap or completion.
+- **Trap:** a Rust-implemented object that a coroutine yields to the driver, describing what the task waits for.
+- **Waker:** a `std::task::Waker` pointing at a task. Waking schedules the task.

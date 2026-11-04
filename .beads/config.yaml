@@ -72,4 +72,6 @@
 # - github.token    → use GITHUB_TOKEN env var instead
 
 sync:
-    remote: "git+ssh://git@github-m4nd0r4s/m4nd0r4s/porto.git"
+    remote: "git+https://github.com/m4nd0r4s/porto.git"
+export:
+    auto: true
