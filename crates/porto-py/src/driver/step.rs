@@ -5,17 +5,20 @@
 //! wait:
 //!
 //! - a `_Trap` (exact type) is taken and its [`TrapKind`] handled: `Yield` requeues the task at
-//!   the back of the local queue, `Sleep` registers a lane timer;
+//!   the back of the local queue, `Sleep` registers a lane timer, `Park` waits for a wake that
+//!   the trap's maker arranged through [`current_waker`];
 //! - `None` (a bare `yield` in a generator-based coroutine) is a yield;
 //! - anything else is an error thrown back into the coroutine, at the `await` that yielded it.
 //!
-//! The coroutine's `contextvars.Context` is entered for the whole poll.
+//! The coroutine's `contextvars.Context` is entered for the whole poll, and the task's waker is
+//! reachable through [`current_waker`] while it runs.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
 use std::ptr;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use porto_core::time::{Deadline, sleep_until};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
@@ -26,6 +29,35 @@ use super::pytask::{Outcome, Pending, PyTask, Resume};
 use super::trap::{Trap, TrapKind};
 use crate::interned::names;
 use crate::py_compat::take_exception;
+
+thread_local! {
+    /// The waker of the task this lane is polling, null between polls.
+    static CURRENT_WAKER: Cell<*const Waker> = const { Cell::new(ptr::null()) };
+}
+
+/// A clone of the waker of the task running on this thread, if a task is running: what native
+/// code called from a coroutine registers before handing it a [`TrapKind::Park`] trap.
+pub(crate) fn current_waker() -> Option<Waker> {
+    let waker = CURRENT_WAKER.get();
+    // SAFETY: non-null only while `poll` runs on this thread, which borrows the waker for that
+    // whole time (see `RunningWaker`).
+    (!waker.is_null()).then(|| unsafe { &*waker }.clone())
+}
+
+/// Publishes the polled task's waker in `CURRENT_WAKER` until dropped.
+struct RunningWaker(*const Waker);
+
+impl RunningWaker {
+    fn set(waker: &Waker) -> Self {
+        Self(CURRENT_WAKER.replace(waker))
+    }
+}
+
+impl Drop for RunningWaker {
+    fn drop(&mut self) {
+        CURRENT_WAKER.set(self.0);
+    }
+}
 
 /// Polls `task`: steps its coroutine until it finishes (`Ready`) or waits (`Pending`).
 pub(super) fn poll(task: &mut PyTask, py: Python<'_>, cx: &mut Context<'_>) -> Poll<()> {
@@ -45,6 +77,7 @@ pub(super) fn poll(task: &mut PyTask, py: Python<'_>, cx: &mut Context<'_>) -> P
             return Poll::Ready(());
         }
     };
+    let _waker = RunningWaker::set(cx.waker());
     match step_until_wait(task, &coro, cx) {
         Some(outcome) => {
             task.coro = Some(coro.unbind());
@@ -67,7 +100,8 @@ fn step_until_wait(
     loop {
         match &mut task.pending {
             Pending::None => {}
-            Pending::Yield => task.pending = Pending::None,
+            // A parked task is only polled after a wake: whoever woke it ended the wait.
+            Pending::Yield | Pending::Park => task.pending = Pending::None,
             Pending::Sleep(sleep) => match Pin::new(sleep).poll(cx) {
                 Poll::Pending => return None,
                 Poll::Ready(()) => task.pending = Pending::None,
@@ -90,6 +124,10 @@ fn step_until_wait(
                 } else {
                     task.pending = Pending::Sleep(sleep);
                 }
+                return None;
+            }
+            Next::Park => {
+                task.pending = Pending::Park;
                 return None;
             }
             Next::Throw(error) => task.resume = Resume::Throw(error.unbind()),
@@ -172,6 +210,7 @@ fn thrown_outcome(raised: Bound<'_, PyBaseException>) -> Outcome {
 enum Next<'py> {
     Yield,
     Sleep(Deadline),
+    Park,
     /// Throw this error into the coroutine and step again.
     Throw(Bound<'py, PyBaseException>),
 }
@@ -182,6 +221,7 @@ fn dispatch<'py>(yielded: &Bound<'py, PyAny>) -> Next<'py> {
         return match trap.get().take() {
             Some(TrapKind::Yield) => Next::Yield,
             Some(TrapKind::Sleep { deadline }) => Next::Sleep(deadline),
+            Some(TrapKind::Park) => Next::Park,
             None => Next::Throw(
                 PyRuntimeError::new_err(
                     "porto: a trap reached the driver without being awaited (or twice); \

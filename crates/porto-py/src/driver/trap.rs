@@ -50,13 +50,30 @@ pub enum TrapKind {
         /// When to resume.
         deadline: Deadline,
     },
+    /// Wait for a wake that whoever made the trap arranged (a scope registers the task's waker
+    /// before handing out the trap). Any wake resumes the task, so the awaiting code re-checks
+    /// what it waits for.
+    Park,
 }
 
 /// A trap: a request from a coroutine to the driver, plus the value the driver sends back.
+///
+/// The [`TrapKind`] is stored as a one-byte tag next to the state and the deadline, which keeps
+/// the payload two words (a `TrapKind` field would need a third once two kinds carry no data).
 #[pyclass(frozen, freelist = 512, module = "porto._core", name = "_Trap")]
 pub struct Trap {
     state: AtomicU8,
-    kind: TrapKind,
+    tag: Tag,
+    /// The deadline of a `Sleep`; unused by the other kinds.
+    deadline: Deadline,
+}
+
+/// The variant of a [`TrapKind`].
+#[derive(Clone, Copy)]
+enum Tag {
+    Yield,
+    Sleep,
+    Park,
 }
 
 // 25-cpython-integration-and-memory.md §5: a trap is at most 48 bytes with its object header.
@@ -80,9 +97,15 @@ enum Step {
 impl Trap {
     /// A fresh trap asking for `kind`.
     pub fn new(kind: TrapKind) -> Self {
+        let (tag, deadline) = match kind {
+            TrapKind::Yield => (Tag::Yield, Deadline::NEVER),
+            TrapKind::Sleep { deadline } => (Tag::Sleep, deadline),
+            TrapKind::Park => (Tag::Park, Deadline::NEVER),
+        };
         Self {
             state: AtomicU8::new(FRESH),
-            kind,
+            tag,
+            deadline,
         }
     }
 
@@ -96,9 +119,20 @@ impl Trap {
         Self::new(TrapKind::Sleep { deadline })
     }
 
+    /// A trap that waits for a wake arranged by its maker (a scope waiting for its children).
+    pub fn park() -> Self {
+        Self::new(TrapKind::Park)
+    }
+
     /// What the trap asks for.
     pub fn kind(&self) -> TrapKind {
-        self.kind
+        match self.tag {
+            Tag::Yield => TrapKind::Yield,
+            Tag::Sleep => TrapKind::Sleep {
+                deadline: self.deadline,
+            },
+            Tag::Park => TrapKind::Park,
+        }
     }
 
     /// The driver's side: returns the request of a trap that a coroutine suspended on, once.
@@ -109,7 +143,7 @@ impl Trap {
         self.state
             .compare_exchange(SUSPENDED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| self.kind)
+            .map(|_| self.kind())
     }
 
     fn resume(&self, value_is_none: bool) -> Step {
@@ -147,20 +181,21 @@ fn reused_error() -> PyErr {
 
 #[pymethods]
 impl Trap {
-    /// What the trap asks for: `"yield"` or `"sleep"`.
+    /// What the trap asks for: `"yield"`, `"sleep"` or `"park"`.
     #[getter(kind)]
     fn py_kind(&self) -> &'static str {
-        match self.kind {
+        match self.kind() {
             TrapKind::Yield => "yield",
             TrapKind::Sleep { .. } => "sleep",
+            TrapKind::Park => "park",
         }
     }
 
     /// For a sleep, when it ends, in seconds on the runtime clock (`_monotonic()`).
     #[getter(deadline)]
     fn py_deadline(&self) -> Option<f64> {
-        match self.kind {
-            TrapKind::Yield => None,
+        match self.kind() {
+            TrapKind::Yield | TrapKind::Park => None,
             TrapKind::Sleep { deadline } => Some(deadline.as_secs_f64()),
         }
     }
@@ -215,8 +250,9 @@ impl Trap {
             TAKEN => "taken",
             _ => "done",
         };
-        match self.kind {
+        match self.kind() {
             TrapKind::Yield => format!("<porto._core._Trap yield {state}>"),
+            TrapKind::Park => format!("<porto._core._Trap park {state}>"),
             TrapKind::Sleep { deadline } => format!(
                 "<porto._core._Trap sleep until {:.6}s {state}>",
                 deadline.as_secs_f64()
@@ -267,8 +303,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_trap_kind_is_one_word() {
-        assert_eq!(size_of::<TrapKind>(), 8);
+    fn every_kind_round_trips_through_the_packed_payload() {
+        for kind in [
+            TrapKind::Yield,
+            TrapKind::Sleep {
+                deadline: Deadline::from_nanos(7),
+            },
+            TrapKind::Park,
+        ] {
+            assert_eq!(Trap::new(kind).kind(), kind);
+        }
     }
 
     #[test]
