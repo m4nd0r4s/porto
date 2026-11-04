@@ -5,6 +5,8 @@
 
 use pyo3::prelude::*;
 
+pub mod interned;
+
 /// The `porto._core` module. For now it only exposes `__version__`.
 ///
 /// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
@@ -12,5 +14,8 @@ use pyo3::prelude::*;
 #[pymodule(gil_used = false)]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("__version__", env!("CARGO_PKG_VERSION"))
+    let py = module.py();
+    module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    interned::names(py);
+    Ok(())
 }
