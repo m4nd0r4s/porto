@@ -1,0 +1,20 @@
+[package]
+name = "porto-py"
+description = "Python bindings for Porto, built as the `porto._core` extension module."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "porto_py"
+# cdylib for the extension module, rlib so tests and other crates can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3.workspace = true
+
+[lints]
+workspace = true

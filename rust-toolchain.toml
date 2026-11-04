@@ -1,0 +1,4 @@
+# Pinned latest stable, bumped deliberately in its own commit (ADR-031).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
