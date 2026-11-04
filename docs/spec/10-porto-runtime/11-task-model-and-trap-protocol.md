@@ -20,7 +20,7 @@ pub struct Header {
 - **RustTask<F: Future>**: Header + `F` + output slot + join waker. Polled via `Future::poll`.
 - **PyTask**: Header + PyTask body (§2). Its `poll` implementation performs **steps** (§4).
 
-Target: `size_of::<Header>() <= 64`, `size_of::<PyTaskBody>() <= 64` (excluding the Python coroutine).
+Target (ADR-034): `size_of::<Header>() <= 64` including the registry node, `size_of::<PyTaskBody>() <= 192` including the embedded timer entry and wait node (excluding the Python coroutine).
 
 Reference counting: tasks are `Arc`-like with a manual refcount packed in `state` (as in Tokio: `REF_ONE = 1 << 6`). Wakers clone and drop refs.
 
@@ -171,7 +171,9 @@ In `debug=True` mode:
 
 ## 11. Performance targets for this layer (M1 gate)
 
-| Micro-benchmark | Target (CPython 3.14, x86-64, per lane) |
+The gates tighten by milestone (ADR-034): the M0 spike must reach ≥ 2× asyncio+uvloop and these absolute targets within 30%; M1 must meet them; 1.0 must meet the `53-benchmarks.md` table.
+
+| Micro-benchmark | Target (CPython 3.14, per lane, on the reference machine of `53` §1) |
 |---|---|
 | `await porto.checkpoint()` (budget not exhausted) | ≤ 60 ns |
 | Task switch via `Yield` round-trip through the local queue | ≤ 250 ns |

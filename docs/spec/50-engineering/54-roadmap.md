@@ -4,7 +4,7 @@ Each milestone is shippable internally. The order is chosen so the riskiest assu
 
 | M | Scope | Exit criteria |
 |---|---|---|
-| **M0 Spike (2–3 wks)** | Minimal porto-py: single lane, PyTask driver + Trap (`Yield`, `Sleep`), `run`, `scope.spawn`, `sleep`, `checkpoint`. No I/O. | §11 §11 micro targets met or within 30%. **If spawn/switch isn't ≥ 2× asyncio+uvloop, stop and redesign.** |
+| **M0 Spike (2–3 wks)** | Minimal porto-py: single lane, PyTask driver + Trap (`Yield`, `Sleep`), `run`, `scope.spawn`, `sleep`, `checkpoint`. No I/O. | §11 micro targets met or within 30%. **If spawn/switch isn't ≥ 2× asyncio+uvloop, stop and redesign.** Gates then tighten: M1 ≥ 2.5× and §11 met; 1.0 = the §53 table (ADR-034). |
 | **M1 Core runtime** | porto-core complete single-lane: scopes (full §15), timers wheel, sync primitives, channels, budget, registry; porto-io epoll/kqueue; TCP/UDP/Unix; blocking pool; signals; errors. | §15/§16 semantic tests green; TCP echo gate; loom suite green |
 | **M2 Multi-lane** | lanes, stealing, inbox, LIFO slot, free-threaded attach policy, GIL-degraded mode, Rust lanes on GIL builds | Free-threaded scaling gates; TSAN clean |
 | **M3 ABI + Rust facade** | porto-abi v1, porto-pyo3, `porto` crate API, hyper compat, tokio bridge | A sample PyO3 extension (in `examples/`) doing TCP via ABI passes tests; hyper client example works |

@@ -59,7 +59,7 @@ Each experiment states a scenario, follows its consequences, and records the **d
 ### ST-11 One million idle tasks (WebSocket fan-out)
 **Analysis:** the per-task Rust header must be small, and the coroutine frame dominates (~0.5–2 KB in Python).
 **Consequence:**
-- The task header is ≤ 128 bytes (cache-line ×2), including the intrusive list node.
+- The task header is ≤ 64 bytes (one cache line) including the intrusive list node, with a hard ceiling of 128 bytes (ADR-034).
 - Timers are O(1) wheel inserts, and waiter nodes are intrusive.
 - Benchmark gate: 1M sleeping tasks, RSS < 2.5 GB, spawn rate > 1M/s per lane (§53).
 

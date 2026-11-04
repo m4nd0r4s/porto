@@ -18,7 +18,7 @@
 | deterministic | 1000 seeds of the deterministic suite |
 | compat | asyncpg/redis/httpx/aiohttp test suites under porto (services in containers) |
 | conformance | h2spec, Autobahn |
-| perf | nightly on the dedicated reference machine; regressions > 5% fail; results committed to `bench/results` |
+| perf | nightly on the reference machine (`53` §1, ADR-033: a local script on the maintainer's Mac for now); regressions > 5% fail; results committed to `bench/results` |
 | soak | weekly 72 h |
 | audit | `cargo deny`, `cargo audit`, `pip-audit` |
 

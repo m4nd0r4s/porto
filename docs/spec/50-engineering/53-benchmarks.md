@@ -1,7 +1,16 @@
 # 53 — Benchmarks & Gates
 
 ## 1. Reference machine
-Dedicated bare-metal: 16 physical cores x86-64 (current gen), turbo disabled, `performance` governor, isolated CPUs for server vs load generator (or two machines over 25 GbE). Linux LTS kernel. Python built with `--enable-optimizations --with-lto`.
+**Current (ADR-033):** the maintainer's Apple M4 Pro Mac (10 performance + 4 efficiency cores, 48 GB, macOS, kqueue). Rules for a run that counts:
+- on AC power, Low Power Mode off, no other heavy process, after a warm-up run;
+- Python from `uv` (python-build-standalone, built with PGO + LTO), the same build for Porto and every competitor;
+- `pyperf` with its default calibration and ≥ 20 values per benchmark; the gate is the **ratio** to the competitor measured in the same session, not the absolute number;
+- multi-lane and HTTP runs use at most 8 lanes/workers so they stay on performance cores, and the load generator gets the rest;
+- every result in `bench/results/` records the machine fingerprint (model, cores, OS, Python build, commit).
+
+Linux-only paths (epoll, io_uring) are measured in the Docker Desktop Linux VM on the same Mac, as ratios only. The perf "job" is a local script, `bench/run_reference.sh`, run nightly on the Mac (launchd) or before a milestone gate; regressions > 5% versus the last committed result fail it.
+
+**Later:** a dedicated bare-metal Linux box (16 physical cores x86-64, turbo disabled, `performance` governor, isolated CPUs or two machines over 25 GbE, Python built with `--enable-optimizations --with-lto`). When it exists, it becomes the reference and S1 is re-measured there.
 
 ## 2. Micro (pyperf / criterion)
 | Bench | Gate vs asyncio+uvloop (3.14, GIL) |

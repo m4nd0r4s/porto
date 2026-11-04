@@ -5,7 +5,7 @@ Monorepo `porto/` (both projects; split later if needed).
 ```
 porto/
 ├── Cargo.toml                     # workspace, shared lints, profiles
-├── rust-toolchain.toml            # pinned stable
+├── rust-toolchain.toml            # pinned latest stable, edition 2024 (ADR-031)
 ├── pyproject.toml                 # uv workspace root (dev tooling only)
 ├── crates/
 │   ├── porto-core/                # scheduler, task, scope, time, sync, coop, registry
@@ -46,6 +46,6 @@ porto/
 │   ├── typing/ (pyright strict samples)    └── conformance/ (h2spec, autobahn configs)
 ├── bench/
 │   ├── micro/ (criterion + pyperf scripts) ├── http/ (wrk2/oha scenarios, competitor apps) └── results/
-├── docs/                          # mkdocs-material; guides, API (generated from stubs), cookbook
+├── docs/                          # Zensical + mkdocstrings (ADR-032); guides, API (generated from stubs), cookbook
 └── .github/workflows/
 ```
