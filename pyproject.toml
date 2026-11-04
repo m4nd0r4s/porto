@@ -62,7 +62,7 @@ docstring-code-format = true
 # MUST fail strict; tests/typing/test_should_fail.py runs pyright on them through
 # should_fail/pyrightconfig.json, which extends this table and undoes the exclude.
 [tool.pyright]
-include = ["python", "tests/typing"]
+include = ["python", "scripts", "tests/typing"]
 exclude = ["tests/typing/should_fail"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
