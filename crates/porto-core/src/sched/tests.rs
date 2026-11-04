@@ -8,7 +8,7 @@
 use std::future::{Future, poll_fn};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -244,4 +244,33 @@ fn nested_block_on_panics_with_a_hint() {
 #[should_panic(expected = "porto_core::spawn called outside a runtime")]
 fn spawn_outside_a_runtime_panics_with_a_hint() {
     spawn(async {});
+}
+
+#[test]
+fn a_task_that_keeps_yielding_does_not_starve_remote_spawns() {
+    let rt = Runtime::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        rt.spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                yield_now().await;
+            }
+        });
+    }
+    let done = Signal::default();
+    let handle = rt.handle().clone();
+    let (done_in_task, stop_in_task) = (done.clone(), stop.clone());
+    // Lands in the inbox before the lane starts: the yielding task alone keeps the local
+    // queue busy, so only the periodic inbox check can let this one run.
+    thread::spawn(move || {
+        handle.spawn(async move {
+            stop_in_task.store(true, Ordering::SeqCst);
+            done_in_task.set();
+        });
+    })
+    .join()
+    .unwrap();
+    rt.block_on(done.wait());
+    assert!(stop.load(Ordering::SeqCst));
 }

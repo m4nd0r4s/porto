@@ -32,6 +32,8 @@ thread_local! {
 struct Core {
     handle: Handle,
     local: RefCell<VecDeque<Notified>>,
+    /// Tasks taken so far; every `EVENT_INTERVAL`th one comes from the inbox first.
+    tick: Cell<usize>,
 }
 
 /// A single-lane runtime.
@@ -50,6 +52,7 @@ impl Runtime {
             core: Core {
                 handle: Handle::new(),
                 local: RefCell::new(VecDeque::with_capacity(256)),
+                tick: Cell::new(0),
             },
         }
     }
@@ -145,6 +148,15 @@ impl fmt::Debug for Runtime {
 
 impl Core {
     fn next_task(&self) -> Option<Notified> {
+        let tick = self.tick.get().wrapping_add(1);
+        self.tick.set(tick);
+        // Tasks that keep waking themselves keep the local queue non-empty; checking the inbox
+        // first every `EVENT_INTERVAL` tasks keeps remote wakes and spawns from starving.
+        if tick.is_multiple_of(EVENT_INTERVAL)
+            && let Some(task) = self.handle.shared.inbox().tasks.pop_front()
+        {
+            return Some(task);
+        }
         if let Some(task) = self.local.borrow_mut().pop_front() {
             return Some(task);
         }

@@ -67,7 +67,8 @@ impl Handle {
     }
 }
 
-impl Schedule for Handle {
+// SAFETY: `schedule_local` only pushes the task onto this thread's local queue, or returns it.
+unsafe impl Schedule for Handle {
     fn schedule_local(&self, task: Notified) -> Result<(), Notified> {
         lane::push_local(self, task)
     }

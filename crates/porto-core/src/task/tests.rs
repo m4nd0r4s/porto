@@ -19,7 +19,8 @@ use super::{Notified, Schedule, new_task};
 #[derive(Clone, Default)]
 struct MockScheduler(Arc<Mutex<VecDeque<Notified>>>);
 
-impl Schedule for MockScheduler {
+// SAFETY: `schedule_local` always returns the task untouched.
+unsafe impl Schedule for MockScheduler {
     fn schedule_local(&self, task: Notified) -> Result<(), Notified> {
         Err(task)
     }
@@ -232,14 +233,19 @@ fn concurrent_wakes_from_other_threads_schedule_once() {
 fn wake_from_another_thread_during_poll_requeues_once() {
     let rounds = if cfg!(miri) { 3 } else { 200 };
     for _ in 0..rounds {
-        let (sched, task, drops) = spawn(|waker| {
+        let waker_thread = Arc::new(Mutex::new(None));
+        let waker_thread_in_task = waker_thread.clone();
+        let (sched, task, drops) = spawn(move |waker| {
             let waker = waker.clone();
-            // Races with the end of this poll: either NOTIFIED (requeue at poll end) or an
-            // idle wake (requeue from the other thread). Both must queue it exactly once.
-            thread::spawn(move || waker.wake()).join().unwrap();
+            // Not joined here: the wake races with the end of this poll. It lands either
+            // while RUNNING (requeued when the poll returns) or after (queued by the waking
+            // thread). Both must queue the task exactly once.
+            *waker_thread_in_task.lock().unwrap() = Some(thread::spawn(move || waker.wake()));
             Poll::Pending
         });
         task.run();
+        let waker_thread = waker_thread.lock().unwrap().take().unwrap();
+        waker_thread.join().unwrap();
         assert_eq!(sched.len(), 1);
         drop(sched.pop());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -271,4 +277,29 @@ fn ids_increase_in_spawn_order() {
     let a = new_task(async {}, MockScheduler::default());
     let b = new_task(async {}, MockScheduler::default());
     assert!(b.id() > a.id());
+}
+
+#[test]
+fn wake_and_waker_drop_race_with_completion_free_the_task_once() {
+    let rounds = if cfg!(miri) { 3 } else { 200 };
+    for _ in 0..rounds {
+        let waker_thread = Arc::new(Mutex::new(None));
+        let waker_thread_in_task = waker_thread.clone();
+        let (sched, task, drops) = spawn(move |waker| {
+            let (by_ref, by_val) = (waker.clone(), waker.clone());
+            // Both run while this poll completes the task and the lane drops its reference:
+            // the last of the three references must free the task, exactly once.
+            *waker_thread_in_task.lock().unwrap() = Some(thread::spawn(move || {
+                by_ref.wake_by_ref();
+                drop(by_ref);
+                by_val.wake();
+            }));
+            Poll::Ready(())
+        });
+        task.run();
+        let waker_thread = waker_thread.lock().unwrap().take().unwrap();
+        waker_thread.join().unwrap();
+        assert_eq!(sched.len(), 0, "a completed task is never queued");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 }

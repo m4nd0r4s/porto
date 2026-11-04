@@ -24,7 +24,14 @@ use raw::RawTask;
 
 /// Where a woken task goes. Implemented by a cheap, cloneable scheduler handle that is stored
 /// inside every task it spawned.
-pub trait Schedule: Clone + Send + Sync + 'static {
+///
+/// # Safety
+///
+/// `schedule_local` is called through a borrow of the scheduler stored inside the task's own
+/// allocation. It MUST NOT run `task`, drop it, or hand it to another thread before returning:
+/// any of those can free the allocation while that borrow is live. Queueing it on the current
+/// thread, or returning it, is fine.
+pub unsafe trait Schedule: Clone + Send + Sync + 'static {
     /// Queues `task` if the current thread is running this scheduler's lane, else returns it.
     ///
     /// `self` is borrowed from inside a task allocation, so the implementation MUST NOT hand
