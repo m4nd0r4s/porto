@@ -5,18 +5,18 @@
 
 use pyo3::prelude::*;
 
+mod api;
 pub mod async_slots;
+pub mod driver;
 pub mod interned;
-pub mod ready;
 pub mod testing;
 mod throw_args;
-pub mod trap;
 
-pub use ready::Ready;
-pub use trap::Trap;
+pub use driver::ready::Ready;
+pub use driver::trap::{Trap, TrapKind};
 
-/// The `porto._core` module: the trap protocol's awaitables (`_Trap`, `_Ready`) and private
-/// test hooks.
+/// The `porto._core` module: the trap protocol's awaitables (`_Trap`, `_Ready`), the trap
+/// constructors and private test hooks.
 ///
 /// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
 /// free-threaded CPython 3.14t, so importing it does not re-enable the GIL (ADR-024).
@@ -29,8 +29,9 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Ready>()?;
     // The types exist now (`add_class` created them) and nothing outside this function can see
     // them yet, so this is the one point where their `am_send` slot can be set (see async_slots).
-    async_slots::install_am_send::<Trap>(py, trap::trap_am_send)?;
-    async_slots::install_am_send::<Ready>(py, ready::ready_am_send)?;
+    async_slots::install_am_send::<Trap>(py, driver::trap::trap_am_send)?;
+    async_slots::install_am_send::<Ready>(py, driver::ready::ready_am_send)?;
     interned::names(py);
+    api::time::register(module)?;
     testing::register(module)
 }

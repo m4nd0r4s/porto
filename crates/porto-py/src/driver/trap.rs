@@ -7,13 +7,21 @@
 //! 2. the driver resumes the outer coroutine with a value; the chain hands it to the trap, which
 //!    returns it, so the `await` evaluates to that value (`am_send` returns `PYGEN_RETURN`, the
 //!    Python `send` raises `StopIteration(value)`);
-//! 3. any later resume raises `RuntimeError("trap reused")`: a trap is taken exactly once.
+//! 3. any later resume raises `RuntimeError("trap reused")`: a trap is awaited exactly once.
 //!
-//! `throw(...)` re-raises the exception at the `await`. The state is an atomic, so the class
-//! stays `frozen` and safe on free-threaded builds (25-cpython-integration-and-memory.md §3).
+//! `throw(...)` re-raises the exception at the `await`.
+//!
+//! The driver reads the request with [`Trap::take`], which succeeds once, and only for a trap
+//! that suspended through an `await`. The payload is an immutable [`TrapKind`] and the only
+//! mutable state is one atomic, so the class stays `frozen` and sound on free-threaded builds
+//! (25-cpython-integration-and-memory.md §3). Spec 11 §5.1 sketches the payload as an
+//! `UnsafeCell<Option<TrapKind>>` moved out by the driver; the kinds that exist so far are
+//! `Copy`, so nothing needs moving. A kind that owns data (`Future`, `Join`) can keep this
+//! design by moving its payload out only after winning the SUSPENDED → TAKEN exchange.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use porto_core::time::Deadline;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -25,16 +33,37 @@ use crate::throw_args::thrown_exception;
 const FRESH: u8 = 0;
 /// Yielded to the driver: the next resume returns the value sent back.
 const SUSPENDED: u8 = 1;
+/// Taken by the driver (after SUSPENDED): the next resume returns the value sent back.
+const TAKEN: u8 = 2;
 /// Resumed, thrown into or closed: any further resume is a reuse.
-const DONE: u8 = 2;
+const DONE: u8 = 3;
+
+/// What a trap asks the driver to do (11-task-model-and-trap-protocol.md §5.2). Later kinds
+/// (`Notified`, `Io`, `Join`, `ScopeExit`, `Future`) arrive with the features that need them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrapKind {
+    /// A schedule point: requeue the task at the back of its lane's local queue.
+    Yield,
+    /// Resume the task once the runtime clock reaches `deadline`, never earlier. A deadline
+    /// that has already passed is a [`TrapKind::Yield`].
+    Sleep {
+        /// When to resume.
+        deadline: Deadline,
+    },
+}
 
 /// A trap: a request from a coroutine to the driver, plus the value the driver sends back.
 #[pyclass(frozen, freelist = 512, module = "porto._core", name = "_Trap")]
 pub struct Trap {
     state: AtomicU8,
-    kind: u32,
-    args: Py<PyAny>,
+    kind: TrapKind,
 }
+
+// 25-cpython-integration-and-memory.md §5: a trap is at most 48 bytes with its object header.
+const _: () = assert!(
+    size_of::<Trap>() <= 16,
+    "the trap payload must stay two words"
+);
 
 /// What one resume of a trap does.
 enum Step {
@@ -49,23 +78,38 @@ enum Step {
 }
 
 impl Trap {
-    /// A trap of `kind` with its arguments. Kinds are defined by the driver (porto-itr.4).
-    pub fn new(kind: u32, args: Py<PyAny>) -> Self {
+    /// A fresh trap asking for `kind`.
+    pub fn new(kind: TrapKind) -> Self {
         Self {
             state: AtomicU8::new(FRESH),
             kind,
-            args,
         }
     }
 
-    /// The trap kind, as given to [`Trap::new`].
-    pub fn kind(&self) -> u32 {
+    /// A trap that yields to the scheduler once (`porto.checkpoint`).
+    pub fn yield_now() -> Self {
+        Self::new(TrapKind::Yield)
+    }
+
+    /// A trap that resumes the task at `deadline` (`porto.sleep`, `porto.sleep_until`).
+    pub fn sleep_until(deadline: Deadline) -> Self {
+        Self::new(TrapKind::Sleep { deadline })
+    }
+
+    /// What the trap asks for.
+    pub fn kind(&self) -> TrapKind {
         self.kind
     }
 
-    /// The trap arguments, as given to [`Trap::new`].
-    pub fn args(&self) -> &Py<PyAny> {
-        &self.args
+    /// The driver's side: returns the request of a trap that a coroutine suspended on, once.
+    ///
+    /// `None` if the trap did not reach the driver through an `await` (a generator yielded it
+    /// directly, or it was taken already): the driver then throws an error into the coroutine.
+    pub fn take(&self) -> Option<TrapKind> {
+        self.state
+            .compare_exchange(SUSPENDED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| self.kind)
     }
 
     fn resume(&self, value_is_none: bool) -> Step {
@@ -74,7 +118,7 @@ impl Trap {
             let (next, step) = match state {
                 FRESH if value_is_none => (SUSPENDED, Step::Suspend),
                 FRESH => return Step::NotStarted,
-                SUSPENDED => (DONE, Step::Complete),
+                SUSPENDED | TAKEN => (DONE, Step::Complete),
                 _ => return Step::Reused,
             };
             match self
@@ -103,16 +147,22 @@ fn reused_error() -> PyErr {
 
 #[pymethods]
 impl Trap {
-    /// The trap kind (an integer the driver dispatches on).
+    /// What the trap asks for: `"yield"` or `"sleep"`.
     #[getter(kind)]
-    fn py_kind(&self) -> u32 {
-        self.kind
+    fn py_kind(&self) -> &'static str {
+        match self.kind {
+            TrapKind::Yield => "yield",
+            TrapKind::Sleep { .. } => "sleep",
+        }
     }
 
-    /// The trap arguments.
-    #[getter(args)]
-    fn py_args(&self, py: Python<'_>) -> Py<PyAny> {
-        self.args.clone_ref(py)
+    /// For a sleep, when it ends, in seconds on the runtime clock (`_monotonic()`).
+    #[getter(deadline)]
+    fn py_deadline(&self) -> Option<f64> {
+        match self.kind {
+            TrapKind::Yield => None,
+            TrapKind::Sleep { deadline } => Some(deadline.as_secs_f64()),
+        }
     }
 
     fn __await__(slf: &Bound<'_, Self>) -> Py<Self> {
@@ -162,9 +212,16 @@ impl Trap {
         let state = match self.state.load(Ordering::Acquire) {
             FRESH => "fresh",
             SUSPENDED => "suspended",
+            TAKEN => "taken",
             _ => "done",
         };
-        format!("<porto._core._Trap kind={} {state}>", self.kind)
+        match self.kind {
+            TrapKind::Yield => format!("<porto._core._Trap yield {state}>"),
+            TrapKind::Sleep { deadline } => format!(
+                "<porto._core._Trap sleep until {:.6}s {state}>",
+                deadline.as_secs_f64()
+            ),
+        }
     }
 }
 
@@ -203,4 +260,31 @@ pub(crate) unsafe extern "C" fn trap_am_send(
         unsafe { *presult = result };
         status
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trap_kind_is_one_word() {
+        assert_eq!(size_of::<TrapKind>(), 8);
+    }
+
+    #[test]
+    fn the_driver_takes_a_trap_once_and_only_after_it_suspended() {
+        let trap = Trap::sleep_until(Deadline::from_nanos(7));
+        assert_eq!(trap.take(), None, "a fresh trap was not awaited");
+        assert!(matches!(trap.resume(true), Step::Suspend));
+        assert_eq!(
+            trap.take(),
+            Some(TrapKind::Sleep {
+                deadline: Deadline::from_nanos(7)
+            })
+        );
+        assert_eq!(trap.take(), None, "taken twice");
+        assert!(matches!(trap.resume(false), Step::Complete));
+        assert!(matches!(trap.resume(true), Step::Reused));
+        assert_eq!(trap.take(), None);
+    }
 }

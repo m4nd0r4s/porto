@@ -1,7 +1,7 @@
 //! Private test hooks of `porto._core` (underscore names, not part of the public API).
 //!
-//! - `_make_trap(kind, args=None)` and `_make_ready(value)` build the awaitables, which have no
-//!   Python constructor;
+//! - `_make_ready(value)` builds a `_Ready`, which has no Python constructor (traps come from
+//!   `_yield_trap()` and `_sleep_trap(delay)`);
 //! - `_send(iterator, value)` calls `PyIter_Send` directly, which is how the step driver resumes
 //!   a coroutine, so tests reach `am_send` even where the `SEND` opcode does not use it;
 //! - `_count_allocations(fn)` counts every allocation CPython makes while `fn()` runs.
@@ -15,21 +15,13 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use crate::{Ready, Trap};
+use crate::Ready;
 
 /// Adds the hooks to `module`.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_function(wrap_pyfunction!(make_trap, module)?)?;
     module.add_function(wrap_pyfunction!(make_ready, module)?)?;
     module.add_function(wrap_pyfunction!(send, module)?)?;
     module.add_function(wrap_pyfunction!(count_allocations, module)?)
-}
-
-/// A fresh `_Trap(kind, args)`.
-#[pyfunction(name = "_make_trap")]
-#[pyo3(signature = (kind, args = None))]
-fn make_trap(py: Python<'_>, kind: u32, args: Option<Py<PyAny>>) -> Trap {
-    Trap::new(kind, args.unwrap_or_else(|| py.None()))
 }
 
 /// A `_Ready` holding `value`.
