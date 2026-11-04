@@ -4,7 +4,8 @@
 //! This crate MUST build and pass its tests without Python. See the
 //! [architecture overview](https://github.com/m4nd0r4s/porto/blob/main/docs/spec/10-porto-runtime/10-architecture-overview.md).
 //!
-//! M0 spike: the task core ([`task`]) and a single-lane executor ([`sched`]).
+//! M0 spike: the task core ([`task`]), a single-lane executor ([`sched`]) and its timers
+//! ([`time`]).
 //!
 //! ```
 //! let rt = porto_core::Runtime::new();
@@ -14,5 +15,6 @@
 
 pub mod sched;
 pub mod task;
+pub mod time;
 
-pub use sched::{Handle, Runtime, spawn};
+pub use sched::{Handle, ParkHook, Runtime, spawn};

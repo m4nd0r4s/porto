@@ -3,6 +3,8 @@
 //! This is the M0 spike of `12-scheduler-and-lanes.md` §3 with one lane and no LIFO slot,
 //! stealing, injector or reactor. Wakes on the lane thread push to the local queue without
 //! synchronization; wakes from other threads go through the shared inbox and unpark the lane.
+//! Timers live on the lane (a min-heap, see `timers`): they fire every `EVENT_INTERVAL` tasks
+//! and before parking, and the lane parks no longer than until the earliest one.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -17,8 +19,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 
+use super::park::ParkHook;
 use super::shared::Handle;
+use super::timers::Timers;
 use crate::task::{Notified, new_task};
+use crate::time::Deadline;
 
 /// Tasks run between two checks of the `block_on` future (Tokio's `event_interval`).
 const EVENT_INTERVAL: usize = 61;
@@ -34,6 +39,8 @@ struct Core {
     local: RefCell<VecDeque<Notified>>,
     /// Tasks taken so far; every `EVENT_INTERVAL`th one comes from the inbox first.
     tick: Cell<usize>,
+    timers: Timers,
+    park_hook: Option<Box<dyn ParkHook>>,
 }
 
 /// A single-lane runtime.
@@ -48,11 +55,22 @@ pub struct Runtime {
 impl Runtime {
     /// Creates a runtime with an empty run queue.
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// Creates a runtime that calls `hook` around every park of the lane thread.
+    pub fn with_park_hook(hook: impl ParkHook) -> Self {
+        Self::build(Some(Box::new(hook)))
+    }
+
+    fn build(park_hook: Option<Box<dyn ParkHook>>) -> Self {
         Self {
             core: Core {
                 handle: Handle::new(),
                 local: RefCell::new(VecDeque::with_capacity(256)),
                 tick: Cell::new(0),
+                timers: Timers::default(),
+                park_hook,
             },
         }
     }
@@ -96,22 +114,30 @@ impl Runtime {
             {
                 return output;
             }
-            if self.core.run_batch(EVENT_INTERVAL) == 0 && !root.woken.load(Ordering::Acquire) {
-                // Every queue was empty after the last check; a later remote push or root
-                // wake unparks us (or has already left the token).
-                thread::park();
+            let ran = self.core.run_batch(EVENT_INTERVAL);
+            let fired = self.core.timers.fire_expired();
+            if ran == 0 && fired == 0 && !root.woken.load(Ordering::Acquire) {
+                // Every queue was empty after the last check and no timer is due; a later
+                // remote push or root wake unparks us (or has already left the token).
+                self.core.park();
             }
         }
     }
 
-    /// Runs queued tasks until both the local queue and the inbox are empty, without parking.
-    /// Returns the number of polls.
+    /// Runs queued tasks until both the local queue and the inbox are empty and no timer is
+    /// due, without parking. Returns the number of polls.
     ///
     /// # Panics
     /// Like [`Runtime::block_on`].
     pub fn run_until_idle(&self) -> usize {
         let _enter = Enter::new(&self.core);
-        self.core.run_batch(usize::MAX)
+        let mut ran = 0;
+        loop {
+            ran += self.core.run_batch(usize::MAX);
+            if self.core.timers.fire_expired() == 0 {
+                return ran;
+            }
+        }
     }
 }
 
@@ -129,7 +155,8 @@ impl Drop for Runtime {
         loop {
             let local = mem::take(&mut *self.core.local.borrow_mut());
             let remote = mem::take(&mut self.core.handle.shared.inbox().tasks);
-            if local.is_empty() && remote.is_empty() {
+            let had_timers = self.core.timers.drop_all();
+            if local.is_empty() && remote.is_empty() && !had_timers {
                 break;
             }
             drop(local);
@@ -142,6 +169,7 @@ impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime")
             .field("queued", &self.core.local.borrow().len())
+            .field("next_timer", &self.core.timers.next_deadline())
             .finish_non_exhaustive()
     }
 }
@@ -169,6 +197,27 @@ impl Core {
         mem::swap(&mut *local, &mut inbox.tasks);
         drop(inbox);
         local.pop_front()
+    }
+
+    /// Parks the lane thread until an unpark, or until the earliest timer is due, through the
+    /// park hook if there is one.
+    fn park(&self) {
+        let next_deadline = self.timers.next_deadline();
+        let mut park = || match next_deadline {
+            None => thread::park(),
+            // `park_timeout` may return early; the caller then finds no timer due and parks
+            // again for the rest.
+            Some(deadline) => {
+                let timeout = deadline.saturating_duration_since(Deadline::now());
+                if !timeout.is_zero() {
+                    thread::park_timeout(timeout);
+                }
+            }
+        };
+        match &self.park_hook {
+            Some(hook) => hook.around_park(&mut park),
+            None => park(),
+        }
     }
 
     /// Runs up to `max` tasks. No borrow of `local` is held while a task runs, so tasks can
@@ -199,6 +248,22 @@ pub(crate) fn push_local(handle: &Handle, task: Notified) -> Result<(), Notified
     }
     core.local.borrow_mut().push_back(task);
     Ok(())
+}
+
+/// Registers a timer on the lane running on this thread: `waker` is woken once the clock
+/// reaches `deadline`.
+///
+/// # Panics
+/// If no runtime is running on this thread.
+pub(crate) fn register_timer(deadline: Deadline, waker: Waker) {
+    let core = CURRENT.try_with(Cell::get).unwrap_or(ptr::null());
+    assert!(
+        !core.is_null(),
+        "porto_core::time::Sleep polled outside a runtime: await it from a task or inside \
+         Runtime::block_on"
+    );
+    // SAFETY: as in `push_local`.
+    unsafe { &*core }.timers.register(deadline, waker);
 }
 
 /// A handle to the runtime running on this thread, if any.

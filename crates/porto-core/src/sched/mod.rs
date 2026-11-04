@@ -1,7 +1,9 @@
 //! The scheduler. M0 has a single lane (`12-scheduler-and-lanes.md`, single-lane parts).
 
 mod lane;
+mod park;
 mod shared;
+mod timers;
 
 #[cfg(test)]
 mod tests;
@@ -9,6 +11,8 @@ mod tests;
 use std::future::Future;
 
 pub use lane::Runtime;
+pub(crate) use lane::register_timer;
+pub use park::ParkHook;
 pub use shared::Handle;
 
 /// Spawns `future` onto the runtime running on this thread.
