@@ -1,0 +1,91 @@
+name: ci
+
+# The check list in CLAUDE.md (Build & Test), split into the jobs of
+# docs/spec/50-engineering/51-build-ci-release.md §2. Third-party actions are pinned by commit
+# SHA (40-security-and-limits.md, supply chain); the comment names the tag the SHA resolves to.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Only the latest commit of a branch (or of main) runs: a new push cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts only bloat the cache on a fresh runner.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The toolchain and its components come from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - run: cargo fmt --all --check
+      # The venv first: clippy builds porto-py, and pyo3 needs an interpreter to build against.
+      - run: uv sync
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          PYO3_PYTHON: ${{ github.workspace }}/.venv/bin/python
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run pyright
+
+  rust-test:
+    name: rust-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-nextest
+      # Without porto-py, so porto-core and porto build and test with no Python around. The
+      # bindings are tested from Python in py-test. `--no-tests=warn` until the crates have tests.
+      - run: cargo nextest run --workspace --exclude porto-py --no-tests=warn
+      # nextest does not run doctests.
+      - run: cargo test --workspace --exclude porto-py --doc
+
+  py-test:
+    name: py-test (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # One Rust cache per Python: porto-py is built against that interpreter.
+          key: py${{ matrix.python }}
+      # Sets UV_PYTHON, so `uv sync` makes the venv with this Python and maturin builds the
+      # editable porto (pyo3 included) against that same interpreter.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      - run: uv sync
+      - run: uv run pytest -q
