@@ -6,7 +6,10 @@
 use pyo3::prelude::*;
 
 /// The `porto._core` module. For now it only exposes `__version__`.
-#[pymodule]
+///
+/// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
+/// free-threaded CPython 3.14t, so importing it does not re-enable the GIL (ADR-024).
+#[pymodule(gil_used = false)]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))
