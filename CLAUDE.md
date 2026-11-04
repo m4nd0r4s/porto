@@ -88,18 +88,32 @@ Layout: `docs/spec/50-engineering/50-repository-layout.md`; checks:
 `rust-toolchain.toml`; Python tooling comes from uv (the root `pyproject.toml`
 is a dev-only workspace, the `porto` wheel is `packaging/porto/pyproject.toml`).
 
+**The check list.** These are the checks CONTRIBUTING, the PR template and CI
+run; a change is ready when all of them pass:
+
 ```bash
-# Rust
+uv sync                                               # dev tools + an editable porto in .venv
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+uv run ruff check
+uv run ruff format --check
+uv run pyright                                        # strict, python/ + tests/typing/ (ADR-028)
+uv run pytest -q                                      # tests/python/ + tests/typing/
+```
 
-# Python: dev tools + an editable porto in .venv (rebuilt when Rust sources change)
-uv sync
+Tool settings live in the root `pyproject.toml` (ruff, pyright, pytest) and
+`.editorconfig`. `tests/typing/should_fail/` holds samples that MUST fail
+pyright strict; `tests/typing/test_should_fail.py` proves they do, so keep
+them out of the main pyright run.
+
+While iterating:
+
+```bash
+# Rebuild the editable porto after Rust changes (faster than `uv sync`)
+uv run --directory packaging/porto maturin develop
 uv run python -c 'import porto; print(porto.__version__)'
-uv run --directory packaging/porto maturin develop   # faster rebuild while iterating
-uv run ruff check python
-uv run pyright python                                # strict
+uv run ruff format                                    # apply formatting
 
 # A wheel for one interpreter (per-version, no abi3: ADR-024)
 uv run --directory packaging/porto maturin build -i python3.11 --out ../../dist
