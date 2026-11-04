@@ -9,14 +9,15 @@ mod api;
 pub mod async_slots;
 pub mod driver;
 pub mod interned;
+mod py_compat;
 pub mod testing;
 mod throw_args;
 
 pub use driver::ready::Ready;
 pub use driver::trap::{Trap, TrapKind};
 
-/// The `porto._core` module: the trap protocol's awaitables (`_Trap`, `_Ready`), the trap
-/// constructors and private test hooks.
+/// The `porto._core` module: the trap protocol's awaitables (`_Trap`, `_Ready`), the step
+/// driver's private entry points (`_run`, `_spawn`, the trap constructors) and test hooks.
 ///
 /// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
 /// free-threaded CPython 3.14t, so importing it does not re-enable the GIL (ADR-024).
@@ -32,6 +33,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     async_slots::install_am_send::<Trap>(py, driver::trap::trap_am_send)?;
     async_slots::install_am_send::<Ready>(py, driver::ready::ready_am_send)?;
     interned::names(py);
+    api::run::register(module)?;
     api::time::register(module)?;
     testing::register(module)
 }

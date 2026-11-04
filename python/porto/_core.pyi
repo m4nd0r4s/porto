@@ -1,13 +1,15 @@
 """The native extension module, built from crates/porto-py.
 
 Everything except ``__version__`` is internal to porto: the trap protocol's awaitables
-(docs/spec/10-porto-runtime/11-task-model-and-trap-protocol.md §5-§6) and test hooks.
+(docs/spec/10-porto-runtime/11-task-model-and-trap-protocol.md §5-§6), the step driver's
+entry points (§4) and test hooks.
 """
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Coroutine, Generator
 from types import TracebackType
-from typing import Generic, Literal, NoReturn, TypeVar, final, overload
+from typing import Any, Generic, Literal, NoReturn, TypeVar, final, overload
 
+_T = TypeVar("_T")
 _T_co = TypeVar("_T_co", covariant=True)
 
 __version__: str
@@ -66,6 +68,16 @@ class _Ready(Generic[_T_co]):
         /,
     ) -> NoReturn: ...
     def close(self) -> None: ...
+
+def _run(coro: Coroutine[Any, Any, _T], /) -> _T:
+    """Runs ``coro`` as a task on a fresh single-lane runtime; returns its result or raises.
+
+    Tasks it spawned that are still running when it returns are closed.
+    """
+
+def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
+    """Starts ``coro`` as a task on the running runtime. Its exception goes to
+    ``sys.unraisablehook``."""
 
 def _monotonic() -> float:
     """The runtime clock, in seconds: what sleep deadlines are measured on."""

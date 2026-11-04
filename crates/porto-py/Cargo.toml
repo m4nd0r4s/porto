@@ -17,5 +17,8 @@ crate-type = ["cdylib", "rlib"]
 porto-core.workspace = true
 pyo3.workspace = true
 
+[build-dependencies]
+pyo3-build-config.workspace = true
+
 [lints]
 workspace = true

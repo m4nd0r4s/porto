@@ -17,6 +17,8 @@ publish = false
 porto-core = { path = "crates/porto-core" }
 # No abi3: it is unavailable for free-threaded builds (ADR-024), so wheels are per Python version.
 pyo3 = "0.30"
+# The `Py_3_12`-style cfgs for code that differs between CPython versions (porto-py's build.rs).
+pyo3-build-config = "0.30"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
