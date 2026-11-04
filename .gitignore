@@ -23,3 +23,6 @@ __pycache__/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Python: lockfile not committed, like kinemo and hapto
+uv.lock

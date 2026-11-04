@@ -1,0 +1,37 @@
+# uv workspace root: dev tooling only, not a package. The wheels live in packaging/*
+# (docs/spec/50-engineering/50-repository-layout.md).
+[project]
+name = "porto-dev"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+# The wheels are members so `uv run` inside packaging/* uses this root .venv.
+[tool.uv.workspace]
+members = ["packaging/porto"]
+
+[tool.uv.sources]
+porto = { workspace = true }
+
+[dependency-groups]
+dev = [
+    # Built by maturin on `uv sync`; `maturin develop` rebuilds it faster while iterating.
+    "porto",
+    "maturin>=1.16,<2",
+    "pytest>=9",
+    "pyright>=1.1.400",
+    "ruff>=0.14",
+    "towncrier>=25",
+    # The asyncio baseline the benchmarks compare against (M0 kill criterion).
+    "uvloop>=0.22",
+]
+
+# Minimal until the lint bead lands its full configuration.
+[tool.pyright]
+include = ["python"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
