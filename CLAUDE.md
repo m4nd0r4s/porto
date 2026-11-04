@@ -117,7 +117,7 @@ maturin runs from `packaging/porto` (its `-m` flag takes a `Cargo.toml`, not a
 porto follows [kinemo](https://github.com/m4nd0r4s/kinemo) and
 [hapto](https://github.com/m4nd0r4s/hapto):
 
-- **Personal GitHub only.** Remote `git@github-m4nd0r4s:m4nd0r4s/porto.git`;
+- **Personal GitHub only.** Remote `https://github.com/m4nd0r4s/porto.git` (private for now);
   commits as `M4nd0r4s <25236463+m4nd0r4s@users.noreply.github.com>` (set in
   this repo's git config). Never the work identity.
 - **English everywhere:** code, comments, docs, commit messages, beads.
@@ -127,7 +127,7 @@ porto follows [kinemo](https://github.com/m4nd0r4s/kinemo) and
   a test that triggers it.
 - **Commits** are small and focused, with a short imperative message
   ("Add the timer wheel's level cascade").
-- Dual license MIT OR Apache-2.0 (ADR-029, pending acceptance).
+- Dual license MIT OR Apache-2.0 (ADR-029, accepted).
 
 ## Working with several agents
 
