@@ -1,0 +1,60 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "porto"
+description = "An async runtime for Python, written in Rust"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+keywords = ["async", "runtime", "asyncio", "structured-concurrency", "rust"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Typing :: Typed",
+]
+# The version comes from Cargo (the workspace version of crates/porto-py).
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/m4nd0r4s/porto"
+Issues = "https://github.com/m4nd0r4s/porto/issues"
+
+[tool.maturin]
+module-name = "porto._core"
+manifest-path = "../../crates/porto-py/Cargo.toml"
+python-source = "../../python"
+# maturin 1.16 silently skips a python-source outside this directory, so the Python files are
+# listed here (globs are relative to python-source). Only sources: never a stray `_core.so`
+# from `maturin develop` or a `__pycache__`.
+include = [
+    { path = "porto/**/*.py", format = "wheel" },
+    { path = "porto/**/*.pyi", format = "wheel" },
+    { path = "porto/**/py.typed", format = "wheel" },
+]
+# No abi3: it is unavailable for free-threaded builds (ADR-024), so wheels are per Python version.
+# No `pyo3/extension-module` feature either: pyo3 0.30 deprecates it, and maturin sets
+# PYO3_BUILD_EXTENSION_MODULE itself, so `cargo test` keeps linking libpython.
+
+# `uv sync` rebuilds the editable install when the Rust sources change.
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+    { file = "../../crates/**/*.rs" },
+    { file = "../../crates/**/Cargo.toml" },
+]
