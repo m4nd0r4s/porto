@@ -83,9 +83,34 @@ Douro (M6) starts only after M3, and needs oxiform's OX-1…OX-5.
 
 ## Build & Test
 
-_Filled in by the housekeeping beads as the workspace lands (layout:
-`docs/spec/50-engineering/50-repository-layout.md`; checks:
-`docs/spec/50-engineering/51-build-ci-release.md`)._
+Layout: `docs/spec/50-engineering/50-repository-layout.md`; checks:
+`docs/spec/50-engineering/51-build-ci-release.md`. Rust is pinned by
+`rust-toolchain.toml`; Python tooling comes from uv (the root `pyproject.toml`
+is a dev-only workspace, the `porto` wheel is `packaging/porto/pyproject.toml`).
+
+```bash
+# Rust
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+
+# Python: dev tools + an editable porto in .venv (rebuilt when Rust sources change)
+uv sync
+uv run python -c 'import porto; print(porto.__version__)'
+uv run --directory packaging/porto maturin develop   # faster rebuild while iterating
+uv run ruff check python
+uv run pyright python                                # strict
+
+# A wheel for one interpreter (per-version, no abi3: ADR-024)
+uv run --directory packaging/porto maturin build -i python3.11 --out ../../dist
+
+# Another interpreter (3.11, 3.14t, ...) in its own venv
+uv venv -p 3.14t .venv314t
+(cd packaging/porto && VIRTUAL_ENV=$PWD/../../.venv314t ../../.venv/bin/maturin develop --uv)
+```
+
+maturin runs from `packaging/porto` (its `-m` flag takes a `Cargo.toml`, not a
+`pyproject.toml`). `uv.lock` is not committed.
 
 ## Conventions
 
