@@ -27,13 +27,15 @@ dev = [
     # The asyncio baseline the benchmarks compare against (M0 kill criterion). uvloop does not
     # build on Windows, so the uv sync there leaves it out.
     "uvloop>=0.22; sys_platform != 'win32'",
+    # The micro-benchmark harness (bench/micro/, 53-benchmarks.md §1-§2).
+    "pyperf>=2.9",
 ]
 
 [tool.ruff]
 target-version = "py311"
 # Same as rustfmt's default, so Rust and Python wrap at the same column.
 line-length = 100
-src = ["python", "tests/python", "tests/typing"]
+src = ["python", "tests/python", "tests/typing", "bench/micro"]
 # Python sources only: the snippets in README.md and docs/spec/ are illustrative, not code.
 include = ["*.py", "*.pyi", "**/pyproject.toml"]
 
@@ -63,8 +65,8 @@ docstring-code-format = true
 # MUST fail strict; tests/typing/test_should_fail.py runs pyright on them through
 # should_fail/pyrightconfig.json, which extends this table and undoes the exclude.
 [tool.pyright]
-include = ["python", "scripts", "tests/typing"]
-exclude = ["tests/typing/should_fail"]
+include = ["python", "scripts", "tests/typing", "bench"]
+exclude = ["tests/typing/should_fail", "bench/.venvs"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
 venvPath = "."
