@@ -8,5 +8,5 @@
 pub(crate) mod lane;
 pub(crate) mod pytask;
 pub mod ready;
-mod step;
+pub(crate) mod step;
 pub mod trap;

@@ -6,7 +6,7 @@ Module layout. Names not listed here are private (`_`-prefixed). Signatures use 
 
 ### Running
 ```python
-def run[**P, T](main: Callable[P, Awaitable[T]] | Awaitable[T], *args: P.args,
+def run[*Ts, T](main: Callable[[*Ts], Awaitable[T]] | Awaitable[T], /, *args: *Ts,
                 config: RuntimeConfig | None = None, **config_overrides: Any) -> T
 class Runtime:
     def __init__(self, config: RuntimeConfig | None = None, **overrides: Any) -> None
@@ -45,7 +45,9 @@ def in_runtime() -> bool
 | `cancel_timeout` | `float` | `5.0` |
 
 ### Time
-`current_time() -> float`, `monotonic() -> float`, `async sleep(s: float)`, `async sleep_until(t: float)`, `async sleep_forever() -> NoReturn`, `async checkpoint()`, `interval(period, *, missed="skip") -> AsyncIterator[float]`.
+`current_time() -> float`, `monotonic() -> float`, `sleep(seconds: float, /) -> Awaitable[None]`, `async sleep_until(t: float)`, `async sleep_forever() -> NoReturn`, `checkpoint() -> Awaitable[None]`, `interval(period, *, missed="skip") -> AsyncIterator[float]`.
+
+`sleep` and `checkpoint` return a trap (§11 §5, T1), not a coroutine: they are the hottest awaits, and a trap costs one freelisted object where a coroutine costs a frame. Await the result right away.
 
 ### Structured concurrency
 ```python
@@ -56,7 +58,7 @@ def timeout(seconds: float) -> Scope                      # = scope(timeout=seco
 def move_on_after(seconds: float) -> Scope                # = scope(timeout=seconds, raise_on_timeout=False)
 
 class Scope:   # async context manager (and sync CM for shield-only usage)
-    def spawn[T](self, coro_or_fn: Coroutine[Any, Any, T] | Callable[..., Awaitable[T]], *args: Any,
+    def spawn[*Ts, T](self, coro_or_fn: Coroutine[Any, Any, T] | Callable[[*Ts], Awaitable[T]], /, *args: *Ts,
                  name: str | None = None, pin: bool | None = None,
                  context: contextvars.Context | None = None) -> Task[T]
     async def start[T](self, fn: Callable[..., Awaitable[Any]], *args: Any, name: str | None = None) -> T

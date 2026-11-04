@@ -3,16 +3,46 @@
 use std::time::Duration;
 
 use porto_core::time::Deadline;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
+use crate::driver::lane;
 use crate::driver::trap::Trap;
 
 /// Adds the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(checkpoint, module)?)?;
+    module.add_function(wrap_pyfunction!(sleep, module)?)?;
     module.add_function(wrap_pyfunction!(monotonic, module)?)?;
     module.add_function(wrap_pyfunction!(yield_trap, module)?)?;
     module.add_function(wrap_pyfunction!(sleep_trap, module)?)
+}
+
+/// `porto.checkpoint()`: an awaitable that yields to the other tasks once. It is a trap, not a
+/// coroutine, so a checkpoint costs one small allocation from a freelist.
+#[pyfunction]
+fn checkpoint() -> PyResult<Trap> {
+    require_lane("checkpoint")?;
+    Ok(Trap::yield_now())
+}
+
+/// `porto.sleep(seconds)`: an awaitable that resumes the task `seconds` from now, never earlier.
+/// `sleep(0)` yields once; `inf` never resumes.
+#[pyfunction]
+#[pyo3(signature = (seconds, /))]
+fn sleep(seconds: f64) -> PyResult<Trap> {
+    require_lane("sleep")?;
+    sleep_trap(seconds)
+}
+
+/// Fails unless a porto task is running on this thread: porto awaitables only work there.
+fn require_lane(function: &str) -> PyResult<()> {
+    if lane::is_active() {
+        return Ok(());
+    }
+    Err(PyRuntimeError::new_err(format!(
+        "porto: porto.{function}() was called outside porto.run(); porto awaitables only work          in tasks of a porto runtime: start the program with porto.run(main) and await it from          there"
+    )))
 }
 
 /// The runtime clock, in seconds since its origin: what sleep deadlines are measured on.

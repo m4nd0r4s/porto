@@ -12,11 +12,12 @@ use std::task::{Context, Poll, Waker};
 
 use porto_core::Handle;
 use porto_core::time::Sleep;
-use pyo3::exceptions::PyBaseException;
+use pyo3::exceptions::{PyBaseException, PyException};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use super::step;
+use super::{lane, step};
+use crate::api::scope::Task;
 use crate::py_compat::take_exception;
 
 /// A Python coroutine running as a porto task.
@@ -29,9 +30,19 @@ pub(crate) struct PyTask {
     pub(super) resume: Resume,
     /// What the task waits for before its next step.
     pub(super) pending: Pending,
-    /// Where the outcome goes; `None` for a detached task, whose exception is reported as
-    /// unraisable.
-    pub(super) join: Option<Arc<JoinSlot>>,
+    /// Where the outcome goes.
+    pub(super) completion: Completion,
+}
+
+/// Where a task's outcome goes when it finishes.
+pub(crate) enum Completion {
+    /// Nobody waits for it (`_spawn`). An `Exception` goes to `sys.unraisablehook`; any other
+    /// `BaseException` (`KeyboardInterrupt`, `SystemExit`) stops the run (see `lane::fail`).
+    Detached,
+    /// The one waiter of a [`JoinSlot`]: `porto.run` waiting for `main`.
+    Join(Arc<JoinSlot>),
+    /// A scope's child: the outcome goes to its [`Task`] object, which tells the scope.
+    Child(Py<Task>),
 }
 
 // ADR-034: the body stays within 192 bytes (excluding the coroutine).
@@ -56,6 +67,8 @@ pub(super) enum Pending {
     Yield,
     /// The task sleeps until the timer fires.
     Sleep(Sleep),
+    /// The task waits for a wake arranged by the maker of a `Park` trap.
+    Park,
 }
 
 /// How a task ended.
@@ -76,7 +89,7 @@ impl Outcome {
     }
 }
 
-/// Where a task leaves its outcome for the one waiter (the `_run` caller).
+/// Where a task leaves its outcome for the one waiter (the `porto.run` caller).
 ///
 /// The lock is only held to store or take the outcome and the waker, never while calling into
 /// Python (25-cpython-integration-and-memory.md P3).
@@ -128,7 +141,7 @@ impl JoinSlot {
 pub(crate) fn spawn(
     handle: &Handle,
     coro: Bound<'_, PyAny>,
-    join: Option<Arc<JoinSlot>>,
+    completion: Completion,
 ) -> PyResult<()> {
     let py = coro.py();
     // SAFETY: attached (we hold `py`). Returns a new reference, or NULL with an exception set.
@@ -143,7 +156,7 @@ pub(crate) fn spawn(
         context,
         resume: Resume::None,
         pending: Pending::None,
-        join,
+        completion,
     });
     Ok(())
 }
@@ -152,13 +165,19 @@ impl PyTask {
     /// Stores the outcome and releases the coroutine.
     pub(super) fn complete(&mut self, py: Python<'_>, outcome: Outcome) {
         let coro = self.coro.take();
-        match (&self.join, outcome) {
-            (Some(join), outcome) => join.set(outcome),
-            (None, Outcome::Returned(_)) => {}
-            // A detached task has nobody to raise to: report it like an exception in `__del__`.
-            (None, Outcome::Raised(exception)) => {
-                PyErr::from_value(exception.into_bound(py).into_any())
-                    .write_unraisable(py, coro.as_ref().map(|coro| coro.bind(py)));
+        match (&self.completion, outcome) {
+            (Completion::Join(join), outcome) => join.set(outcome),
+            (Completion::Child(task), outcome) => task.get().finish(py, outcome),
+            (Completion::Detached, Outcome::Returned(_)) => {}
+            (Completion::Detached, Outcome::Raised(exception)) => {
+                if exception.bind(py).is_instance_of::<PyException>() {
+                    // Nobody to raise to: report it like an exception in `__del__`.
+                    PyErr::from_value(exception.into_bound(py).into_any())
+                        .write_unraisable(py, coro.as_ref().map(|coro| coro.bind(py)));
+                } else {
+                    // `KeyboardInterrupt`, `SystemExit`: the program asked to stop.
+                    lane::fail(exception);
+                }
             }
         }
     }

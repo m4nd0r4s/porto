@@ -1,5 +1,6 @@
-//! The functions `porto._core` exposes to the `porto` package. M0 has only private (underscore)
-//! entry points; the public `porto.run`, `porto.sleep` and `porto.checkpoint` build on them.
+//! The functions and classes `porto._core` exposes to the `porto` package: the public `run`,
+//! `scope`, `sleep` and `checkpoint`, plus private (underscore) entry points for tests.
 
 pub(crate) mod run;
+pub(crate) mod scope;
 pub(crate) mod time;
