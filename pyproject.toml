@@ -24,8 +24,9 @@ dev = [
     "pyright>=1.1.400",
     "ruff>=0.14",
     "towncrier>=25",
-    # The asyncio baseline the benchmarks compare against (M0 kill criterion).
-    "uvloop>=0.22",
+    # The asyncio baseline the benchmarks compare against (M0 kill criterion). uvloop does not
+    # build on Windows, so the uv sync there leaves it out.
+    "uvloop>=0.22; sys_platform != 'win32'",
 ]
 
 [tool.ruff]
