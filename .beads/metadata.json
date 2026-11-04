@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "porto",
+  "project_id": "bb1b4d33-d848-407e-bde3-fa11cf088abd"
+}
