@@ -1,13 +1,15 @@
 """The native extension module, built from crates/porto-py.
 
 Everything except ``__version__`` is internal to porto: the trap protocol's awaitables
-(docs/spec/10-porto-runtime/11-task-model-and-trap-protocol.md §5-§6) and test hooks.
+(docs/spec/10-porto-runtime/11-task-model-and-trap-protocol.md §5-§6), the step driver's
+entry points (§4) and test hooks.
 """
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Coroutine, Generator
 from types import TracebackType
-from typing import Generic, NoReturn, TypeVar, final, overload
+from typing import Any, Generic, Literal, NoReturn, TypeVar, final, overload
 
+_T = TypeVar("_T")
 _T_co = TypeVar("_T_co", covariant=True)
 
 __version__: str
@@ -16,13 +18,17 @@ __version__: str
 class _Trap:
     """A request to the driver. Awaiting it yields the trap, then returns what the driver sends.
 
-    A trap is taken exactly once: resuming it again raises ``RuntimeError("trap reused")``.
+    A trap is awaited exactly once: resuming it again raises ``RuntimeError("trap reused")``.
     """
 
     @property
-    def kind(self) -> int: ...
+    def kind(self) -> Literal["yield", "sleep"]:
+        """What the trap asks the driver for."""
+
     @property
-    def args(self) -> object: ...
+    def deadline(self) -> float | None:
+        """For a sleep, when it ends, in seconds on the runtime clock (``_monotonic()``)."""
+
     def __await__(self) -> Generator[_Trap, object, object]: ...
     def __iter__(self) -> Generator[_Trap, object, object]: ...
     def __next__(self) -> _Trap: ...
@@ -63,8 +69,24 @@ class _Ready(Generic[_T_co]):
     ) -> NoReturn: ...
     def close(self) -> None: ...
 
-def _make_trap(kind: int, args: object = None) -> _Trap:
-    """Test hook: a fresh trap."""
+def _run(coro: Coroutine[Any, Any, _T], /) -> _T:
+    """Runs ``coro`` as a task on a fresh single-lane runtime; returns its result or raises.
+
+    Tasks it spawned that are still running when it returns are closed.
+    """
+
+def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
+    """Starts ``coro`` as a task on the running runtime. Its exception goes to
+    ``sys.unraisablehook``."""
+
+def _monotonic() -> float:
+    """The runtime clock, in seconds: what sleep deadlines are measured on."""
+
+def _yield_trap() -> _Trap:
+    """A trap that yields to the scheduler once."""
+
+def _sleep_trap(delay: float, /) -> _Trap:
+    """A trap that resumes the task ``delay`` seconds from now, never earlier."""
 
 def _make_ready(value: _T_co, /) -> _Ready[_T_co]:
     """Test hook: a ready awaitable holding ``value``."""

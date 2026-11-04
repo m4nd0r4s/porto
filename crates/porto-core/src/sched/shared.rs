@@ -62,6 +62,12 @@ impl Handle {
         }
     }
 
+    /// A handle to the runtime running on this thread (inside its `block_on` or one of its
+    /// tasks), if any.
+    pub fn try_current() -> Option<Self> {
+        lane::current_handle()
+    }
+
     pub(crate) fn same_runtime(&self, other: &Handle) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
     }

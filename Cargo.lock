@@ -41,7 +41,9 @@ version = "0.0.0"
 name = "porto-py"
 version = "0.0.0"
 dependencies = [
+ "porto-core",
  "pyo3",
+ "pyo3-build-config",
 ]
 
 [[package]]

@@ -14,7 +14,11 @@ name = "porto_py"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+porto-core.workspace = true
 pyo3.workspace = true
+
+[build-dependencies]
+pyo3-build-config.workspace = true
 
 [lints]
 workspace = true

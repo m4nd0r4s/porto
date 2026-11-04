@@ -36,37 +36,58 @@ def no_traps(trap: _core._Trap) -> object:
 
 
 def test_the_driver_receives_the_trap_with_its_payload() -> None:
-    trap = _core._make_trap(3, ("deadline", 1.5))
+    before = _core._monotonic()
+    trap = _core._sleep_trap(1.5)
 
     async def main() -> object:
         return await trap
 
     coro = main()
     assert coro.send(None) is trap
-    assert trap.kind == 3
-    assert trap.args == ("deadline", 1.5)
+    assert trap.kind == "sleep"
+    assert trap.deadline is not None
+    assert before + 1.5 <= trap.deadline <= _core._monotonic() + 1.5
     coro.close()
 
 
+def test_a_yield_trap_has_no_deadline() -> None:
+    trap = _core._yield_trap()
+    assert trap.kind == "yield"
+    assert trap.deadline is None
+    assert repr(trap) == "<porto._core._Trap yield fresh>"
+
+
+@pytest.mark.parametrize("delay", [-1.0, float("nan")])
+def test_a_sleep_trap_rejects_a_negative_or_nan_delay(delay: float) -> None:
+    with pytest.raises(ValueError, match="sleep delay must be a number of seconds >= 0"):
+        _core._sleep_trap(delay)
+
+
+def test_an_infinite_sleep_trap_never_ends() -> None:
+    trap = _core._sleep_trap(float("inf"))
+    assert trap.deadline is not None
+    assert trap.deadline > _core._monotonic() + 100 * 365 * 24 * 3600
+
+
 def test_a_trap_in_a_nested_chain_evaluates_to_the_value_the_driver_sends() -> None:
-    async def leaf(kind: int) -> object:
-        return await _core._make_trap(kind)
+    async def leaf() -> object:
+        return await _core._yield_trap()
 
     async def middle() -> tuple[object, object]:
-        first = await leaf(1)
-        second = await leaf(2)
+        first = await leaf()
+        second = await leaf()
         return first, second
 
     async def main() -> object:
         return await middle()
 
-    answers = {1: "one", 2: (2, "a tuple stays one value")}
-    result = drive(main(), lambda trap: answers[trap.kind])
+    answers = iter(["one", (2, "a tuple stays one value")])
+    result = drive(main(), lambda trap: next(answers))
     assert result == ("one", (2, "a tuple stays one value"))
 
 
 def test_a_trap_evaluates_to_none_when_resumed_with_next() -> None:
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
     assert next(trap) is trap
     with pytest.raises(StopIteration) as stop:
         next(trap)
@@ -76,7 +97,7 @@ def test_a_trap_evaluates_to_none_when_resumed_with_next() -> None:
 def test_throw_reraises_inside_the_coroutine_at_the_await() -> None:
     async def main() -> str:
         try:
-            await _core._make_trap(0)
+            await _core._yield_trap()
         except ValueError as error:
             return f"caught {error}"
         return "not thrown"
@@ -90,7 +111,7 @@ def test_throw_reraises_inside_the_coroutine_at_the_await() -> None:
 
 def test_an_uncaught_throw_propagates_out_of_the_chain() -> None:
     async def leaf() -> object:
-        return await _core._make_trap(0)
+        return await _core._yield_trap()
 
     async def main() -> object:
         return await leaf()
@@ -111,7 +132,7 @@ def test_an_uncaught_throw_propagates_out_of_the_chain() -> None:
     ],
 )
 def test_throw_accepts_the_legacy_signature(args: tuple[Any, ...], expected: BaseException) -> None:
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
     next(trap)
     with pytest.raises(type(expected)) as raised:
         trap.throw(*args)
@@ -119,13 +140,13 @@ def test_throw_accepts_the_legacy_signature(args: tuple[Any, ...], expected: Bas
 
 
 def test_throw_rejects_a_non_exception() -> None:
-    trap: Any = _core._make_trap(0)
+    trap: Any = _core._yield_trap()
     with pytest.raises(TypeError, match="deriving from BaseException, not int"):
         trap.throw(42)
 
 
 def test_throw_rejects_an_instance_with_a_separate_value() -> None:
-    trap: Any = _core._make_trap(0)
+    trap: Any = _core._yield_trap()
     with pytest.raises(TypeError, match="takes no separate value"):
         trap.throw(ValueError("x"), "y")
 
@@ -136,7 +157,7 @@ def test_throw_attaches_the_given_traceback() -> None:
     except ValueError as error:
         traceback = error.__traceback__
     assert traceback is not None
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
     with pytest.raises(ValueError, match="fresh") as raised:
         trap.throw(ValueError, "fresh", traceback)
     assert raised.value.__traceback__ is not None
@@ -144,7 +165,7 @@ def test_throw_attaches_the_given_traceback() -> None:
 
 
 def test_awaiting_a_trap_twice_raises_trap_reused() -> None:
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
 
     async def main() -> None:
         await trap
@@ -167,7 +188,7 @@ RESUMES_WITH_NONE: dict[str, Callable[[_core._Trap], object]] = {
 def test_resuming_a_completed_trap_raises_trap_reused(
     resume: Callable[[_core._Trap], object],
 ) -> None:
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
     assert _core._send(trap, None) == (False, trap)
     assert _core._send(trap, "answer") == (True, "answer")
     with pytest.raises(RuntimeError, match=r"^trap reused: .*create a new trap for each await"):
@@ -176,7 +197,7 @@ def test_resuming_a_completed_trap_raises_trap_reused(
 
 @pytest.mark.parametrize("finish", ["close", "throw"])
 def test_a_closed_or_thrown_trap_cannot_be_resumed(finish: str) -> None:
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
     next(trap)
     if finish == "close":
         trap.close()
@@ -195,7 +216,7 @@ EARLY_SENDS: dict[str, Callable[[_core._Trap], object]] = {
 
 @pytest.mark.parametrize("send", EARLY_SENDS.values(), ids=EARLY_SENDS.keys())
 def test_sending_a_value_into_a_fresh_trap_raises(send: Callable[[_core._Trap], object]) -> None:
-    trap = _core._make_trap(0)
+    trap = _core._yield_trap()
     with pytest.raises(TypeError, match="first resume of an awaitable must be send"):
         send(trap)
     # The failed send did not consume the trap.
@@ -205,12 +226,12 @@ def test_sending_a_value_into_a_fresh_trap_raises(send: Callable[[_core._Trap], 
 def test_a_trap_works_with_yield_from_in_generator_coroutines() -> None:
     @types.coroutine
     def legacy() -> Generator[Any, Any, object]:
-        return (yield from _core._make_trap(5))
+        return (yield from _core._yield_trap())
 
     async def main() -> object:
         return await legacy()
 
-    assert drive(main(), lambda trap: trap.kind * 2) == 10
+    assert drive(main(), lambda trap: trap.kind * 2) == "yieldyield"
 
 
 @pytest.mark.parametrize("value", [42, None, ("a", "tuple"), ValueError("an exception value")])
@@ -248,7 +269,7 @@ def test_the_awaitables_cannot_be_created_from_python(cls: type[object]) -> None
 
 def test_a_trap_fits_its_size_budget() -> None:
     # 25-cpython-integration-and-memory.md §5: a Trap is at most 48 bytes.
-    assert sys.getsizeof(_core._make_trap(0)) <= 48
+    assert sys.getsizeof(_core._yield_trap()) <= 48
 
 
 # Allocations. `_count_allocations` counts every malloc, calloc and realloc CPython makes (MEM and
