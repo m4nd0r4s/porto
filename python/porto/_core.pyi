@@ -1,10 +1,10 @@
 """The native extension module, built from crates/porto-py.
 
 Everything except ``__version__`` is internal to porto: the trap protocol's awaitables
-(docs/spec/10-porto-runtime/11-task-model-and-trap-protocol.md §5-§6).
+(docs/spec/10-porto-runtime/11-task-model-and-trap-protocol.md §5-§6) and test hooks.
 """
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from types import TracebackType
 from typing import Generic, NoReturn, TypeVar, final, overload
 
@@ -62,3 +62,15 @@ class _Ready(Generic[_T_co]):
         /,
     ) -> NoReturn: ...
     def close(self) -> None: ...
+
+def _make_trap(kind: int, args: object = None) -> _Trap:
+    """Test hook: a fresh trap."""
+
+def _make_ready(value: _T_co, /) -> _Ready[_T_co]:
+    """Test hook: a ready awaitable holding ``value``."""
+
+def _send(iterator: object, value: object, /) -> tuple[bool, object]:
+    """Test hook: ``PyIter_Send``. ``(True, result)`` on return, ``(False, yielded)`` on yield."""
+
+def _count_allocations(function: Callable[[], object], /) -> int:
+    """Test hook: allocations CPython makes (MEM and OBJ domains) while ``function()`` runs."""

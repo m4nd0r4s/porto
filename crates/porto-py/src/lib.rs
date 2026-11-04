@@ -8,13 +8,15 @@ use pyo3::prelude::*;
 pub mod async_slots;
 pub mod interned;
 pub mod ready;
+pub mod testing;
 mod throw_args;
 pub mod trap;
 
 pub use ready::Ready;
 pub use trap::Trap;
 
-/// The `porto._core` module: the trap protocol's awaitables, `_Trap` and `_Ready`.
+/// The `porto._core` module: the trap protocol's awaitables (`_Trap`, `_Ready`) and private
+/// test hooks.
 ///
 /// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
 /// free-threaded CPython 3.14t, so importing it does not re-enable the GIL (ADR-024).
@@ -30,5 +32,5 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     async_slots::install_am_send::<Trap>(py, trap::trap_am_send)?;
     async_slots::install_am_send::<Ready>(py, ready::ready_am_send)?;
     interned::names(py);
-    Ok(())
+    testing::register(module)
 }
