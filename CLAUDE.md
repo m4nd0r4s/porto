@@ -107,6 +107,11 @@ Tool settings live in the root `pyproject.toml` (ruff, pyright, pytest) and
 pyright strict; `tests/typing/test_should_fail.py` proves they do, so keep
 them out of the main pyright run.
 
+When you add or update a Rust dependency, run
+`uv run python scripts/third_party_licenses.py` and commit the regenerated
+`packaging/*/THIRD_PARTY_LICENSES.md` (one per wheel, shipped in its
+dist-info/licenses); `--check` fails when one is out of date.
+
 While iterating:
 
 ```bash
