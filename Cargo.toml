@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# Internal crates follow the pinned toolchain (ADR-031). The published crates (`porto`,
+# `porto-abi`, `porto-pyo3`) move to the pin minus two minor releases from M3.
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/m4nd0r4s/porto"
+# Nothing is published until the API settles (51-build-ci-release.md §4).
+publish = false
+
+[workspace.dependencies]
+porto-core = { path = "crates/porto-core" }
+# No abi3: it is unavailable for free-threaded builds (ADR-024), so wheels are per Python version.
+pyo3 = "0.30"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+# A curated pedantic subset: the lints that catch real bugs in low-level code, not style nits.
+borrow_as_ptr = "warn"
+cast_lossless = "warn"
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+manual_let_else = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+semicolon_if_nothing_returned = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Task-level panics are caught and become `porto.RustPanic` (ADR-027), so unwinding stays on.
+panic = "unwind"
+
+# Release wheels. The PGO training and rebuild hook in here in M8 (51-build-ci-release.md §3).
+[profile.dist]
+inherits = "release"
+
+[profile.dev]
+# Keep the dev build small: line tables for our crates, no debuginfo for dependencies.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
