@@ -80,6 +80,8 @@ port = await s.start(server, 0)
 ## 4. Task cancellation
 `task.cancel()` cancels an implicit per-task scope that wraps the task's coroutine. It is equivalent to the task having been spawned inside `porto.scope()` and that scope being cancelled. It does not cancel siblings, and the absorbed `Cancelled` does not count as a failure.
 
+Reading the outcome of a task that ended cancelled (`task.result()`, or joining it) raises `porto.Cancelled`, as `asyncio.Task.result()` raises `CancelledError`: a fresh exception per read, whose `__cause__` is the `Cancelled` the task ended with. A joiner whose own scope is not cancelled that lets it propagate fails like any other exception (C4); catching it is how to tell "the task was cancelled" apart.
+
 ## 5. Interaction with asyncio-style code (summary; details §22)
 `asyncio.CancelledError` raised by asyncio code inside a Porto task, when the Porto scope is not cancelled, is treated as a regular exception (a failure). This is deliberate. It surfaces bugs where asyncio libraries cancel things that aren't theirs.
 

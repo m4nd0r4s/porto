@@ -99,7 +99,8 @@ class Scope:
         """Cancels the scope: every task in it, and in the scopes nested in it, gets
         ``porto.Cancelled`` at its next await; waiting tasks are woken. Safe from any thread;
         cancelling again does nothing. Cancelling before the block is entered cancels it as it
-        is entered."""
+        is entered; cancelling after it exited affects no task, but ``cancel_called`` still
+        turns true."""
 
     @property
     def cancel_called(self) -> bool:

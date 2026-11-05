@@ -118,7 +118,9 @@ struct KeyHasher(u64);
 
 impl Hasher for KeyHasher {
     fn finish(&self) -> u64 {
-        self.0
+        // Keys are cache-line-aligned addresses: the multiply keeps their zero low bits, and
+        // the table picks buckets from the low bits, so bring the mixed high bits down.
+        self.0.rotate_left(26)
     }
 
     fn write(&mut self, bytes: &[u8]) {

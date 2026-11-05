@@ -36,7 +36,7 @@ use pyo3::prelude::*;
 
 use super::lane;
 use super::pending::{Kind, Payload, Pending};
-use super::pytask::{PyTask, Resume, TaskOutcome, shut_down_error};
+use super::pytask::{PyTask, Resume, TaskOutcome, joined_cancelled, shut_down_error};
 
 /// Who keeps a task's waker for its current wait, besides what it waits on: bits of
 /// `PyTask::wait_links`, cleared when the wait ends.
@@ -263,8 +263,9 @@ impl PyTask {
 fn joined_resume(py: Python<'_>, outcome: Option<TaskOutcome>) -> Resume {
     match outcome {
         Some(TaskOutcome::Ok(value)) => Resume::Value(value),
-        Some(TaskOutcome::Err(exception) | TaskOutcome::Cancelled(Some(exception))) => {
-            Resume::Throw(exception)
+        Some(TaskOutcome::Err(exception)) => Resume::Throw(exception),
+        Some(TaskOutcome::Cancelled(Some(exception))) => {
+            Resume::Throw(joined_cancelled(py, exception))
         }
         Some(TaskOutcome::Cancelled(None)) | None => {
             Resume::Throw(shut_down_error().into_value(py))

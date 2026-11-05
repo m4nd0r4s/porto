@@ -11,6 +11,7 @@ use pyo3::prelude::*;
 use super::blocking;
 use super::wait_op::{Grant, SyncWait};
 use crate::api::time::require_lane;
+use crate::driver::ready::Ready;
 use crate::driver::step::checkpoint_if_needed;
 use crate::driver::thin::{WaitSource, Waitable};
 
@@ -118,15 +119,20 @@ impl Lock {
         self.acquire()
     }
 
-    #[pyo3(signature = (_exc_type, _exc, _traceback, /))]
+    #[pyo3(signature = (_exc_type, exc, _traceback, /))]
     fn __aexit__(
         &self,
         py: Python<'_>,
         _exc_type: &Bound<'_, PyAny>,
-        _exc: &Bound<'_, PyAny>,
+        exc: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
         self.release()?;
+        // An exception is in flight: no checkpoint, which could raise `Cancelled` in its place
+        // (and a cancelled scope would then absorb it, losing the original error).
+        if !exc.is_none() {
+            return Ok(Py::new(py, Ready::new(py.None()))?.into_any());
+        }
         // After the release: a checkpoint here (T2) never holds the lock.
         checkpoint_if_needed(py, py.None())
     }

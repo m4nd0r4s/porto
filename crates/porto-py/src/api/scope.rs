@@ -225,7 +225,8 @@ impl Scope {
 
     /// Cancels the scope: every task in it, and in the scopes nested in it, gets
     /// `porto.Cancelled` at its next checkpoint, and the waiting ones are woken (C1, C10).
-    /// Safe from any thread. Cancelling again, or a closed scope, does nothing.
+    /// Safe from any thread. Cancelling again does nothing; cancelling a closed scope affects
+    /// no task, but `cancel_called` still turns true.
     #[pyo3(signature = (reason = None))]
     fn cancel(&self, reason: Option<String>) {
         let flags = self

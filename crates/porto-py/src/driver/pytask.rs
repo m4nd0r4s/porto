@@ -38,7 +38,7 @@ use pyo3::prelude::*;
 use super::pending::{Kind, Payload};
 use super::{lane, step};
 use crate::api::scope::Task;
-use crate::errors::RuntimeClosed;
+use crate::errors::{Cancelled, RuntimeClosed};
 use crate::py_compat::take_exception;
 
 /// The scope type of the cancel stack: scopes collect Python exceptions.
@@ -190,12 +190,27 @@ impl TaskOutcome {
     pub(crate) fn into_result(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self {
             Self::Ok(value) => Ok(value),
-            Self::Err(exception) | Self::Cancelled(Some(exception)) => {
-                Err(PyErr::from_value(exception.into_bound(py).into_any()))
-            }
+            Self::Err(exception) => Err(PyErr::from_value(exception.into_bound(py).into_any())),
+            Self::Cancelled(Some(exception)) => Err(PyErr::from_value(
+                joined_cancelled(py, exception).into_bound(py).into_any(),
+            )),
             Self::Cancelled(None) => Err(shut_down_error()),
         }
     }
+}
+
+/// What reading the outcome of a task that ended `Cancelled` raises: a fresh `porto.Cancelled`
+/// per read, caused by the one the task ended with, as `asyncio.Task.result()` does (spec 15
+/// §4). Re-raising the stored exception would grow its traceback with every reader.
+pub(crate) fn joined_cancelled(py: Python<'_>, stored: Py<PyBaseException>) -> Py<PyBaseException> {
+    let fresh = Cancelled::new_err(
+        "porto: the task you waited for was cancelled; its own cancellation is the cause below",
+    );
+    fresh.set_cause(
+        py,
+        Some(PyErr::from_value(stored.into_bound(py).into_any())),
+    );
+    fresh.into_value(py)
 }
 
 /// What reading the outcome of a task cancelled by its runtime raises.

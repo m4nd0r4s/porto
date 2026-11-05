@@ -441,3 +441,52 @@ def test_szb105_a_lock_handed_over_just_before_a_cancel_is_never_leaked() -> Non
 
     porto.run(main)
     assert events == ["waiting", "holding", "cancelled"]
+
+
+def test_an_exception_leaving_a_lock_block_is_not_replaced_by_the_scope_cancel() -> None:
+    # Lock.__aexit__ must not checkpoint while an exception is in flight: its Cancelled would
+    # replace the error, and the cancelled scope would then absorb it.
+    lock = porto.Lock()
+
+    async def main() -> None:
+        async with porto.scope() as s, lock:
+            s.cancel()
+            raise ValueError("kept")
+
+    with pytest.raises(ValueError, match="kept"):
+        porto.run(main)
+    assert not lock.locked()
+
+
+def test_a_keyboard_interrupt_leaving_a_mutex_block_survives_a_cancelled_scope() -> None:
+    mutex = porto.Mutex[int](0)
+
+    async def main() -> None:
+        async with porto.scope() as s, mutex as guard:
+            guard.set(1)
+            s.cancel()
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        porto.run(main)
+    assert not mutex.locked()
+
+
+def test_reading_a_cancelled_child_raises_a_fresh_cancelled_each_time() -> None:
+    async def main() -> tuple[BaseException, BaseException]:
+        async with porto.scope() as inner:
+            task = inner.spawn(porto.sleep, 30)
+            await porto.sleep(0)
+            inner.cancel()
+        raised: list[BaseException] = []
+        for _ in range(2):
+            try:
+                task.result()
+            except porto.Cancelled as error:
+                raised.append(error)
+        return raised[0], raised[1]
+
+    first, second = porto.run(main)
+    assert first is not second
+    assert isinstance(first.__cause__, porto.Cancelled)
+    assert first.__cause__ is second.__cause__
