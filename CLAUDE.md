@@ -136,9 +136,16 @@ maturin runs from `packaging/porto` (its `-m` flag takes a `Cargo.toml`, not a
 porto follows [kinemo](https://github.com/m4nd0r4s/kinemo) and
 [hapto](https://github.com/m4nd0r4s/hapto):
 
-- **Personal GitHub only.** Remote `https://github.com/m4nd0r4s/porto.git` (private for now);
+- **Personal GitHub only.** Remote `https://github.com/m4nd0r4s/porto.git` (public);
   commits as `M4nd0r4s <25236463+m4nd0r4s@users.noreply.github.com>` (set in
-  this repo's git config). Never the work identity.
+  this repo's git config). Never the work identity. Beads sync pushes through
+  the git caches in `.beads/embeddeddolt/porto/.dolt/git-remote-cache/*/repo.git`,
+  which inherit the global git identity: set the same name and email in each
+  cache's local config (or scope it with a global `includeIf "gitdir:<repo path>/"`,
+  which also covers caches Dolt creates later). CI's lint job runs
+  `scripts/check_commit_identity.py` on the beads sync refs and on each PR's commits.
+- **`main` is protected:** changes land through a PR with the eight CI checks green
+  (the repository admin may push the beads export directly).
 - **English everywhere:** code, comments, docs, commit messages, beads.
 - **Descriptive names**, **small modules**, **typed public API** (pyright
   strict, `.pyi` stubs).
