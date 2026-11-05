@@ -22,7 +22,9 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
+mod backend;
 mod driver;
+mod mio_driver;
 mod ready;
 mod scheduled_io;
 mod slab;
@@ -31,7 +33,12 @@ mod waiters;
 #[cfg(test)]
 mod test_util;
 
+pub use backend::{
+    BackendSelection, IoBackend, IoBackendConfig, NATIVE_DRIVER_KIND, UnavailableBackend,
+    UnknownIoBackend, select_backend,
+};
 pub use driver::{Driver, DriverKind, DriverWaker, RawOsHandle, RawSource, RegistrationId};
+pub use mio_driver::MioDriver;
 pub use ready::{Interest, Ready};
 pub use scheduled_io::{Direction, Readiness, ReadyEvent, ScheduledIo};
 pub use slab::IoSlab;

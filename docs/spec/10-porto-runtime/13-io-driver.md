@@ -34,6 +34,8 @@ Edge-triggered registration (EPOLLET) is used. Readiness bits are **cleared by t
 | `io_uring` | Linux ≥ 5.19 | `io_backend="io_uring"` |
 | `sim` | any | deterministic mode (§24) |
 
+`io_backend="auto"` picks the OS default. A backend that this OS lacks (`epoll` on macOS, `kqueue` on Linux, `iocp` off Windows) or that is not built yet falls back to the OS default with a warning; with `io_backend_strict=True` it is an error that names the alternatives. mio registers every source edge-triggered (`EPOLLET`, `EV_CLEAR`); its tokens are `RegistrationId`s, and `usize::MAX` is reserved for the driver waker.
+
 ### 3.1 io_uring backend
 - Probe: `io_uring_setup(256, params)` with `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN` when available. On `EPERM`/`ENOSYS`/`EINVAL`, fall back to epoll and warn, unless `io_backend_strict`.
 - One ring **per lane** (single issuer). The ring owned by the lane that registered the resource services it.
