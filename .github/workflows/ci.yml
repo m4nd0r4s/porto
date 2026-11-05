@@ -44,6 +44,8 @@ jobs:
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run pyright
+      # No borrowed-reference C APIs in porto-py (25-cpython-integration-and-memory.md §3).
+      - run: uv run python scripts/check_borrowed_refs.py
       # packaging/porto/THIRD_PARTY_LICENSES.md must match Cargo.lock.
       - run: uv run python scripts/third_party_licenses.py --check
 

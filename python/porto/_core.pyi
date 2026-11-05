@@ -176,5 +176,10 @@ def _make_ready(value: _T_co, /) -> _Ready[_T_co]:
 def _send(iterator: object, value: object, /) -> tuple[bool, object]:
     """Test hook: ``PyIter_Send``. ``(True, result)`` on return, ``(False, yielded)`` on yield."""
 
+def _take_unnormalized_exception(
+    exc_type: type[BaseException], value: object, traceback: TracebackType | None, /
+) -> BaseException:
+    """Test hook: ``PyErr_Restore`` of the raw triple, then porto's ``take_exception``."""
+
 def _count_allocations(function: Callable[[], object], /) -> int:
     """Test hook: allocations CPython makes (MEM and OBJ domains) while ``function()`` runs."""
