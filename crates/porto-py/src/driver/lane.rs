@@ -8,9 +8,9 @@
 //! stop-the-world GC proceed.
 //!
 //! The lane also keeps what belongs to one run and must not outlive it: an error that stops the
-//! run (see [`fail`]), the interrupts filed for waiting tasks (see [`interrupt`]), and the
-//! wakers of tasks whose wait would otherwise keep them alive forever once the run ends (see
-//! [`keep_linked_wait`]).
+//! run (see [`fail`]), the interrupts a test hook files for waiting tasks (see [`interrupt`]),
+//! and the wakers of tasks whose wait would otherwise keep them alive forever once the run ends
+//! (see [`keep_linked_wait`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -144,9 +144,9 @@ fn task_key(waker: &Waker) -> usize {
 /// it. The wait is given up first (T3, `wait.rs`). A task that is not waiting gets it at its
 /// next wait that is not over at once. A later interrupt of the same task replaces this one.
 ///
-/// This is how a cancellation reaches a waiting task until scopes deliver it (porto-szb.36:
-/// `Scope.cancel` wakes the task, and its poll finds `effective_cancel` instead of this
-/// entry). The private `_interrupt` test hook files them.
+/// A scope's cancellation reaches a waiting task the same way with `Cancelled` (`step.rs`);
+/// this is for the private `_interrupt` test hook, which throws other exceptions, also into
+/// waits a cancellation does not give up (`ScopeExit`).
 pub(crate) fn interrupt(waker: &Waker, exception: Py<PyBaseException>) {
     let previous = LANE.with_borrow_mut(|lane| lane.interrupts.insert(task_key(waker), exception));
     drop(previous);

@@ -141,3 +141,121 @@ fn a_failing_child_cancels_before_the_owner_can_exit() {
         assert_eq!(seen, Some(CancelReason::ChildFailed));
     });
 }
+
+/// A task registers as a waiter of a nested scope while another thread cancels the root
+/// (C10): either the cancel wakes it, or its registration sees the cancel. Never neither, which
+/// would leave it waiting forever.
+#[test]
+fn register_waiter_vs_cancel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let scope = ScopeNode::new_child(&root, 1, false);
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || assert!(root.cancel(CancelReason::Explicit)))
+        };
+
+        let wakes = std::sync::Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&wakes));
+        let saw_cancel = scope.register_waiter(1, &waker);
+
+        canceller.join().unwrap();
+        assert!(saw_cancel || wakes.0.load(Ordering::SeqCst) == 1);
+        scope.unregister_waiter(1);
+    });
+}
+
+/// The scope's own walk cache against a cancel of its parent from another thread: whatever a
+/// check saw before, one after the cancel returned sees it, and a check from a third thread
+/// that refills the cache meanwhile never leaves a stale answer behind.
+#[test]
+fn scope_walk_cache_vs_cancel() {
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let scope = ScopeNode::new_child(&root, 1, false);
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || assert!(root.cancel(CancelReason::Explicit)))
+        };
+        let checker = {
+            let scope = Arc::clone(&scope);
+            thread::spawn(move || scope.is_cancelled())
+        };
+        scope.is_cancelled();
+        canceller.join().unwrap();
+        checker.join().unwrap();
+        assert!(scope.is_cancelled());
+    });
+}
+
+/// From the PR #39 review: a leaf two levels down fills its walk cache while the root is
+/// cancelled and an unrelated scope is cancelled too (two generation bumps in either order).
+#[test]
+fn scope_walk_cache_two_levels_vs_root_and_unrelated_cancel() {
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let mid = ScopeNode::new_child(&root, 1, false);
+        let leaf = ScopeNode::new_child(&mid, 1, false);
+        let other = Scope::new_root(0);
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || assert!(root.cancel(CancelReason::Explicit)))
+        };
+        let unrelated = {
+            let other = Arc::clone(&other);
+            thread::spawn(move || {
+                other.cancel(CancelReason::Explicit);
+            })
+        };
+        leaf.is_cancelled();
+        canceller.join().unwrap();
+        // After the root cancel returned, a check on this thread must see it, whatever the
+        // unrelated cancel does meanwhile.
+        assert!(leaf.is_cancelled());
+        unrelated.join().unwrap();
+        assert!(leaf.is_cancelled());
+    });
+}
+
+/// ADVERSARIAL: register in a grandchild while the root is cancelled.
+#[test]
+fn register_waiter_grandchild_vs_cancel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+    struct CountWakes(AtomicUsize);
+    impl Wake for CountWakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let mid = ScopeNode::new_child(&root, 1, false);
+        let leaf = ScopeNode::new_child(&mid, 1, false);
+        let canceller = {
+            let mid = Arc::clone(&mid);
+            thread::spawn(move || assert!(mid.cancel(CancelReason::Explicit)))
+        };
+        let wakes = std::sync::Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&wakes));
+        // A check (cache fill) before registering, like the step loop's `cancellation()`.
+        let early = leaf.is_cancelled();
+        let saw_cancel = leaf.register_waiter(1, &waker);
+        canceller.join().unwrap();
+        assert!(early || saw_cancel || wakes.0.load(Ordering::SeqCst) == 1);
+        // After a wake, the woken task's cached check sees it.
+        assert!(leaf.is_cancelled());
+        leaf.unregister_waiter(1);
+    });
+}

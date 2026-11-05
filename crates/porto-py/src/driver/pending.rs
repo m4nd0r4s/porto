@@ -69,6 +69,21 @@ impl Kind {
         !matches!(self, Self::None | Self::Yield | Self::Sleep)
     }
 
+    /// Whether a cancellation gives the wait up (T3) while it is not over: every kind but the
+    /// yields (the task is queued already, and a `YieldThen` holds a result it must get, see
+    /// `step.rs`) and `ScopeExit` (an exit never abandons its children, C5).
+    pub(crate) fn is_cancellable(self) -> bool {
+        matches!(
+            self,
+            Self::Sleep
+                | Self::Notified
+                | Self::Io
+                | Self::Join
+                | Self::Future
+                | Self::AsyncioFuture
+        )
+    }
+
     /// The name `_Trap.kind` shows.
     pub(crate) fn name(self) -> &'static str {
         match self {

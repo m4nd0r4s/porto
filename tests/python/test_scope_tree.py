@@ -2,9 +2,9 @@
 C5): children are counted and their failures recorded by the scope's node, and the exit waits
 on a ``ScopeExit`` trap.
 
-A failing child cancels its scope (``cancelled: a child failed`` in its repr); the siblings
-and the body only stop once checkpoints deliver the cancellation (porto-szb.36). Until then,
-``_interrupt(token, Cancelled())`` stands in for that delivery.
+A failing child cancels its scope (``cancelled: a child failed`` in its repr), which stops the
+siblings at their next checkpoint (test_cancellation.py covers the delivery).
+``_interrupt(token, exc)`` throws other exceptions into a waiting task.
 """
 
 import gc
@@ -82,23 +82,34 @@ def test_C4_a_child_that_returns_does_not_cancel_the_scope() -> None:
 
 def test_C4_a_cancelled_absorbed_by_its_cancelled_scope_is_not_a_failure() -> None:
     blocked = Blocked()
+    reached: list[str] = []
+    seen: list[Any] = []
 
-    async def main() -> None:
+    async def body() -> None:
         async with porto.scope() as s:
-            task = s.spawn(blocked.run)
+            seen.append(s)
+            seen.append(s.spawn(blocked.run))
             await wait_until(lambda: blocked.probe.waiting == 1)
             s.spawn(fail_with, ValueError("first"))
-            await wait_until(lambda: "cancelled" in repr(s))
-            # What cancel delivery (porto-szb.36) will throw into the sibling.
-            blocked.interrupt(porto.Cancelled())
-            await wait_until(task.done)
-            # The task itself still reports how it ended.
-            with pytest.raises(porto.Cancelled):
-                task.result()
+            # The failure cancels the scope: the body's next checkpoint raises, and the
+            # sibling is woken with `Cancelled`.
+            await porto.sleep(30)
+            reached.append("after the sleep")
 
-    with pytest.raises(ExceptionGroup) as raised:
-        run(main())
-    assert [repr(error) for error in raised.value.exceptions] == ["ValueError('first')"]
+    async def main() -> None:
+        with pytest.raises(ExceptionGroup) as raised:
+            await body()
+        assert [repr(error) for error in raised.value.exceptions] == ["ValueError('first')"]
+        scope, task = seen
+        # The sibling reports how it ended, and the body's `Cancelled` is not in the group.
+        assert repr(task) == "<porto.Task cancelled>"
+        with pytest.raises(porto.Cancelled):
+            task.result()
+        assert scope.cancel_called
+        assert scope.cancelled_caught
+
+    run(main())
+    assert reached == []
 
 
 def test_C4_a_cancelled_while_the_scope_is_not_cancelled_is_a_failure() -> None:

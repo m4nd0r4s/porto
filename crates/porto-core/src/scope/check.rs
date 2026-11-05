@@ -13,7 +13,7 @@ use super::sync::CANCEL_GENERATION;
 ///
 /// Scopes are compared by id, not address: a scope freed and replaced by another at the same
 /// address must not inherit its cached answer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CancelCache {
     scope_id: u64,
     epoch: u64,

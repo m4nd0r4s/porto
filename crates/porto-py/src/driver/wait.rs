@@ -21,6 +21,12 @@
 //! holds what it waits on (the payload), which holds the task's waker. If nothing ends the wait,
 //! nothing ever frees either, so the lane keeps the waker too ([`lane::keep_linked_wait`]) and
 //! wakes it when the run ends, which cancels the task (spec 11 §3.2).
+//!
+//! A cancellable wait (every kind but the yields and `ScopeExit`, which never abandons its
+//! children, C5) of a task in a scope is also filed with its innermost scope
+//! ([`PyTask::watch_cancel`]), so a cancel that reaches the scope wakes it, from any thread
+//! (C10). That is the same cycle (the task holds its scope), so the lane keeps those wakers
+//! too.
 
 use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker};
@@ -30,7 +36,18 @@ use pyo3::prelude::*;
 
 use super::lane;
 use super::pending::{Kind, Payload, Pending};
-use super::pytask::{PyTask, Resume, TaskOutcome, cancelled_error};
+use super::pytask::{PyTask, Resume, TaskOutcome, joined_cancelled, shut_down_error};
+
+/// Who keeps a task's waker for its current wait, besides what it waits on: bits of
+/// `PyTask::wait_links`, cleared when the wait ends.
+pub(super) struct WaitLinks;
+
+impl WaitLinks {
+    /// The lane ([`lane::keep_linked_wait`]).
+    const LANE: u8 = 1;
+    /// The task's innermost scope ([`porto_core::scope::ScopeNode::register_waiter`]).
+    const SCOPE: u8 = 2;
+}
 
 impl PyTask {
     /// Whether the task waits for something.
@@ -181,11 +198,33 @@ impl PyTask {
     /// `Pending` for a wait whose target now holds `waker` (the task's), which the lane then
     /// keeps too, once per wait: see the module docs.
     fn linked_pending(&mut self, waker: &Waker) -> Poll<Resume> {
-        if !self.linked_wait {
-            self.linked_wait = true;
+        self.keep_on_lane(waker);
+        Poll::Pending
+    }
+
+    fn keep_on_lane(&mut self, waker: &Waker) {
+        if self.wait_links & WaitLinks::LANE == 0 {
+            self.wait_links |= WaitLinks::LANE;
             lane::keep_linked_wait(self.key(), waker);
         }
-        Poll::Pending
+    }
+
+    /// Files `waker` (the task's) with its innermost scope for the pending wait, if the wait
+    /// is cancellable and the task is in a scope, so a cancel that reaches the scope wakes it
+    /// (C10); once per wait. Returns whether the scope is effectively cancelled, checked after
+    /// filing (the caller then gives the wait up): see `ScopeNode::register_waiter`.
+    pub(super) fn watch_cancel(&mut self, waker: &Waker) -> bool {
+        if self.wait_links & WaitLinks::SCOPE != 0 || !self.pending_kind.is_cancellable() {
+            return false;
+        }
+        let key = self.key();
+        let Some(scope) = self.innermost_scope() else {
+            return false;
+        };
+        let cancelled = scope.register_waiter(key, waker);
+        self.wait_links |= WaitLinks::SCOPE;
+        self.keep_on_lane(waker);
+        cancelled
     }
 
     /// The key the lane keeps the task's linked wait under: the body's address, which is the
@@ -197,7 +236,15 @@ impl PyTask {
     /// Moves the payload out; the task waits for nothing afterwards, and the lane no longer
     /// keeps its waker.
     fn take_pending(&mut self) -> Pending {
-        if std::mem::take(&mut self.linked_wait) {
+        let links = std::mem::take(&mut self.wait_links);
+        if links & WaitLinks::SCOPE != 0
+            && let Some(scope) = self.innermost_scope()
+        {
+            // The scope filed with is still the innermost one: scopes are entered and exited
+            // only while the coroutine runs, never during a wait.
+            scope.unregister_waiter(self.key());
+        }
+        if links & WaitLinks::LANE != 0 {
             lane::forget_linked_wait(self.key());
         }
         let kind = std::mem::replace(&mut self.pending_kind, Kind::None);
@@ -217,7 +264,12 @@ fn joined_resume(py: Python<'_>, outcome: Option<TaskOutcome>) -> Resume {
     match outcome {
         Some(TaskOutcome::Ok(value)) => Resume::Value(value),
         Some(TaskOutcome::Err(exception)) => Resume::Throw(exception),
-        Some(TaskOutcome::Cancelled) | None => Resume::Throw(cancelled_error().into_value(py)),
+        Some(TaskOutcome::Cancelled(Some(exception))) => {
+            Resume::Throw(joined_cancelled(py, exception))
+        }
+        Some(TaskOutcome::Cancelled(None)) | None => {
+            Resume::Throw(shut_down_error().into_value(py))
+        }
     }
 }
 

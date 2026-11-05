@@ -108,13 +108,15 @@ fn poll(task, lane, cx) -> Poll<()>:
   loop:
     // 1. Resolve pending wait, if any
     if task.pending != None:
+       if task.budget == 0: wake(self); break Pending   // unpolled: a grant stays in its node
        match task.pending.poll(cx, task):        // §5
-         Pending   -> break with Poll::Pending
-         Ready(r)  -> task.resume = r; task.pending = None
-    // 2. Cancellation check (level-triggered)
-    if let Some(exc) = scopes::effective_cancel(task) && task.resume is not Throw:
-         // Only inject if the task is at a checkpoint (i.e., it just resumed from a trap)
-         task.resume = Throw(Cancelled(exc))
+         Ready(r)  -> task.resume = r; task.pending = None   // a wait that is over wins
+         Pending   ->
+           // 2. Cancellation of a waiting task (level-triggered, §5.2)
+           if task.pending is cancellable and scopes::effective_cancel(task):
+                abandon(task.pending)            // T3
+                task.resume = Throw(Cancelled)
+           else: register the wait with the task's innermost scope; break with Poll::Pending
     // 3. Step Python
     stats.step_start = now()
     r = match task.resume.take():
@@ -133,6 +135,9 @@ fn poll(task, lane, cx) -> Poll<()>:
                                         task.pending = Pending::AsyncioFuture(obj)  // §22
           elif obj is None:               task.pending = Pending::Yield        // bare `yield` from types.coroutine
           else: task.resume = Throw(TypeError("porto: task awaited an unsupported object: {type}")); continue
+          // a checkpoint while effectively cancelled: not waited on (YieldThen, ScopeExit excepted)
+          if task.pending is not YieldThen/ScopeExit and scopes::effective_cancel(task):
+               drop(task.pending); task.resume = Throw(Cancelled); continue
           // fast loop: if the pending wait is immediately ready, continue without yielding
           if task.budget == 0: task.pending = Pending::YieldThen(pending); break Pending (reschedule)
           continue
@@ -175,11 +180,13 @@ The `Pending` variants mirror `TrapKind` plus `AsyncioFuture(PyObj)` and `YieldT
 
 `Io` is packed as one pointer to the operation, which owns its registration reference, interest and op state (13-io-driver.md §5). The operation is a future: polling it attempts the op, and dropping it unregisters its waker.
 
-A woken task whose wait is not over yet is where cancellation is delivered (§4 step 2 for a task that cannot step): the wait is abandoned under T3 and the exception thrown in. A wait that is already over wins: its result is delivered, and the cancellation waits for the next wait.
+A woken task whose wait is not over yet is where cancellation is delivered (§4 step 2 for a task that cannot step): the wait is abandoned under T3 and the exception thrown in. A wait that is already over wins: its result is delivered, and the cancellation waits for the next wait. A task cancelled when it yields a trap gets `Cancelled` thrown back at once instead of waiting. The cancellable kinds are all but `Yield`, `YieldThen` and `ScopeExit` (C5: an exit never abandons its children); a `YieldThen` holds a result its coroutine must get (a lock taken by a fast path), so it is never replaced by `Cancelled`. For the same reason a task out of budget yields *before* polling a wait: a grant that resolved it stays in the wait node, where abandoning the wait passes it on.
+
+A cancellable wait that does not resolve at once is registered with the task's innermost scope (`ScopeState::waiters`, the task's waker by task key) until it ends, which is how `Scope.cancel()` wakes it (15 C10). The registration re-walks the effective cancellation after filing the waker, so a cancel from another thread racing with it is never missed. The scope's hold on the waker is the same cycle as a `Notified` wait's, broken at shutdown the same way (the lane keeps the waker).
 
 ### 5.3 Rules
 - **T1** Every Porto awaitable MUST either complete synchronously or yield exactly one Trap.
-- **T2** Synchronous completion MUST call `checkpoint_if_needed()`. It raises `Cancelled` if the effective scope is cancelled and the cancel was not yet delivered to this checkpoint. It also spends a unit of the budget. When the budget is already spent, it converts the completion into `Trap::Yield` with the result stashed (`Pending::YieldThen(Ready(v))`). Every step spends a unit too (a throw included), so the step that resumes a `YieldThen` spends the first unit of the next poll, and a loop of synchronous completions yields every `coop_budget` awaits.
+- **T2** Synchronous completion MUST call `checkpoint_if_needed()`. It raises `Cancelled` if the effective scope is cancelled (before it spends anything, so an awaitable that took something on its fast path gives it back). Otherwise it spends a unit of the budget. When the budget is already spent, it converts the completion into `Trap::Yield` with the result stashed (`Pending::YieldThen(Ready(v))`). Every step spends a unit too (a throw included), so the step that resumes a `YieldThen` spends the first unit of the next poll, and a loop of synchronous completions yields every `coop_budget` awaits.
 - **T3** Traps are cancel-safe: dropping a pending trap (on cancellation) MUST unregister wakers and must not lose data. For I/O ops, the op is re-attempted only after readiness, so data is never consumed by a cancelled op.
 - **T4** A trap yielded by a coroutine **not** running inside a Porto task (e.g., awaited inside an asyncio Task on the facade) is handled by the facade (§22): the Trap implements `_asyncio_future_blocking` via a slow path.
 

@@ -19,19 +19,39 @@
 //! The budget starts at the lane's `coop_budget` (`porto_core::coop`) and every step spends a
 //! unit, a throw included: a coroutine that keeps catching the error of an unsupported await
 //! yields like any other. Out of budget with a step to go, the task yields to the back of the
-//! local queue.
+//! local queue. A task out of budget while it waits yields without polling its wait: a wait
+//! that resolved holds its grant (a lock, a permit) in its node until the coroutine can take
+//! it, so a cancel meanwhile passes the grant on instead of leaking it (porto-szb.105).
 //!
-//! A woken task whose wait is still not over is where a cancellation is delivered: the wait is
-//! abandoned (T3, `wait.rs`) and the exception thrown in. Until scopes deliver cancellation
-//! (porto-szb.36, `scopes::effective_cancel`), the one source is [`lane::take_interrupt`].
-//! porto-szb.36 also turns a `Cancelled` that belongs to a cancelling scope into
-//! `TaskOutcome::Cancelled`; until then every exception is `TaskOutcome::Err`.
+//! # Cancellation (spec 15 C1, C2, C10; spec 11 §5.2)
+//!
+//! While the task's effective scope is cancelled (the walk from its innermost scope, cached in
+//! that scope, `ScopeNode::is_cancelled`), every checkpoint raises `porto.Cancelled`, again and again if
+//! the coroutine swallows it (level-triggered):
+//!
+//! - a trap the coroutine yields is not waited on: `Cancelled` is thrown back in at once
+//!   (a `YieldThen`, which holds a result, and a `ScopeExit` excepted);
+//! - [`checkpoint_if_needed`] raises it in place of a synchronous result (T2);
+//! - a woken task whose cancellable wait is still not over gives the wait up (T3, `wait.rs`)
+//!   and gets it thrown in. A wait that is already over wins: its result is delivered, and the
+//!   cancellation comes at the next checkpoint.
+//!
+//! Python code between two awaits is never interrupted. A waiting task is woken by the cancel
+//! itself: its cancellable wait is filed with its innermost scope (`PyTask::watch_cancel`).
+//! The test hook `_interrupt` ([`lane::take_interrupt`]) throws any exception the same way. A
+//! `Cancelled` that ends the coroutine while its scope is cancelling ends the task as
+//! `TaskOutcome::Cancelled`.
+//!
+//! The cancel stack is moved into the poll's [`Running`] record while the coroutine runs, so
+//! `Scope.__aenter__` and `__aexit__` push and pop scopes on it ([`enter_cancel_scope`],
+//! [`exit_cancel_scope`]) while the loop holds the task.
 
 use std::cell::Cell;
 use std::ptr;
 use std::task::{Context, Poll, Waker};
 
 use porto_core::coop;
+use porto_core::scope::CancelReason;
 use porto_core::task::Header;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
@@ -39,9 +59,10 @@ use pyo3::{ffi, intern};
 
 use super::lane;
 use super::pending::{Kind, Pending};
-use super::pytask::{PyTask, Resume, TaskOutcome};
+use super::pytask::{CancelStack, PyScopeNode, PyScopeRef, PyTask, Resume, TaskOutcome};
 use super::ready::Ready;
 use super::trap::{Trap, TrapKind};
+use crate::errors::Cancelled;
 use crate::py_compat::{Sent, names, send, take_exception};
 
 thread_local! {
@@ -49,12 +70,35 @@ thread_local! {
     static RUNNING: Cell<*const Running> = const { Cell::new(ptr::null()) };
 }
 
-/// What `RUNNING` publishes of the polled task: its waker and its budget. Lives in `poll`'s
-/// frame, which outlives the publication (see `RunningTask`).
+/// What `RUNNING` publishes of the polled task: its waker, its budget and its cancel stack.
+/// Lives in `poll`'s frame, which outlives the publication (see `RunningTask`).
 struct Running {
     waker: *const Waker,
+    /// The task's id, the owner of the scopes it enters.
+    task_id: u64,
     /// Steps and synchronous completions left in this poll (T2).
     budget: Cell<u32>,
+    /// The task's cancel stack while its coroutine runs (moved out of the task around each
+    /// step), empty otherwise. Reached through [`Running::with_stack`].
+    stack: Cell<CancelStack>,
+}
+
+impl Running {
+    /// Runs `f` on the cancel stack. `f` MUST NOT run Python code, which could reach the stack
+    /// again.
+    fn with_stack<R>(&self, f: impl FnOnce(&mut CancelStack) -> R) -> R {
+        let mut stack = self.stack.take();
+        let result = f(&mut stack);
+        self.stack.set(stack);
+        result
+    }
+}
+
+/// Whether a task whose innermost scope is `scope` is effectively cancelled: the scope's cached
+/// walk (`ScopeNode::is_cancelled`), two loads and a compare while nothing was cancelled.
+#[inline]
+fn is_cancelled(scope: Option<&PyScopeNode>) -> bool {
+    scope.is_some_and(PyScopeNode::is_cancelled)
 }
 
 /// The task running on this thread, if a task is running.
@@ -105,10 +149,15 @@ impl Drop for RunningTask {
 /// so a loop of them yields every `coop_budget` awaits. Otherwise, and outside a porto task (a
 /// manual driver, the asyncio facade), it is a `_Ready`.
 ///
-/// It will also raise `Cancelled` when the task's effective scope is cancelled and this
-/// checkpoint has not delivered it yet: cancel delivery (porto-szb.36) hooks in here.
+/// While the task's effective scope is cancelled it raises `Cancelled` instead (C1), before
+/// spending anything: an awaitable whose fast path took something (a lock, a permit) gives it
+/// back when this raises. The `YieldThen` result is always delivered: once the value is
+/// stashed, the coroutine gets it, and the cancellation comes at its next checkpoint.
 pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
     if let Some(running) = running() {
+        if let Some(cancelled) = running_cancellation(py, running) {
+            return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
+        }
         let budget = &running.budget;
         match budget.get() {
             0 => return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any()),
@@ -130,6 +179,59 @@ pub(crate) fn spend_budget() -> bool {
             false
         }
     })
+}
+
+/// The `Cancelled` to raise in the running task, if its effective scope is cancelled.
+fn running_cancellation(py: Python<'_>, running: &Running) -> Option<Py<PyBaseException>> {
+    let cancelled = running.with_stack(|stack| {
+        let scope = stack.innermost()?;
+        scope.is_cancelled().then(|| scope.clone())
+    })?;
+    Some(cancelled_exception(py, &cancelled))
+}
+
+/// Enters a new cancel scope in the task running on this thread: `make(parent, owner)` builds
+/// its node (no Python code), given the task's innermost scope (`None` outside every scope) and
+/// the task's id.
+/// Returns the node, or `None` (and makes nothing) if no task's coroutine is running here.
+pub(crate) fn enter_cancel_scope(
+    make: impl FnOnce(Option<&PyScopeRef>, u64) -> PyScopeRef,
+) -> PyResult<Option<PyScopeRef>> {
+    let Some(running) = running() else {
+        return Ok(None);
+    };
+    running.with_stack(|stack| {
+        let scope = make(stack.innermost(), running.task_id);
+        stack.enter(scope.clone())?;
+        Ok(Some(scope))
+    })
+}
+
+/// Exits `scope` in the task running on this thread. Returns `false`, changing nothing, if no
+/// task runs here or `scope` is not its innermost entered scope.
+pub(crate) fn exit_cancel_scope(scope: &PyScopeNode) -> bool {
+    running().is_some_and(|running| {
+        scope.owner_task() == running.task_id && running.with_stack(|stack| stack.exit(scope))
+    })
+}
+
+/// The `Cancelled` delivered to a task whose effective scope, walked from `scope`, is
+/// cancelled: its message says which cancellation it is.
+fn cancelled_exception(py: Python<'_>, scope: &PyScopeNode) -> Py<PyBaseException> {
+    let why = match scope.effective_cancellation().map(|found| found.reason) {
+        Some(CancelReason::Deadline) => "the deadline of its scope, or of one it is in, passed",
+        Some(CancelReason::ChildFailed) => {
+            "a task of its scope, or of one it is nested in, failed, which cancels the scope (C4)"
+        }
+        Some(CancelReason::Shutdown) => "the runtime is shutting down",
+        _ => "Scope.cancel() was called on its scope or on one it is nested in",
+    };
+    Cancelled::new_err(format!(
+        "porto: the task was cancelled: {why}; let the Cancelled propagate (the cancelled scope \
+         absorbs it at its `async with` exit): a task that catches it gets it again at its next \
+         await"
+    ))
+    .into_value(py)
 }
 
 /// Polls `task`: steps its coroutine until it finishes (`Ready`) or waits (`Pending`).
@@ -162,19 +264,22 @@ pub(super) fn poll(
     };
     let running = Running {
         waker: cx.waker(),
+        task_id: header.id(),
         // The lane's budget for this poll (`coop_budget`), kept here so a step does not touch a
         // thread local. Rust futures the task awaits draw on the lane's own count.
         budget: Cell::new(coop::remaining().unwrap_or(u32::MAX)),
+        stack: Cell::new(CancelStack::default()),
     };
     let outcome = {
         // Published only while the coroutine steps: Python code that `complete` runs (a
         // `Task.finish`, an unraisable hook) must not see the finished task as running.
         let _running = RunningTask::set(&running);
-        step_until_wait(task, &coro, &running.budget, cx)
+        step_until_wait(task, &coro, &running, cx)
     };
     task.coro = Some(coro.unbind());
     match outcome {
         Some(outcome) => {
+            let outcome = cancelled_by_its_scope(py, task, outcome);
             task.complete(py, header, outcome);
             Poll::Ready(())
         }
@@ -182,49 +287,94 @@ pub(super) fn poll(
     }
 }
 
+/// `outcome`, or `Cancelled` if it is a `porto.Cancelled` raised while the task's scope is
+/// cancelling: the cancellation ended the task, which did not fail (spec 11 §4).
+fn cancelled_by_its_scope(py: Python<'_>, task: &PyTask, outcome: TaskOutcome) -> TaskOutcome {
+    match outcome {
+        TaskOutcome::Err(exception)
+            if exception.bind(py).is_instance_of::<Cancelled>()
+                && task
+                    .innermost_scope()
+                    .is_some_and(|scope| scope.effective_cancellation().is_some()) =>
+        {
+            TaskOutcome::Cancelled(Some(exception))
+        }
+        outcome => outcome,
+    }
+}
+
 /// Runs steps until the coroutine finishes (`Some(outcome)`) or the task waits (`None`).
 fn step_until_wait(
     task: &mut PyTask,
     coro: &Bound<'_, PyAny>,
-    budget: &Cell<u32>,
+    running: &Running,
     cx: &mut Context<'_>,
 ) -> Option<TaskOutcome> {
     let py = coro.py();
+    let budget = &running.budget;
     loop {
         if task.is_waiting() {
+            if budget.get() == 0 {
+                // Out of budget with a wait to resolve: yield before polling it. A wait that
+                // resolved would hand its grant to a coroutine that only runs after the yield,
+                // and a cancel meanwhile would lose it; unpolled, the grant stays in the node,
+                // where giving the wait up passes it on (porto-szb.105).
+                cx.waker().wake_by_ref();
+                return None;
+            }
             match task.poll_pending(py, cx) {
                 // `None` keeps a resume set before the wait (a throw delayed by the budget).
                 Poll::Ready(Resume::None) => {}
                 Poll::Ready(resume) => task.set_resume(resume),
                 Poll::Pending => {
-                    // Still waiting, unless an interrupt is due (`None`: the task waits).
-                    let exception = lane::take_interrupt(cx.waker())?;
+                    let exception = match lane::take_interrupt(cx.waker()) {
+                        Some(exception) => exception,
+                        None => cancelled_wait(py, task, cx.waker())?,
+                    };
                     task.abandon_wait();
                     task.set_resume(Resume::Throw(exception));
                 }
             }
         }
         if budget.get() == 0 {
-            // Out of budget with a step to go (a throw after an unsupported await, a wait that
-            // was over at once): let the other tasks run first. A loop that keeps catching the
+            // Out of budget with a step to go (a throw after an unsupported await or a
+            // cancellation): let the other tasks run first. A loop that keeps catching the
             // `TypeError` of an unsupported await yields here too, so it cannot hang the lane.
             yield_now(task, cx);
             return None;
         }
         budget.set(budget.get() - 1);
         task.stats.steps = task.stats.steps.wrapping_add(1);
-        let yielded = match resume(coro, task.take_resume(py)) {
+        let resume_with = task.take_resume(py);
+        // The coroutine's Python code reaches the cancel stack through `RUNNING` (scopes it
+        // enters and exits), not through the task, which this loop holds.
+        running.stack.replace(task.take_cancel_stack());
+        let stepped = resume(coro, resume_with);
+        task.put_cancel_stack(running.stack.take());
+        let yielded = match stepped {
             Stepped::Finished(outcome) => return Some(outcome),
             Stepped::Yielded(yielded) => yielded,
         };
         match dispatch(task, &yielded) {
             // The hot path of a switch: no payload to pack.
             Next::Wait(Pending::Yield) => {
+                if let Some(cancelled) = cancellation(py, task) {
+                    task.set_resume(Resume::Throw(cancelled));
+                    continue;
+                }
                 yield_now(task, cx);
                 return None;
             }
             Next::Wait(pending) => {
                 let kind = pending.kind();
+                if kind.is_cancellable()
+                    && let Some(cancelled) = cancellation(py, task)
+                {
+                    // Not waited on: nothing is linked yet, the payload is just dropped.
+                    drop(pending);
+                    task.set_resume(Resume::Throw(cancelled));
+                    continue;
+                }
                 task.set_pending(pending);
                 match kind {
                     Kind::Yield | Kind::YieldThen => {
@@ -239,8 +389,12 @@ fn step_until_wait(
                             // §4): the timer is disarmed, so the wait becomes a yield.
                             task.release_wait();
                             yield_now(task, cx);
+                            return None;
                         }
-                        return None;
+                        // Still waiting, unless the task is cancelled (`None`: it waits).
+                        let cancelled = cancelled_wait(py, task, cx.waker())?;
+                        task.abandon_wait();
+                        task.set_resume(Resume::Throw(cancelled));
                     }
                     // Polled at the top of the loop: a wait that is already over continues
                     // without a round trip through the scheduler.
@@ -250,6 +404,34 @@ fn step_until_wait(
             Next::Throw(error) => task.set_resume(Resume::Throw(error.unbind())),
         }
     }
+}
+
+/// The `Cancelled` to throw into `task` if it is effectively cancelled.
+#[inline]
+fn cancellation(py: Python<'_>, task: &PyTask) -> Option<Py<PyBaseException>> {
+    let scope = task.innermost_scope();
+    if !is_cancelled(scope) {
+        return None;
+    }
+    scope.map(|scope| cancelled_exception(py, scope))
+}
+
+/// For a wait that is not over: the `Cancelled` to throw in if the wait is cancellable and the
+/// task is effectively cancelled, else `None`, with the wait filed with the task's scope so a
+/// cancel wakes it (`PyTask::watch_cancel`, whose own check closes the race with a cancel from
+/// another thread).
+fn cancelled_wait(py: Python<'_>, task: &mut PyTask, waker: &Waker) -> Option<Py<PyBaseException>> {
+    if !task.pending_kind.is_cancellable() {
+        return None;
+    }
+    if let Some(cancelled) = cancellation(py, task) {
+        return Some(cancelled);
+    }
+    if !task.watch_cancel(waker) {
+        return None;
+    }
+    task.innermost_scope()
+        .map(|scope| cancelled_exception(py, scope))
 }
 
 /// Requeues the task at the back of its lane's local queue: a wake while it runs makes the lane

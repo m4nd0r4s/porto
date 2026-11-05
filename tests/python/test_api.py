@@ -235,9 +235,16 @@ def test_one_failing_child_still_raises_an_exception_group() -> None:
 def test_the_group_holds_every_failure_in_the_order_the_children_finished() -> None:
     first, second = ValueError("first"), KeyError("second")
 
+    async def fail_when_cancelled(error: BaseException) -> None:
+        try:
+            await porto.sleep(30)
+        finally:
+            raise error
+
     async def main() -> None:
         async with porto.scope() as s:
-            s.spawn(fail_with, second, 0.02)
+            # The first failure cancels the scope, which makes the sibling raise the second.
+            s.spawn(fail_when_cancelled, second)
             s.spawn(fail_with, first, 0.01)
 
     with pytest.raises(ExceptionGroup) as raised:
@@ -567,9 +574,6 @@ def test_ctrl_c_while_main_sleeps_inside_a_scope_body_closes_everything(
     monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
     closed: list[str] = []
 
-    async def failing_child() -> None:
-        raise ValueError("already failed")
-
     async def sleeping_child() -> None:
         try:
             await porto.sleep(30)
@@ -579,7 +583,6 @@ def test_ctrl_c_while_main_sleeps_inside_a_scope_body_closes_everything(
     async def main() -> None:
         try:
             async with porto.scope() as s:
-                s.spawn(failing_child)
                 s.spawn(sleeping_child)
                 await porto.sleep(30)
         finally:
