@@ -534,3 +534,61 @@ fn a_task_waiting_on_io_is_freed_when_the_runtime_drops() {
         "the driver was freed with the runtime"
     );
 }
+
+/// A resource that is always ready, behind `coop::poll_proceed`: what a channel with messages
+/// queued does.
+fn always_ready() -> impl Future<Output = ()> {
+    poll_fn(|cx| {
+        let proceed = std::task::ready!(crate::coop::poll_proceed(cx));
+        proceed.made_progress();
+        Poll::Ready(())
+    })
+}
+
+#[test]
+fn a_loop_of_ready_operations_yields_every_coop_budget_and_lets_a_peer_run() {
+    const BUDGET: u32 = 16;
+    let rt = Runtime::builder().coop_budget(BUDGET).build();
+    let done = Arc::new(AtomicUsize::new(0));
+    let peer_saw = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let peer = {
+        let (done, peer_saw, stop) = (done.clone(), peer_saw.clone(), stop.clone());
+        rt.spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                peer_saw.lock().unwrap().push(done.load(Ordering::Relaxed));
+                yield_now().await;
+            }
+        })
+    };
+    let busy = rt.spawn(async move {
+        for _ in 0..1000 {
+            always_ready().await;
+            done.fetch_add(1, Ordering::Relaxed);
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+    rt.block_on(async move {
+        busy.await.unwrap();
+        peer.await.unwrap();
+    });
+    let seen = peer_saw.lock().unwrap();
+    let steps: Vec<usize> = seen.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    // The busy task got through exactly a budget's worth of operations between two turns of
+    // the peer (the last stretch may be shorter).
+    let full = &steps[..steps.len() - 1];
+    assert!(
+        full.len() >= 1000 / BUDGET as usize - 2,
+        "the peer starved: {steps:?}"
+    );
+    assert!(
+        full.iter().all(|&step| step == BUDGET as usize),
+        "{steps:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "coop_budget must be at least 1")]
+fn a_zero_coop_budget_is_refused() {
+    let _ = Runtime::builder().coop_budget(0);
+}

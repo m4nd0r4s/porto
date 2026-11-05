@@ -13,7 +13,7 @@ use std::time::Duration;
 use porto_io::Driver;
 
 use super::context::Enter;
-use super::lane::{Lane, run_each};
+use super::lane::{DEFAULT_COOP_BUDGET, Lane, run_each};
 use super::park::ParkHook;
 use super::shared::{Handle, Shared};
 use super::timers::Timers;
@@ -40,6 +40,7 @@ pub struct Builder {
     clock: Option<Box<dyn Clock>>,
     timer_resolution: Option<Duration>,
     driver: Option<Arc<dyn Driver>>,
+    coop_budget: Option<u32>,
 }
 
 impl Builder {
@@ -72,6 +73,21 @@ impl Builder {
         self
     }
 
+    /// Sets how many operations a task may run in one poll before it yields
+    /// (`12-scheduler-and-lanes.md` §10, [`coop`](crate::coop)). The default is 128.
+    ///
+    /// # Panics
+    /// If `budget` is 0: a task could then never make progress.
+    pub fn coop_budget(mut self, budget: u32) -> Self {
+        assert!(
+            budget > 0,
+            "porto: coop_budget must be at least 1, got 0; pass a positive budget, or leave it \
+             unset for the default of 128"
+        );
+        self.coop_budget = Some(budget);
+        self
+    }
+
     /// Gives the runtime an I/O driver (`13-io-driver.md`). The lane polls it without
     /// blocking every 61 tasks and before parking, and parks in it (unparks wake it). A
     /// custom [`clock`](Builder::clock) is then only read, not parked on: the driver waits in
@@ -98,7 +114,12 @@ impl Builder {
             1,
         );
         Runtime {
-            lane: Lane::new(0, handle, self.park_hook),
+            lane: Lane::new(
+                0,
+                handle,
+                self.park_hook,
+                self.coop_budget.unwrap_or(DEFAULT_COOP_BUDGET),
+            ),
         }
     }
 }
@@ -110,6 +131,7 @@ impl fmt::Debug for Builder {
             .field("clock", &self.clock.is_some())
             .field("timer_resolution", &self.timer_resolution)
             .field("driver", &self.driver.as_ref().map(|driver| driver.kind()))
+            .field("coop_budget", &self.coop_budget)
             .finish()
     }
 }
@@ -125,7 +147,7 @@ impl Runtime {
         Self::builder().park_hook(hook).build()
     }
 
-    /// Configures a runtime: a park hook, a clock, a driver.
+    /// Configures a runtime: a park hook, a clock, a driver, a cooperative budget.
     pub fn builder() -> Builder {
         Builder::default()
     }
@@ -178,7 +200,7 @@ impl Runtime {
         loop {
             if root.woken.load(Ordering::Relaxed)
                 && root.woken.swap(false, Ordering::AcqRel)
-                && let Poll::Ready(output) = future.as_mut().poll(&mut cx)
+                && let Poll::Ready(output) = self.lane.with_budget(|| future.as_mut().poll(&mut cx))
             {
                 return output;
             }
