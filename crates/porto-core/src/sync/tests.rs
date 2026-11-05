@@ -260,6 +260,20 @@ fn grant_all_wakes_every_waiter() {
 }
 
 #[test]
+fn cancelled_after_grant_all_passes_nothing_on() {
+    // `grant_all` wakes are shared: a cancelled waiter drops its wake.
+    let queue = held_queue();
+    let mut a = Box::pin(queue.wait(3, try_take));
+    let mut b = Box::pin(queue.wait(4, try_take));
+    assert!(poll_once(a.as_mut(), Waker::noop()).is_pending());
+    assert!(poll_once(b.as_mut(), Waker::noop()).is_pending());
+    assert_eq!(queue.lock().grant_all(), 2);
+    drop(a);
+    assert!(poll_once(b.as_mut(), Waker::noop()).is_ready());
+    assert!(queue.lock().passed.is_empty(), "pass_grant is not called");
+}
+
+#[test]
 fn raw_node_is_reusable_after_completion_and_cancel() {
     // The low-level API PyTask's embedded `wait_node` will use.
     let queue = held_queue();
