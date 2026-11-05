@@ -20,6 +20,7 @@ async def porto_work(index: int) -> int:
 
 
 async def porto_main(tasks: int) -> int:
+    spawned: list[porto.Task[int]] = []
     async with porto.scope() as s:
         spawned = [s.spawn(porto_work, index) for index in range(tasks)]
     return sum(task.result() for task in spawned)

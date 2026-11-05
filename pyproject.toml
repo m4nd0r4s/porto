@@ -54,6 +54,10 @@ select = [
     "RUF", # ruff-specific
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# Examples are scripts that check themselves with assert, without pytest.
+"examples/**" = ["PT"]
+
 [tool.ruff.lint.isort]
 known-first-party = ["porto"]
 
@@ -65,7 +69,7 @@ docstring-code-format = true
 # MUST fail strict; tests/typing/test_should_fail.py runs pyright on them through
 # should_fail/pyrightconfig.json, which extends this table and undoes the exclude.
 [tool.pyright]
-include = ["python", "scripts", "tests/typing", "bench"]
+include = ["python", "scripts", "tests/typing", "bench", "examples"]
 exclude = ["tests/typing/should_fail", "bench/.venvs"]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
