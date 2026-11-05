@@ -12,20 +12,24 @@
 //! `throw(...)` re-raises the exception at the `await`.
 //!
 //! The driver reads the request with [`Trap::take`], which succeeds once, and only for a trap
-//! that suspended through an `await`. The payload is an immutable [`TrapKind`] and the only
-//! mutable state is one atomic, so the class stays `frozen` and sound on free-threaded builds
-//! (25-cpython-integration-and-memory.md §3). Spec 11 §5.1 sketches the payload as an
-//! `UnsafeCell<Option<TrapKind>>` moved out by the driver; the kinds that exist so far are
-//! `Copy`, so nothing needs moving. A kind that owns data (`Future`, `Join`) can keep this
-//! design by moving its payload out only after winning the SUSPENDED → TAKEN exchange.
+//! that suspended through an `await`. The request is stored packed (`pending.rs`): a kind byte
+//! and one payload word, moved out by the driver only after it won the SUSPENDED → TAKEN
+//! exchange, so it is read by one thread exactly once; the getters read only the kind and a
+//! sleep's (`Copy`) deadline. The rest of the state is one atomic, so the class stays `frozen`
+//! and sound on free-threaded builds (25-cpython-integration-and-memory.md §3).
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use porto_core::task::TaskBodyRef;
 use porto_core::time::Deadline;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use super::pending::{AbiFuture, IoWait, Kind, Payload, Pending};
+use super::pytask::{PyScopeRef, PyTask, Resume};
+use super::thin::{BoxedFuture, WaitTarget};
 use crate::async_slots::{guard_send, stop_iteration};
 use crate::throw_args::thrown_exception;
 
@@ -37,13 +41,18 @@ const SUSPENDED: u8 = 1;
 const TAKEN: u8 = 2;
 /// Resumed, thrown into or closed: any further resume is a reuse.
 const DONE: u8 = 3;
+/// The phase bits above; the payload bit below.
+const PHASE: u8 = 0b0011;
+/// Set with TAKEN: the payload was moved out, so dropping the trap must not drop it again.
+const MOVED: u8 = 0b0100;
 
-/// What a trap asks the driver to do (11-task-model-and-trap-protocol.md §5.2). Later kinds
-/// (`Notified`, `Io`, `Join`, `ScopeExit`, `Future`) arrive with the features that need them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrapKind {
+/// What a trap asks the driver to do (11-task-model-and-trap-protocol.md §5.2).
+pub(crate) enum TrapKind {
     /// A schedule point: requeue the task at the back of its lane's local queue.
     Yield,
+    /// A schedule point, then resume with the value: a synchronous completion after the
+    /// budget ran out (T2, [`checkpoint_if_needed`](super::step::checkpoint_if_needed)).
+    YieldThen(Py<PyAny>),
     /// Resume the task once the runtime clock reaches `deadline`, never earlier. A deadline
     /// that has already passed is a [`TrapKind::Yield`].
     Sleep {
@@ -54,27 +63,71 @@ pub enum TrapKind {
     /// before handing out the trap). Any wake resumes the task, so the awaiting code re-checks
     /// what it waits for.
     Park,
+    /// Wait until a sync primitive grants the task's embedded wait node (spec 16).
+    #[allow(
+        dead_code,
+        reason = "made by porto.Event and porto.Notify (porto-szb.94)"
+    )]
+    Notified(WaitTarget),
+    /// Run an I/O operation, re-attempted on readiness (spec 13 §5).
+    #[allow(dead_code, reason = "made by the socket APIs (porto-szb.62)")]
+    Io(IoWait),
+    /// Wait for another task; the await evaluates to its result, or raises its exception.
+    Join {
+        /// The task to wait for.
+        target: TaskBodyRef<PyTask>,
+    },
+    /// Wait until a scope's children finished (spec 15 §1.1).
+    #[allow(
+        dead_code,
+        reason = "made by Scope.__aexit__ once scopes use the tree (porto-szb.93)"
+    )]
+    ScopeExit {
+        /// The scope whose children the task waits for.
+        scope: PyScopeRef,
+    },
+    /// Wait for a Rust future; the await evaluates to what it resolves to.
+    #[allow(
+        dead_code,
+        reason = "made by Rust-backed awaitables (to_thread, porto-szb.26)"
+    )]
+    Future(BoxedFuture<Resume>),
+    /// Wait for a future from a third-party extension (porto-abi, M3).
+    #[allow(dead_code, reason = "uninhabited until porto-abi (M3)")]
+    AbiFuture(AbiFuture),
+}
+
+impl From<TrapKind> for Pending {
+    fn from(kind: TrapKind) -> Self {
+        match kind {
+            TrapKind::Yield => Self::Yield,
+            TrapKind::YieldThen(value) => Self::YieldThen(value),
+            TrapKind::Sleep { deadline } => Self::Sleep(deadline),
+            TrapKind::Park => Self::Park,
+            TrapKind::Notified(wait) => Self::Notified(wait),
+            TrapKind::Io(io) => Self::Io(io),
+            TrapKind::Join { target } => Self::Join(target),
+            TrapKind::ScopeExit { scope } => Self::ScopeExit(scope),
+            TrapKind::Future(future) => Self::Future(future),
+            TrapKind::AbiFuture(never) => match never {},
+        }
+    }
 }
 
 /// A trap: a request from a coroutine to the driver, plus the value the driver sends back.
-///
-/// The [`TrapKind`] is stored as a one-byte tag next to the state and the deadline, which keeps
-/// the payload two words (a `TrapKind` field would need a third once two kinds carry no data).
 #[pyclass(frozen, freelist = 512, module = "porto._core", name = "_Trap")]
 pub struct Trap {
     state: AtomicU8,
-    tag: Tag,
-    /// The deadline of a `Sleep`; unused by the other kinds.
-    deadline: Deadline,
+    kind: Kind,
+    /// The packed request; moved out once, by the driver (see the module docs).
+    payload: UnsafeCell<Payload>,
 }
 
-/// The variant of a [`TrapKind`].
-#[derive(Clone, Copy)]
-enum Tag {
-    Yield,
-    Sleep,
-    Park,
-}
+// SAFETY: the payload is reached by one thread at a time: `take` moves it out only after
+// winning the SUSPENDED → TAKEN exchange (once), `Drop` has `&mut self`, and the getters read
+// only a sleep's `Copy` deadline, which nothing writes after `new`. Every payload type is
+// `Send`, so moving it out on another thread is sound.
+unsafe impl Sync for Trap {}
 
 // 25-cpython-integration-and-memory.md §5: a trap is at most 48 bytes with its object header.
 const _: () = assert!(
@@ -96,16 +149,12 @@ enum Step {
 
 impl Trap {
     /// A fresh trap asking for `kind`.
-    pub fn new(kind: TrapKind) -> Self {
-        let (tag, deadline) = match kind {
-            TrapKind::Yield => (Tag::Yield, Deadline::NEVER),
-            TrapKind::Sleep { deadline } => (Tag::Sleep, deadline),
-            TrapKind::Park => (Tag::Park, Deadline::NEVER),
-        };
+    pub(crate) fn new(kind: TrapKind) -> Self {
+        let (kind, payload) = Pending::from(kind).pack();
         Self {
             state: AtomicU8::new(FRESH),
-            tag,
-            deadline,
+            kind,
+            payload: UnsafeCell::new(payload),
         }
     }
 
@@ -124,35 +173,38 @@ impl Trap {
         Self::new(TrapKind::Park)
     }
 
-    /// What the trap asks for.
-    pub fn kind(&self) -> TrapKind {
-        match self.tag {
-            Tag::Yield => TrapKind::Yield,
-            Tag::Sleep => TrapKind::Sleep {
-                deadline: self.deadline,
-            },
-            Tag::Park => TrapKind::Park,
-        }
+    /// The deadline of a sleep trap.
+    fn deadline(&self) -> Option<Deadline> {
+        // SAFETY: a sleep's payload is its deadline, `Copy` and never written after `new`;
+        // `take` only copies it.
+        (self.kind == Kind::Sleep).then(|| unsafe { (*self.payload.get()).deadline })
     }
 
     /// The driver's side: returns the request of a trap that a coroutine suspended on, once.
     ///
     /// `None` if the trap did not reach the driver through an `await` (a generator yielded it
     /// directly, or it was taken already): the driver then throws an error into the coroutine.
-    pub fn take(&self) -> Option<TrapKind> {
+    pub(crate) fn take(&self) -> Option<Pending> {
         self.state
-            .compare_exchange(SUSPENDED, TAKEN, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| self.kind())
+            .compare_exchange(
+                SUSPENDED,
+                TAKEN | MOVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        // SAFETY: winning the exchange makes this the one move out of the payload, which was
+        // packed with `self.kind`; MOVED keeps `Drop` from dropping it again.
+        Some(unsafe { Pending::unpack(self.kind, &*self.payload.get()) })
     }
 
     fn resume(&self, value_is_none: bool) -> Step {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            let (next, step) = match state {
+            let (next, step) = match state & PHASE {
                 FRESH if value_is_none => (SUSPENDED, Step::Suspend),
                 FRESH => return Step::NotStarted,
-                SUSPENDED | TAKEN => (DONE, Step::Complete),
+                SUSPENDED | TAKEN => (DONE | (state & MOVED), Step::Complete),
                 _ => return Step::Reused,
             };
             match self
@@ -162,6 +214,22 @@ impl Trap {
                 Ok(_) => return step,
                 Err(actual) => state = actual,
             }
+        }
+    }
+
+    /// Marks the trap finished (thrown into or closed), keeping MOVED.
+    fn finish(&self) {
+        self.state.fetch_or(DONE, Ordering::AcqRel);
+    }
+}
+
+impl Drop for Trap {
+    fn drop(&mut self) {
+        if self.kind.owns_payload() && *self.state.get_mut() & MOVED == 0 {
+            // SAFETY: not moved out, so the payload is live and packed with `self.kind`; it is
+            // never read again. A trap's request is never linked anywhere, so dropping it is
+            // all there is to undo.
+            drop(unsafe { Pending::unpack(self.kind, self.payload.get_mut()) });
         }
     }
 }
@@ -181,23 +249,17 @@ fn reused_error() -> PyErr {
 
 #[pymethods]
 impl Trap {
-    /// What the trap asks for: `"yield"`, `"sleep"` or `"park"`.
+    /// What the trap asks for: `"yield"`, `"sleep"`, `"park"`, `"notified"`, `"io"`,
+    /// `"join"`, `"scope_exit"` or `"future"`.
     #[getter(kind)]
     fn py_kind(&self) -> &'static str {
-        match self.kind() {
-            TrapKind::Yield => "yield",
-            TrapKind::Sleep { .. } => "sleep",
-            TrapKind::Park => "park",
-        }
+        self.kind.name()
     }
 
     /// For a sleep, when it ends, in seconds on the runtime clock (`porto.current_time()`).
     #[getter(deadline)]
     fn py_deadline(&self) -> Option<f64> {
-        match self.kind() {
-            TrapKind::Yield | TrapKind::Park => None,
-            TrapKind::Sleep { deadline } => Some(deadline.as_secs_f64()),
-        }
+        self.deadline().map(Deadline::as_secs_f64)
     }
 
     fn __await__(slf: &Bound<'_, Self>) -> Py<Self> {
@@ -235,28 +297,27 @@ impl Trap {
         val: Option<&Bound<'_, PyAny>>,
         tb: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        self.state.store(DONE, Ordering::Release);
+        self.finish();
         Err(thrown_exception(typ, val, tb))
     }
 
     fn close(&self) {
-        self.state.store(DONE, Ordering::Release);
+        self.finish();
     }
 
     fn __repr__(&self) -> String {
-        let state = match self.state.load(Ordering::Acquire) {
+        let state = match self.state.load(Ordering::Acquire) & PHASE {
             FRESH => "fresh",
             SUSPENDED => "suspended",
             TAKEN => "taken",
             _ => "done",
         };
-        match self.kind() {
-            TrapKind::Yield => format!("<porto._core._Trap yield {state}>"),
-            TrapKind::Park => format!("<porto._core._Trap park {state}>"),
-            TrapKind::Sleep { deadline } => format!(
+        match self.deadline() {
+            Some(deadline) => format!(
                 "<porto._core._Trap sleep until {:.6}s {state}>",
                 deadline.as_secs_f64()
             ),
+            None => format!("<porto._core._Trap {} {state}>", self.kind.name()),
         }
     }
 }
@@ -302,33 +363,72 @@ pub(crate) unsafe extern "C" fn trap_am_send(
 mod tests {
     use super::*;
 
+    fn deadline_of(pending: Option<Pending>) -> Option<Deadline> {
+        match pending {
+            Some(Pending::Sleep(deadline)) => Some(deadline),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn every_kind_round_trips_through_the_packed_payload() {
-        for kind in [
-            TrapKind::Yield,
-            TrapKind::Sleep {
-                deadline: Deadline::from_nanos(7),
-            },
-            TrapKind::Park,
-        ] {
-            assert_eq!(Trap::new(kind).kind(), kind);
+    fn the_copy_kinds_round_trip_through_the_packed_payload() {
+        let sleep = Trap::sleep_until(Deadline::from_nanos(7));
+        assert_eq!(sleep.deadline(), Some(Deadline::from_nanos(7)));
+        assert!(matches!(sleep.resume(true), Step::Suspend));
+        assert_eq!(deadline_of(sleep.take()), Some(Deadline::from_nanos(7)));
+        // The getters still read the kind and the deadline once the trap was taken.
+        assert_eq!(sleep.deadline(), Some(Deadline::from_nanos(7)));
+        for (trap, name) in [(Trap::yield_now(), "yield"), (Trap::park(), "park")] {
+            assert_eq!(trap.kind.name(), name);
+            assert_eq!(trap.deadline(), None);
+            assert!(matches!(trap.resume(true), Step::Suspend));
+            assert!(trap.take().is_some());
         }
     }
 
     #[test]
     fn the_driver_takes_a_trap_once_and_only_after_it_suspended() {
         let trap = Trap::sleep_until(Deadline::from_nanos(7));
-        assert_eq!(trap.take(), None, "a fresh trap was not awaited");
+        assert!(trap.take().is_none(), "a fresh trap was not awaited");
         assert!(matches!(trap.resume(true), Step::Suspend));
-        assert_eq!(
-            trap.take(),
-            Some(TrapKind::Sleep {
-                deadline: Deadline::from_nanos(7)
-            })
-        );
-        assert_eq!(trap.take(), None, "taken twice");
+        assert_eq!(deadline_of(trap.take()), Some(Deadline::from_nanos(7)));
+        assert!(trap.take().is_none(), "taken twice");
         assert!(matches!(trap.resume(false), Step::Complete));
         assert!(matches!(trap.resume(true), Step::Reused));
-        assert_eq!(trap.take(), None);
+        assert!(trap.take().is_none());
+        assert_eq!(trap.state.load(Ordering::Acquire), DONE | MOVED);
+    }
+
+    #[test]
+    fn a_trap_drops_a_payload_it_still_owns_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        struct Probe(Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let future_trap = |drops: &Arc<AtomicUsize>| {
+            let probe = Probe(drops.clone());
+            Trap::new(TrapKind::Future(BoxedFuture::new(async move {
+                drop(probe);
+                Resume::None
+            })))
+        };
+        let drops = Arc::new(AtomicUsize::new(0));
+        // Never awaited: the trap drops the future.
+        drop(future_trap(&drops));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        // Taken: the driver owns the future, the trap must not drop it.
+        let trap = future_trap(&drops);
+        assert!(matches!(trap.resume(true), Step::Suspend));
+        let taken = trap.take();
+        trap.finish();
+        drop(trap);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(taken);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
     }
 }

@@ -14,7 +14,7 @@ pub mod testing;
 mod throw_args;
 
 pub use driver::ready::Ready;
-pub use driver::trap::{Trap, TrapKind};
+pub use driver::trap::Trap;
 pub use py_compat::interned;
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,

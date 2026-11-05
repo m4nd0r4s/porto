@@ -65,13 +65,14 @@ struct BodyCell<B, S> {
 }
 
 /// An owned, counted reference to a task with body `B`: a [`TaskRef`] that knows where the
-/// body is.
+/// body is. One word: the body's offset (which depends on the scheduler type) is in the
+/// task's vtable, so a body can store a reference to another task in a one-word slot.
 pub struct TaskBodyRef<B> {
     task: TaskRef,
-    /// Where the body sits in the allocation (it depends on the scheduler type).
-    offset: usize,
     _body: PhantomData<B>,
 }
+
+const _: () = assert!(size_of::<TaskBodyRef<()>>() == size_of::<usize>());
 
 // SAFETY: the reference only reaches the header (see `TaskRef`) and a raw pointer to the body,
 // which the body type synchronizes; bodies are `Send`.
@@ -107,14 +108,16 @@ impl<B: TaskBody> TaskBodyRef<B> {
     /// published before completion): reach single fields with `&raw const (*body).field`
     /// rather than through a `&B`.
     pub fn body(&self) -> NonNull<B> {
-        // SAFETY: `offset` is the body's offset in this allocation (`new_body_task`), which is
-        // live while `self.task` holds its reference.
+        let offset = self.header().vtable.body_offset;
+        // SAFETY: the vtable's `body_offset` is the body's offset in this allocation (set by
+        // `new_body_task`, the only maker of a `TaskBodyRef`), which is live while `self.task`
+        // holds its reference.
         unsafe {
             self.task
                 .raw()
                 .as_ptr()
                 .cast::<u8>()
-                .add(self.offset)
+                .add(offset)
                 .cast::<B>()
         }
     }
@@ -124,7 +127,6 @@ impl<B> Clone for TaskBodyRef<B> {
     fn clone(&self) -> Self {
         Self {
             task: self.task.clone(),
-            offset: self.offset,
             _body: PhantomData,
         }
     }
@@ -178,7 +180,6 @@ where
         Notified(task),
         TaskBodyRef {
             task: task_ref,
-            offset: std::mem::offset_of!(BodyCell<B, S>, body),
             _body: PhantomData,
         },
     )
@@ -194,6 +195,7 @@ fn vtable<B: TaskBody, S: Schedule>() -> &'static TaskVTable {
         try_read_output: no_join_handle,
         drop_join_handle: no_join_handle_drop,
         type_name: std::any::type_name::<B>,
+        body_offset: std::mem::offset_of!(BodyCell<B, S>, body),
     }
 }
 
