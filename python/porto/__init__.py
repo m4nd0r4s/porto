@@ -19,6 +19,26 @@ print(porto.run(main))
 ```
 """
 
-from porto._core import Scope, Task, __version__, checkpoint, run, scope, sleep
+from porto._core import (
+    Scope,
+    Task,
+    __version__,
+    checkpoint,
+    current_time,
+    monotonic,
+    run,
+    scope,
+    sleep,
+)
 
-__all__ = ["Scope", "Task", "__version__", "checkpoint", "run", "scope", "sleep"]
+__all__ = [
+    "Scope",
+    "Task",
+    "__version__",
+    "checkpoint",
+    "current_time",
+    "monotonic",
+    "run",
+    "scope",
+    "sleep",
+]

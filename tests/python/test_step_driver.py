@@ -223,13 +223,13 @@ def test_a_sleep_returns_none_no_earlier_than_its_deadline() -> None:
             trap = _core._sleep_trap(delay)
             assert trap.deadline is not None
             assert await trap is None
-            assert _core._monotonic() >= trap.deadline
+            assert _core.current_time() >= trap.deadline
 
     run(main())
 
 
 def test_sleeps_wake_in_deadline_order_never_early() -> None:
-    start = _core._monotonic()
+    start = 0.0
     woke: list[str] = []
     delays = {"c": 0.03, "a": 0.01, "e": 0.05, "b": 0.02, "d": 0.04}
 
@@ -237,11 +237,13 @@ def test_sleeps_wake_in_deadline_order_never_early() -> None:
         trap = _core._sleep_trap(delay)
         assert trap.deadline is not None
         await trap
-        now = _core._monotonic()
+        now = _core.current_time()
         assert now >= trap.deadline >= start + delay, f"{name} woke early"
         woke.append(name)
 
     async def main() -> None:
+        nonlocal start
+        start = _core.current_time()
         for name, delay in delays.items():
             _core._spawn(sleeper(name, delay))
         await wait_until(lambda: len(woke) == len(delays))

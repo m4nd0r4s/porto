@@ -1,7 +1,8 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint`` and ``__version__`` (docs/spec/10-porto-runtime/20-python-api-reference.md).
+``checkpoint``, ``current_time``, ``monotonic`` and ``__version__``
+(docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
 """
@@ -29,6 +30,16 @@ def run(main: Callable[[*_Ts], Awaitable[_T]] | Awaitable[_T], /, *args: *_Ts) -
     """
 
 # Time
+
+def current_time() -> float:
+    """The runtime clock: seconds since the runtime started (virtual seconds in deterministic
+    mode). Monotonic; sleep deadlines are measured on it: ``porto.current_time() + 5``.
+
+    Raises ``RuntimeError`` outside ``porto.run``: the clock belongs to the runtime.
+    """
+
+monotonic = current_time
+"""An alias of ``current_time``: the same function."""
 
 def sleep(seconds: float, /) -> Awaitable[None]:
     """Resumes the task ``seconds`` from now, never earlier. ``sleep(0)`` yields once.
@@ -100,7 +111,7 @@ class _Trap:
 
     @property
     def deadline(self) -> float | None:
-        """For a sleep, when it ends, in seconds on the runtime clock (``_monotonic()``)."""
+        """For a sleep, when it ends, in seconds on the runtime clock (``current_time()``)."""
 
     def __await__(self) -> Generator[_Trap, object, object]: ...
     def __iter__(self) -> Generator[_Trap, object, object]: ...
@@ -152,14 +163,12 @@ def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
     """Starts ``coro`` as a task on the running runtime. An ``Exception`` it raises goes to
     ``sys.unraisablehook``; any other ``BaseException`` stops the run (``_run`` raises it)."""
 
-def _monotonic() -> float:
-    """The runtime clock, in seconds: what sleep deadlines are measured on."""
-
 def _yield_trap() -> _Trap:
     """A trap that yields to the scheduler once."""
 
 def _sleep_trap(delay: float, /) -> _Trap:
-    """A trap that resumes the task ``delay`` seconds from now, never earlier."""
+    """A trap that resumes the task ``delay`` seconds from now, never earlier. Reads the runtime
+    clock, so it raises ``RuntimeError`` outside ``porto.run``."""
 
 def _make_ready(value: _T_co, /) -> _Ready[_T_co]:
     """Test hook: a ready awaitable holding ``value``."""

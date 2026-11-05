@@ -4,7 +4,8 @@
 //! stealing, injector or reactor. Wakes on the lane thread push to the local queue without
 //! synchronization; wakes from other threads go through the shared inbox and unpark the lane.
 //! Timers live on the lane (a min-heap, see `timers`): they fire every `EVENT_INTERVAL` tasks
-//! and before parking, and the lane parks no longer than until the earliest one.
+//! and before parking, and the lane parks no longer than until the earliest one. The runtime's
+//! clock (`time::clock`) decides what "now" is and how a park waits for a deadline.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -23,7 +24,7 @@ use super::park::ParkHook;
 use super::shared::Handle;
 use super::timers::Timers;
 use crate::task::{Notified, new_task};
-use crate::time::Deadline;
+use crate::time::{Clock, Deadline, MonotonicClock, RuntimeClock};
 
 /// Tasks run between two checks of the `block_on` future (Tokio's `event_interval`).
 const EVENT_INTERVAL: usize = 61;
@@ -52,32 +53,79 @@ pub struct Runtime {
     core: Core,
 }
 
+/// Configures a [`Runtime`]: `Runtime::builder().park_hook(hook).clock(clock).build()`.
+#[derive(Default)]
+#[must_use = "a builder does nothing until `build` is called"]
+pub struct Builder {
+    park_hook: Option<Box<dyn ParkHook>>,
+    clock: Option<Box<dyn Clock>>,
+}
+
+impl Builder {
+    /// Calls `hook` around every park of the lane thread.
+    pub fn park_hook(mut self, hook: impl ParkHook) -> Self {
+        self.park_hook = Some(Box::new(hook));
+        self
+    }
+
+    /// Uses `clock` as the runtime clock instead of a [`MonotonicClock`] started by `build`:
+    /// the hook for a virtual clock (deterministic mode).
+    pub fn clock(mut self, clock: impl Clock) -> Self {
+        self.clock = Some(Box::new(clock));
+        self
+    }
+
+    /// Creates the runtime. The runtime clock's epoch is now, unless a clock was given.
+    pub fn build(self) -> Runtime {
+        let clock = match self.clock {
+            Some(clock) => RuntimeClock::Custom(clock),
+            None => RuntimeClock::Monotonic(MonotonicClock::new()),
+        };
+        Runtime {
+            core: Core {
+                handle: Handle::new(clock),
+                local: RefCell::new(VecDeque::with_capacity(256)),
+                tick: Cell::new(0),
+                timers: Timers::default(),
+                park_hook: self.park_hook,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for Builder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builder")
+            .field("park_hook", &self.park_hook.is_some())
+            .field("clock", &self.clock.is_some())
+            .finish()
+    }
+}
+
 impl Runtime {
-    /// Creates a runtime with an empty run queue.
+    /// Creates a runtime with an empty run queue, whose clock starts now.
     pub fn new() -> Self {
-        Self::build(None)
+        Self::builder().build()
     }
 
     /// Creates a runtime that calls `hook` around every park of the lane thread.
     pub fn with_park_hook(hook: impl ParkHook) -> Self {
-        Self::build(Some(Box::new(hook)))
+        Self::builder().park_hook(hook).build()
     }
 
-    fn build(park_hook: Option<Box<dyn ParkHook>>) -> Self {
-        Self {
-            core: Core {
-                handle: Handle::new(),
-                local: RefCell::new(VecDeque::with_capacity(256)),
-                tick: Cell::new(0),
-                timers: Timers::default(),
-                park_hook,
-            },
-        }
+    /// Configures a runtime: a park hook, a clock.
+    pub fn builder() -> Builder {
+        Builder::default()
     }
 
     /// A handle for spawning onto this runtime from any thread.
     pub fn handle(&self) -> &Handle {
         &self.core.handle
+    }
+
+    /// The current time on this runtime's clock.
+    pub fn now(&self) -> Deadline {
+        self.core.clock().now()
     }
 
     /// Queues `future` as a new task. It first runs at the next `block_on`/`run_until_idle`.
@@ -115,7 +163,7 @@ impl Runtime {
                 return output;
             }
             let ran = self.core.run_batch(EVENT_INTERVAL);
-            let fired = self.core.timers.fire_expired();
+            let fired = self.core.fire_expired_timers();
             if ran == 0 && fired == 0 && !root.woken.load(Ordering::Acquire) {
                 // Every queue was empty after the last check and no timer is due; a later
                 // remote push or root wake unparks us (or has already left the token).
@@ -134,7 +182,7 @@ impl Runtime {
         let mut ran = 0;
         loop {
             ran += self.core.run_batch(usize::MAX);
-            if self.core.timers.fire_expired() == 0 {
+            if self.core.fire_expired_timers() == 0 {
                 return ran;
             }
         }
@@ -175,6 +223,14 @@ impl fmt::Debug for Runtime {
 }
 
 impl Core {
+    fn clock(&self) -> &RuntimeClock {
+        &self.handle.shared.clock
+    }
+
+    fn fire_expired_timers(&self) -> usize {
+        self.timers.fire_expired(|| self.clock().now())
+    }
+
     fn next_task(&self) -> Option<Notified> {
         let tick = self.tick.get().wrapping_add(1);
         self.tick.set(tick);
@@ -205,14 +261,9 @@ impl Core {
         let next_deadline = self.timers.next_deadline();
         let mut park = || match next_deadline {
             None => thread::park(),
-            // `park_timeout` may return early; the caller then finds no timer due and parks
-            // again for the rest.
-            Some(deadline) => {
-                let timeout = deadline.saturating_duration_since(Deadline::now());
-                if !timeout.is_zero() {
-                    thread::park_timeout(timeout);
-                }
-            }
+            // A park may return early; the caller then finds no timer due and parks again for
+            // the rest.
+            Some(deadline) => self.clock().park_until(deadline),
         };
         match &self.park_hook {
             Some(hook) => hook.around_park(&mut park),
@@ -264,6 +315,13 @@ pub(crate) fn register_timer(deadline: Deadline, waker: Waker) {
     );
     // SAFETY: as in `push_local`.
     unsafe { &*core }.timers.register(deadline, waker);
+}
+
+/// The current time on the clock of the runtime running on this thread, if any.
+pub(crate) fn current_time() -> Option<Deadline> {
+    let core = CURRENT.try_with(Cell::get).ok()?;
+    // SAFETY: as in `push_local`.
+    (!core.is_null()).then(|| unsafe { &*core }.clock().now())
 }
 
 /// A handle to the runtime running on this thread, if any.
