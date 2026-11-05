@@ -203,7 +203,7 @@ fn dropping_the_runtime_frees_queued_and_parked_tasks() {
     {
         let guard = DropCounter(drops.clone());
         let parked = parked.clone();
-        rt.spawn(poll_fn(move |cx| {
+        rt.spawn(poll_fn(move |cx| -> Poll<()> {
             let _owned = &guard;
             *parked.lock().unwrap() = Some(cx.waker().clone());
             Poll::Pending
@@ -273,4 +273,48 @@ fn a_task_that_keeps_yielding_does_not_starve_remote_spawns() {
     .unwrap();
     rt.block_on(done.wait());
     assert!(stop.load(Ordering::SeqCst));
+}
+
+#[test]
+fn block_on_a_join_handle_returns_the_task_output() {
+    let rt = Runtime::new();
+    let task = rt.spawn(async { spawn(async { 20 }).await.unwrap() + 1 });
+    assert_eq!(rt.block_on(task).unwrap(), 21);
+}
+
+#[test]
+fn a_task_spawned_from_another_thread_is_joined_on_the_lane() {
+    let rt = Runtime::new();
+    let handle = rt.handle().clone();
+    let join = thread::spawn(move || handle.spawn(async { "remote" }))
+        .join()
+        .unwrap();
+    assert_eq!(rt.block_on(join).unwrap(), "remote");
+}
+
+#[test]
+fn shutdown_cancels_queued_and_later_woken_tasks_for_their_joiners() {
+    let parked: Arc<Mutex<Option<Waker>>> = Arc::default();
+    let rt = Runtime::new();
+    let parked_in_task = parked.clone();
+    let parked_join = rt.spawn(poll_fn(move |cx| -> Poll<()> {
+        *parked_in_task.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Pending
+    }));
+    rt.run_until_idle();
+    let queued_join = rt.spawn(async { 1 });
+    drop(rt);
+    let cancelled = |join| match Runtime::new().block_on(join) {
+        Err(error) => crate::task::JoinError::is_cancelled(&error),
+        Ok(()) => false,
+    };
+    let queued = Runtime::new().block_on(queued_join);
+    assert!(
+        queued.is_err_and(|e| e.is_cancelled()),
+        "dropped with the runtime"
+    );
+    assert!(!parked_join.is_finished());
+    // A wake after shutdown cancels the task instead of queueing it forever.
+    parked.lock().unwrap().take().unwrap().wake();
+    assert!(cancelled(parked_join));
 }

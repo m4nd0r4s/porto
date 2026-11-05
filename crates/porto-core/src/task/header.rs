@@ -30,8 +30,9 @@ pub struct Header {
     pub(crate) vtable: &'static TaskVTable,
     /// Monotonically increasing, never reused.
     pub(crate) id: u64,
-    /// The spawning scope. Null until scopes exist; the task body holds the strong reference.
-    #[allow(dead_code, reason = "set once the scope tree lands (porto-szb.35)")]
+    /// The spawning scope. Null until spawns go into scopes; the task body holds the strong
+    /// reference. Completion reaches the scheduler through [`super::Schedule::task_completed`].
+    #[allow(dead_code, reason = "set once spawns go into scopes (porto-szb.93)")]
     pub(crate) scope: *const ScopeNode,
     /// Intrusive run-queue link for the injector.
     #[allow(dead_code, reason = "used by the intrusive injector queue (M2)")]
@@ -43,7 +44,7 @@ pub struct Header {
 
 /// The scope a task was spawned in, as seen from the header: opaque here.
 ///
-/// A placeholder so the header has its final type and size; the scope tree (porto-szb.35)
+/// A placeholder so the header has its final type and size; the scope wiring (porto-szb.93)
 /// replaces it with the real scope node.
 #[repr(C)]
 pub struct ScopeNode {
@@ -86,10 +87,11 @@ fn next_id() -> u64 {
 }
 
 impl Header {
-    /// A header for a task that is about to be queued for the first time.
-    pub(crate) fn new(vtable: &'static TaskVTable, flags: TaskFlags) -> Self {
+    /// A header for a task that is about to be queued for the first time, with the queue's
+    /// reference, plus a join handle's if `join_handle`.
+    pub(crate) fn new(vtable: &'static TaskVTable, flags: TaskFlags, join_handle: bool) -> Self {
         Self {
-            state: State::new_scheduled(),
+            state: State::new_scheduled(join_handle),
             owner_lane: AtomicU16::new(0),
             flags,
             vtable,
@@ -121,7 +123,7 @@ impl Header {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::collections::HashSet;
     use std::thread;

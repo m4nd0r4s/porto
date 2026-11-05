@@ -23,7 +23,7 @@ use std::thread::{self, Thread};
 use super::park::ParkHook;
 use super::shared::Handle;
 use super::timers::Timers;
-use crate::task::{Notified, new_task};
+use crate::task::{JoinHandle, Notified, new_joinable_task};
 use crate::time::{Clock, Deadline, MonotonicClock, RuntimeClock};
 
 /// Tasks run between two checks of the `block_on` future (Tokio's `event_interval`).
@@ -47,8 +47,9 @@ struct Core {
 /// A single-lane runtime.
 ///
 /// Tasks run on whichever thread calls [`Runtime::block_on`] or [`Runtime::run_until_idle`].
-/// Dropping the runtime drops every queued task; tasks parked on a waker are freed when
-/// their last waker is dropped.
+/// Dropping the runtime cancels every queued task (its future is dropped and its join handle
+/// yields a cancelled [`JoinError`](crate::task::JoinError)), and so does any later wake of a
+/// task parked on a waker; such a task is freed when its last waker is dropped.
 pub struct Runtime {
     core: Core,
 }
@@ -129,12 +130,15 @@ impl Runtime {
     }
 
     /// Queues `future` as a new task. It first runs at the next `block_on`/`run_until_idle`.
-    pub fn spawn<F>(&self, future: F)
+    /// Await the [`JoinHandle`] for the output, or drop it to detach the task.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
-        let task = new_task(future, self.core.handle.clone());
+        let (task, join) = new_joinable_task(future, self.core.handle.clone());
         self.core.local.borrow_mut().push_back(task);
+        join
     }
 
     /// Runs `future` to completion on this thread, running spawned tasks while it waits.
@@ -198,8 +202,9 @@ impl Default for Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.core.handle.shared.inbox().closed = true;
-        // Dropping a task may drop its future, whose destructor may wake other tasks; with
-        // the inbox closed, those wakes drop their task instead of queueing it.
+        // Dropping a queue entry cancels its task and drops its future, whose destructor may
+        // wake other tasks; with the inbox closed, those wakes cancel their task instead of
+        // queueing it.
         loop {
             let local = mem::take(&mut *self.core.local.borrow_mut());
             let remote = mem::take(&mut self.core.handle.shared.inbox().tasks);
