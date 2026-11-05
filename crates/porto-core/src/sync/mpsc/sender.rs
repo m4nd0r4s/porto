@@ -3,10 +3,11 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use super::super::WaitNode;
-use super::super::primitives::Arc;
+use super::super::primitives::{Arc, AtomicBool};
 use super::chan::Chan;
 use super::error::{SendError, TrySendError};
 
@@ -16,14 +17,15 @@ use super::error::{SendError, TrySendError};
 /// then see the end of the channel.
 pub struct Sender<T> {
     chan: Arc<Chan<T>>,
-    closed: bool,
+    /// Set once, by `close` (or a clone of a closed handle).
+    closed: AtomicBool,
 }
 
 impl<T> Sender<T> {
     pub(super) fn new(chan: Arc<Chan<T>>) -> Self {
         Self {
             chan,
-            closed: false,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -50,7 +52,7 @@ impl<T> Sender<T> {
     /// [`TrySendError::Full`] if the channel is at capacity, [`TrySendError::Closed`] as for
     /// [`Sender::send`]. Both return the value.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
-        if self.closed {
+        if self.is_handle_closed() {
             return Err(TrySendError::Closed(value));
         }
         self.chan.try_send(value)
@@ -58,16 +60,53 @@ impl<T> Sender<T> {
 
     /// Closes this sender, as dropping it would. Sends through it fail from now on; other
     /// clones are unaffected. Closing twice does nothing.
-    pub fn close(&mut self) {
-        if !self.closed {
-            self.closed = true;
+    pub fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
             self.chan.close_sender();
         }
     }
 
+    /// Whether this handle was closed ([`Sender::close`]), as opposed to the channel being
+    /// closed from the other side.
+    pub fn is_handle_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Waits with a caller-owned node until a `try_send` may succeed: there is room, or the channel is closed (the retry reports it). `Ready` is a hint to retry, not a
+    /// reservation: another handle may take it first, and the caller then waits again.
+    /// Returns `Ready` at once on a closed handle.
+    ///
+    /// This is the building block for waiters that keep their node elsewhere than in a
+    /// future (the Python binding embeds one in each task); [`Sender::send`] is the usual way to
+    /// wait.
+    ///
+    /// # Safety
+    /// As for [`WaitQueue::poll_wait`](super::super::WaitQueue::poll_wait): the node is only
+    /// used with this channel (through any of its handles) until a `Ready` or
+    /// [`Sender::cancel_ready`], and this handle outlives that period.
+    pub unsafe fn poll_ready(&self, node: Pin<&WaitNode>, cx: &mut Context<'_>) -> Poll<()> {
+        let chan = &*self.chan;
+        // SAFETY: the caller's contract.
+        unsafe {
+            chan.send_waiters.poll_wait(node, cx, |waiters| {
+                self.is_handle_closed() || chan.writable_or_queue(waiters)
+            })
+        }
+    }
+
+    /// Stops a [`Sender::poll_ready`] wait: unlinks the node, or passes on a wake it has not
+    /// observed, so the room or value it announced goes to the next waiter.
+    ///
+    /// # Safety
+    /// As for [`Sender::poll_ready`].
+    pub unsafe fn cancel_ready(&self, node: Pin<&WaitNode>) {
+        // SAFETY: the caller's contract.
+        unsafe { self.chan.send_waiters.cancel(node) }
+    }
+
     /// Whether sends through this sender fail: it was closed, or every receiver is gone.
     pub fn is_closed(&self) -> bool {
-        self.closed || self.chan.receivers_closed()
+        self.is_handle_closed() || self.chan.receivers_closed()
     }
 
     /// The channel's capacity, or `None` for an unbounded channel.
@@ -89,12 +128,10 @@ impl<T> Sender<T> {
 impl<T> Clone for Sender<T> {
     /// Another sender on the same channel. A clone of a closed sender is closed too.
     fn clone(&self) -> Self {
-        if !self.closed {
-            self.chan.open_sender();
-        }
+        let open = !self.is_handle_closed() && self.chan.open_sender();
         Self {
             chan: self.chan.clone(),
-            closed: self.closed,
+            closed: AtomicBool::new(!open),
         }
     }
 }
@@ -109,7 +146,7 @@ impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sender")
             .field("chan", &self.chan)
-            .field("closed", &self.closed)
+            .field("closed", &self.is_handle_closed())
             .finish()
     }
 }

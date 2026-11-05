@@ -19,8 +19,9 @@ use std::sync::atomic::Ordering;
 
 use super::super::primitives::{AtomicUsize, UnsafeCell, fence, spin};
 
-/// The largest capacity [`ArrayQueue::new`] accepts: the lap bits need room above the index.
-pub(super) const MAX_CAPACITY: usize = usize::MAX / 4;
+/// The largest capacity a bounded channel accepts: the lap bits of its ring buffer need room
+/// above the index.
+pub const MAX_CAPACITY: usize = usize::MAX / 4;
 
 /// One cell of the ring.
 struct Slot<T> {

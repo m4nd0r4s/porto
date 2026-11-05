@@ -118,6 +118,20 @@ pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult
     Ok(Py::new(py, Ready::new(value))?.into_any())
 }
 
+/// T2 for a native awaitable that completed synchronously and suspends by itself: spends one
+/// unit of the running task's budget exactly as [`checkpoint_if_needed`] does, and returns
+/// whether the budget was already spent (the awaitable then yields a `YieldThen` trap with its
+/// result). Always `false` outside a porto task.
+pub(crate) fn spend_budget() -> bool {
+    running().is_some_and(|running| match running.budget.get() {
+        0 => true,
+        left => {
+            running.budget.set(left - 1);
+            false
+        }
+    })
+}
+
 /// Polls `task`: steps its coroutine until it finishes (`Ready`) or waits (`Pending`).
 pub(super) fn poll(
     task: &mut PyTask,

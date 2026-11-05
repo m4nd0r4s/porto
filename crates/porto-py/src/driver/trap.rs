@@ -60,10 +60,6 @@ pub(crate) enum TrapKind {
         deadline: Deadline,
     },
     /// Wait until a sync primitive grants the task's embedded wait node (spec 16).
-    #[allow(
-        dead_code,
-        reason = "made by porto.Event and porto.Notify (porto-szb.94)"
-    )]
     Notified(WaitTarget),
     /// Run an I/O operation, re-attempted on readiness (spec 13 §5).
     #[allow(dead_code, reason = "made by the socket APIs (porto-szb.62)")]

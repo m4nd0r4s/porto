@@ -18,9 +18,9 @@ pub use driver::trap::Trap;
 pub use py_compat::interned;
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,
-/// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`, `Lock`), the trap protocol's
-/// awaitables (`_Trap`, `_Ready`), the step driver's private
-/// entry points (`_run`, `_spawn`, the trap constructors) and test hooks.
+/// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`, `Lock`, the channel handles
+/// `Sender` and `Receiver`), the trap protocol's awaitables (`_Trap`, `_Ready`), the step
+/// driver's private entry points (`_run`, `_spawn`, the trap constructors) and test hooks.
 ///
 /// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
 /// free-threaded CPython 3.14t, so importing it does not re-enable the GIL (ADR-024).
@@ -35,7 +35,13 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // them yet, so this is the one point where their `am_send` slot can be set (see async_slots).
     async_slots::install_am_send::<Trap>(py, driver::trap::trap_am_send)?;
     async_slots::install_am_send::<Ready>(py, driver::ready::ready_am_send)?;
+    module.add_class::<api::channel_op::ChannelOp>()?;
+    async_slots::install_am_send::<api::channel_op::ChannelOp>(
+        py,
+        api::channel_op::channel_op_am_send,
+    )?;
     py_compat::names(py);
+    api::channel::register(module)?;
     api::config::register(module)?;
     api::run::register(module)?;
     api::scope::register(module)?;

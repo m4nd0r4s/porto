@@ -9,11 +9,16 @@
 //! the unbounded search does not finish. Bounded search is loom's documented practice; most
 //! concurrency bugs need two or three preemptions.
 
+use std::future::poll_fn;
+use std::pin::pin;
+use std::task::Poll;
+
 use loom::future::block_on;
 use loom::model::Builder;
 use loom::thread;
 
-use super::{Receiver, RecvError, SendError, channel};
+use super::super::WaitNode;
+use super::{Receiver, RecvError, SendError, Sender, TryRecvError, TrySendError, channel};
 
 /// Explores `f` under the bound described in the module docs.
 fn model(f: impl Fn() + Sync + Send + 'static) {
@@ -149,5 +154,104 @@ fn mpsc_send_recv_wakeup_two_receivers() {
             ),
             "one receiver gets the value, the other the end: {mine:?}, {theirs:?}"
         );
+    });
+}
+
+/// Receives the way the Python binding does: with a node that no `recv` future owns, waited on
+/// with `poll_ready`, retrying `try_recv` after each wake.
+fn recv_with_node(rx: &Receiver<u32>) -> Result<u32, RecvError> {
+    let node = pin!(WaitNode::new(0));
+    let received = block_on(poll_fn(|cx| {
+        // SAFETY: the node lives in this frame, is only used with this channel, and is
+        // cancelled below before the frame ends.
+        if node.is_pending() && unsafe { rx.poll_ready(node.as_ref(), cx) }.is_pending() {
+            return Poll::Pending;
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(value) => return Poll::Ready(Ok(value)),
+                Err(TryRecvError::Closed) => return Poll::Ready(Err(RecvError)),
+                Err(TryRecvError::Empty) => {}
+            }
+            // SAFETY: as above.
+            if unsafe { rx.poll_ready(node.as_ref(), cx) }.is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }));
+    // SAFETY: as above.
+    unsafe { rx.cancel_ready(node.as_ref()) };
+    received
+}
+
+/// Sends the way the Python binding does; see `recv_with_node`.
+fn send_with_node(tx: &Sender<u32>, value: u32) -> Result<(), SendError<u32>> {
+    let node = pin!(WaitNode::new(0));
+    let mut value = Some(value);
+    let sent = block_on(poll_fn(|cx| {
+        // SAFETY: as in `recv_with_node`.
+        if node.is_pending() && unsafe { tx.poll_ready(node.as_ref(), cx) }.is_pending() {
+            return Poll::Pending;
+        }
+        loop {
+            match tx.try_send(value.take().expect("held until sent")) {
+                Ok(()) => return Poll::Ready(Ok(())),
+                Err(TrySendError::Closed(back)) => return Poll::Ready(Err(SendError(back))),
+                Err(TrySendError::Full(back)) => value = Some(back),
+            }
+            // SAFETY: as above.
+            if unsafe { tx.poll_ready(node.as_ref(), cx) }.is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }));
+    // SAFETY: as above.
+    unsafe { tx.cancel_ready(node.as_ref()) };
+    sent
+}
+
+/// External-node waits: a receiver waiting with `poll_ready` sees every send (its look at the
+/// buffer and the sender's hint check cannot both miss), then the end.
+#[test]
+fn mpsc_ready_wait_receiver_sees_every_send() {
+    model(|| {
+        let (tx, rx) = channel(1);
+        let sender = thread::spawn(move || {
+            block_on(tx.send(1)).unwrap();
+            block_on(tx.send(2)).unwrap();
+        });
+        assert_eq!(recv_with_node(&rx), Ok(1));
+        assert_eq!(recv_with_node(&rx), Ok(2));
+        sender.join().unwrap();
+        assert_eq!(recv_with_node(&rx), Err(RecvError));
+    });
+}
+
+/// External-node waits: a sender waiting for room with `poll_ready` sees every receive.
+#[test]
+fn mpsc_ready_wait_sender_sees_every_receive() {
+    model(|| {
+        let (tx, rx) = channel(1);
+        let sender = thread::spawn(move || {
+            send_with_node(&tx, 1).unwrap();
+            send_with_node(&tx, 2).unwrap();
+        });
+        assert_eq!(block_on(rx.recv()), Ok(1));
+        assert_eq!(block_on(rx.recv()), Ok(2));
+        sender.join().unwrap();
+    });
+}
+
+/// External-node waits: the last receiver closes while a sender waits for room; the send
+/// settles and never hangs.
+#[test]
+fn mpsc_ready_wait_sender_vs_receiver_close() {
+    model(|| {
+        let (tx, rx) = channel(1);
+        tx.try_send(1).unwrap();
+        let sender = thread::spawn(move || send_with_node(&tx, 2));
+        drop(rx);
+        let sent = sender.join().unwrap();
+        assert!(matches!(sent, Ok(()) | Err(SendError(2))), "{sent:?}");
     });
 }

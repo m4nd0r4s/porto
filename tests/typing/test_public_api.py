@@ -118,6 +118,57 @@ async def check_a_mutex_guard_checks_the_value_type() -> None:
         guard.set("one")  # pyright: ignore[reportArgumentType]
 
 
+async def pipeline(items: list[str]) -> list[str]:
+    tx, rx = porto.channel[str](4)
+    assert_type(tx, porto.Sender[str])
+    assert_type(rx, porto.Receiver[str])
+    assert_type(tx.capacity, int | None)
+    assert_type(tx.is_closed(), bool)
+    assert_type(tx.clone(), porto.Sender[str])
+    assert_type(rx.clone(), porto.Receiver[str])
+
+    async def produce() -> None:
+        async with tx:
+            for item in items:
+                await tx.send(item)
+
+    received: list[str] = []
+    async with porto.scope() as s:
+        s.spawn(produce)
+        async for item in rx:
+            assert_type(item, str)
+            received.append(item)
+    return received
+
+
+async def check_channel_methods_are_typed() -> None:
+    tx, rx = porto.unbounded_channel[int]()
+    assert_type(tx.capacity, int | None)
+    tx.try_send(1)
+    tx.blocking_send(2)
+    assert_type(await rx.recv(), int)
+    assert_type(rx.try_recv(), int)
+    assert_type(rx.blocking_recv(), int)
+    assert_type(await rx.recv_many(8), list[int])
+    tx.close()
+    rx.close()
+
+
+def check_channel_misuse_is_a_type_error() -> None:
+    porto.channel[int]()  # pyright: ignore[reportCallIssue]
+    porto.channel[int]("4")  # pyright: ignore[reportArgumentType]
+    tx, _ = porto.channel[int](4)
+    tx.try_send("one")  # pyright: ignore[reportArgumentType]
+    # A receiver of ints is a receiver of objects; a sender of objects is a sender of ints.
+    objects: porto.Receiver[object] = porto.channel[int](1)[1]
+    ints: porto.Sender[int] = porto.channel[object](1)[0]
+    del objects, ints
+
+
+def test_the_channel_sample_runs() -> None:
+    assert porto.run(pipeline, ["a", "b", "c"]) == ["a", "b", "c"]
+
+
 def test_the_sample_runs() -> None:
     assert porto.run(main, ["a", "b"]) == [b"a:443", b"b:443"]
 

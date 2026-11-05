@@ -19,12 +19,15 @@ print(porto.run(main))
 ```
 """
 
+from porto._channel import channel, unbounded_channel
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Event,
     Lock,
     Notify,
+    Receiver,
     Scope,
+    Sender,
     Task,
     __version__,
     checkpoint,
@@ -69,18 +72,22 @@ __all__ = [
     "NoRuntimeError",
     "Notify",
     "PortoError",
+    "Receiver",
     "RuntimeClosed",
     "RuntimeConfig",
     "RustPanic",
     "Scope",
+    "Sender",
     "Task",
     "Terminated",
     "WouldBlock",
     "__version__",
+    "channel",
     "checkpoint",
     "current_time",
     "monotonic",
     "run",
     "scope",
     "sleep",
+    "unbounded_channel",
 ]

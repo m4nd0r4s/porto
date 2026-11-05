@@ -52,12 +52,12 @@ mod tests;
 #[cfg(all(test, loom))]
 mod loom_tests;
 
+pub use array_queue::MAX_CAPACITY;
 pub use error::{RecvError, SendError, TryRecvError, TrySendError};
 pub use receiver::{Receiver, RecvFuture};
 pub use sender::{SendFuture, Sender};
 
 use super::primitives::Arc;
-use array_queue::MAX_CAPACITY;
 use chan::Chan;
 
 /// A bounded channel holding up to `capacity` values. Clone either end for more producers or
