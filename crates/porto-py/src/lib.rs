@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 mod api;
 pub mod async_slots;
 pub mod driver;
+pub mod errors;
 mod py_compat;
 pub mod testing;
 mod throw_args;

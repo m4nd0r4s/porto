@@ -35,6 +35,7 @@ use pyo3::prelude::*;
 
 use super::{lane, step};
 use crate::api::scope::Task;
+use crate::errors::RuntimeClosed;
 use crate::py_compat::take_exception;
 
 /// The cooperative budget: steps a task runs per poll before it yields to the lane
@@ -167,7 +168,7 @@ impl TaskOutcome {
 
 /// What reading the outcome of a cancelled task raises.
 pub(crate) fn cancelled_error() -> PyErr {
-    PyRuntimeError::new_err(
+    RuntimeClosed::new_err(
         "porto: the task was cancelled before it finished: its runtime shut down; keep \
          porto.run() running until the tasks you wait for are done",
     )

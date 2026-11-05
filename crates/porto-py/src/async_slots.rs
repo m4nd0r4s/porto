@@ -26,6 +26,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::type_object::PyTypeInfo;
 
+use crate::errors;
+
 /// Sets `am_send` on the type of `T`. Call it once, from module init, after `add_class::<T>`.
 pub fn install_am_send<T: PyTypeInfo>(py: Python<'_>, send: ffi::sendfunc) -> PyResult<()> {
     let type_object = T::type_object(py);
@@ -53,15 +55,25 @@ pub(crate) fn stop_iteration(value: Bound<'_, PyAny>) -> PyErr {
     PyStopIteration::new_err((value.unbind(),))
 }
 
-/// Runs the body of a raw `am_send` slot, turning a Rust panic into a `RuntimeError` instead of
-/// unwinding into CPython (25-cpython-integration-and-memory.md §8).
+/// Runs the body of a raw `am_send` slot, turning a Rust panic into a `porto.RustPanic` raised
+/// into the awaiting task instead of unwinding into CPython (25-cpython-integration-and-memory.md
+/// §8, ADR-027).
 pub(crate) fn guard_send(body: impl FnOnce() -> ffi::PySendResult) -> ffi::PySendResult {
-    catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| {
-        const MESSAGE: &CStr = c"porto._core: a Rust panic escaped am_send; this is a porto bug, \
-                                 please report it";
-        // SAFETY: slots are called with an attached thread state; both pointers are valid
-        // (a static exception type and a NUL-terminated static string).
-        unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, MESSAGE.as_ptr()) };
+    catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|payload| {
+        // SAFETY: slots are called with an attached thread state.
+        let py = unsafe { Python::assume_attached() };
+        // Raising `RustPanic` imports `porto.errors`, which panics if the import fails (an
+        // interpreter shutting down); a panic must not unwind out of the slot either.
+        let raised = catch_unwind(AssertUnwindSafe(|| {
+            errors::rust_panic(&*payload, None).restore(py);
+        }));
+        if raised.is_err() {
+            const MESSAGE: &CStr = c"porto._core: a Rust panic escaped am_send; this is a porto \
+                                     bug, please report it";
+            // SAFETY: attached (see above); both pointers are valid (a static exception type and
+            // a NUL-terminated static string).
+            unsafe { ffi::PyErr_SetString(ffi::PyExc_RuntimeError, MESSAGE.as_ptr()) };
+        }
         ffi::PySendResult::PYGEN_ERROR
     })
 }

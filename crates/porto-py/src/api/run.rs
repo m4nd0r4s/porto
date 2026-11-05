@@ -9,6 +9,7 @@ use pyo3::types::{PyTuple, PyType};
 
 use crate::driver::lane;
 use crate::driver::pytask::{self, Spawned};
+use crate::errors::NoRuntimeError;
 
 /// Adds the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -66,7 +67,7 @@ fn run_main_task(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
 #[pyo3(signature = (coro, /))]
 fn spawn(coro: Bound<'_, PyAny>) -> PyResult<()> {
     let Some(handle) = lane::current() else {
-        return Err(PyRuntimeError::new_err(
+        return Err(NoRuntimeError::new_err(
             "porto: _spawn() must be called from a task running under _run(); start the \
              runtime with _run(main()) and spawn from inside main",
         ));

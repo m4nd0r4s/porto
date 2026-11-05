@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 
 import pytest
 
+import porto
 from porto import _core
 
 ITERATIONS = 100_000
@@ -79,7 +80,7 @@ def test_a_sleep_trap_rejects_a_negative_or_nan_delay(delay: float) -> None:
 
 
 def test_a_sleep_trap_outside_a_runtime_raises_and_says_what_to_do() -> None:
-    with pytest.raises(RuntimeError, match=r"porto.sleep\(\) was called outside porto.run"):
+    with pytest.raises(porto.NoRuntimeError, match=r"porto.sleep\(\) was called outside porto.run"):
         _core._sleep_trap(1)
 
 
