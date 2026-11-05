@@ -22,6 +22,7 @@ print(porto.run(main))
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Event,
+    Lock,
     Notify,
     Scope,
     Task,
@@ -33,6 +34,7 @@ from porto._core import (
     scope,
     sleep,
 )
+from porto._sync import Mutex, MutexGuard
 from porto.errors import (
     BrokenResourceError,
     Cancelled,
@@ -61,6 +63,9 @@ __all__ = [
     "InvalidStateError",
     "Lagged",
     "LimitOverrunError",
+    "Lock",
+    "Mutex",
+    "MutexGuard",
     "NoRuntimeError",
     "Notify",
     "PortoError",

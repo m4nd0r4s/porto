@@ -1,7 +1,7 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify`` and ``__version__``
+``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -126,7 +126,7 @@ class Event:
     def is_set(self) -> bool:
         """Whether the event is set."""
 
-    def wait(self) -> _SyncWait:
+    def wait(self) -> _SyncWait[None]:
         """Completes once the event is set; without suspending if it already is.
 
         Nothing happens until it is awaited; ``await`` it inside ``porto.run``.
@@ -153,7 +153,7 @@ class Notify:
     def notify_all(self) -> None:
         """Wakes every task waiting now. Stores no permit."""
 
-    def notified(self) -> _SyncWait:
+    def notified(self) -> _SyncWait[None]:
         """Completes when notified: at once if a permit is stored (consuming it), otherwise on
         a ``notify_one()`` or ``notify_all()`` made after the ``await`` started.
 
@@ -167,6 +167,56 @@ class Notify:
 
         The wait does not check for signals: Ctrl-C does not interrupt it, and the
         ``KeyboardInterrupt`` is raised once it is over."""
+
+@final
+class Lock:
+    """An async lock: ``async with lock:``. Fair: waiters get it in arrival order, and
+    ``release()`` hands it straight to the first one. **Not reentrant**: acquiring it again
+    from the task that holds it waits forever. A waiter that is cancelled never leaks it.
+    Thread-safe.
+
+    The holder is not recorded (like ``asyncio.Lock``): ``release()`` from a task that does
+    not hold the lock, or a second ``release()``, releases it from under whoever holds it,
+    breaking mutual exclusion; the holder's own ``release()`` then raises ``RuntimeError``.
+    Release only what you acquired, or use ``async with``."""
+
+    def __init__(self) -> None: ...
+    def acquire(self) -> _SyncWait[None]:
+        """Completes once the task holds the lock; without suspending if it is free.
+
+        Nothing happens until it is awaited: one that is never awaited takes no lock. A task
+        cancelled or closed before it observed the lock passes it on.
+        """
+
+    def _acquire_then(self, on_acquired: Callable[[], _T], /) -> _SyncWait[_T]:
+        """Internal (``porto.Mutex``): ``acquire()``, then ``on_acquired()`` in the same step;
+        the await evaluates to its result. If it raises, the lock is released first."""
+
+    def try_acquire(self) -> bool:
+        """Takes the lock if it is free right now; returns whether it did."""
+
+    def release(self) -> None:
+        """Releases the lock, handing it to the longest waiting task. ``RuntimeError`` if the
+        lock is not held. Call it only from the task that acquired the lock: the holder is not
+        checked."""
+
+    def locked(self) -> bool:
+        """Whether the lock is held (or being handed to a waiter)."""
+
+    def blocking_acquire(self) -> None:
+        """Blocks the calling thread until it holds the lock; ``release()`` releases it. Only
+        from threads that do not run porto: raises ``RuntimeError`` on a lane thread.
+
+        The wait does not check for signals: Ctrl-C does not interrupt it."""
+
+    def __aenter__(self) -> _SyncWait[None]: ...
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
 
 @final
 class _Trap:
@@ -204,14 +254,15 @@ class _Trap:
     def close(self) -> None: ...
 
 @final
-class _SyncWait:
-    """The awaitable a sync primitive's wait returns (``Event.wait()``, ``Notify.notified()``).
+class _SyncWait(Generic[_T_co]):
+    """The awaitable a sync primitive's wait returns (``Event.wait()``, ``Notify.notified()``,
+    ``Lock.acquire()``).
 
     Lazy: it tries the primitive when awaited, and only then. Await it once.
     """
 
-    def __await__(self) -> Generator[_Trap, object]: ...
-    def __iter__(self) -> Generator[_Trap, object]: ...
+    def __await__(self) -> Generator[_Trap, object, _T_co]: ...
+    def __iter__(self) -> Generator[_Trap, object, _T_co]: ...
     def __next__(self) -> _Trap: ...
     def send(self, value: object, /) -> _Trap: ...
     @overload

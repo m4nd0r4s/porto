@@ -8,8 +8,8 @@ Waiting tasks use intrusive `WaitNode`s embedded in the task (PyTask: `wait_node
 
 | Python | Rust | Semantics |
 |---|---|---|
-| `porto.Lock()` | `sync::Mutex<()>` | async, fair FIFO handoff, non-reentrant; `async with lock:`; `locked()`; `try_acquire() -> bool` |
-| `porto.Mutex[T](value)` | `sync::Mutex<PyObj>` | lock that owns the value: `async with m as v:` gives access; `v.set(new)`; encourages correct free-threaded code |
+| `porto.Lock()` | `sync::Mutex<()>` | async, fair FIFO handoff, non-reentrant; `async with lock:`; `await acquire()`, `release()`; `locked()`; `try_acquire() -> bool`; `blocking_acquire()`. The holder is not recorded (as in `asyncio.Lock`): a `release()` by a task that does not hold the lock, or a second `release()`, releases it from under the holder and breaks mutual exclusion; only a release of an unlocked lock raises `RuntimeError` |
+| `porto.Mutex[T](value)` | `porto.Lock` + the value | lock that owns the value: `async with m as v:` gives a `MutexGuard[T]`: `v.value`, `v.set(new)`, unusable once the block exits; `locked()`; encourages correct free-threaded code |
 | `porto.RwLock()` | `sync::RwLock` | writer-preferring |
 | `porto.Semaphore(n)` | `sync::Semaphore` | `acquire(k=1)`, `release(k=1)`, `async with`, `available` |
 | `porto.CapacityLimiter(n)` | Semaphore + owner tracking | AnyIO-compatible; per-task borrow |

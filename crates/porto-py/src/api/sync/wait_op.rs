@@ -1,15 +1,15 @@
-//! `_SyncWait`: the awaitable behind `Event.wait()` and `Notify.notified()`
+//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()` and `Lock.acquire()`
 //! (16-sync-primitives-and-channels.md §1).
 //!
 //! Nothing happens until it is awaited, so a `notified()` created and never awaited consumes
-//! no permit. A grant is only ever taken in the step that hands it to the coroutine, so a task
+//! no permit, and an `acquire()` never awaited takes no lock. A grant is only ever taken in the step that hands it to the coroutine, so a task
 //! closed or cancelled at any suspension point cannot hold a grant it never saw:
 //!
 //! - the first resume spends one unit of the task's budget (T2). If that ran the budget out,
 //!   it takes nothing: it yields a `Yield` trap and tries again on the next resume, after the
 //!   other ready tasks ran;
-//! - otherwise it tries the primitive without waiting (`try_notified`, `is_set`). Success
-//!   returns at once, in this same step;
+//! - otherwise it tries the primitive without waiting (`try_notified`, `is_set`, `try_lock`).
+//!   Success returns at once, in this same step;
 //! - otherwise it yields a `Notified` trap: the driver parks the task's embedded wait node on
 //!   the primitive, and the grant stays in the node until the coroutine is resumed with it. A
 //!   task that gives the wait up first (T3) cancels the node, which passes a grant it had not
@@ -26,6 +26,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use super::event::{EventSource, NotifySource};
+use super::lock::LockSource;
 use crate::async_slots::{guard_send, stop_iteration};
 use crate::driver::step::checkpoint_if_needed;
 use crate::driver::thin::{WaitTarget, Waitable};
@@ -38,6 +39,8 @@ pub(super) enum Grant {
     EventSet(Arc<Waitable<EventSource>>),
     /// `Notify.notified()`: a permit or a `notify_one` wake, consumed.
     Notified(Arc<Waitable<NotifySource>>),
+    /// `Lock.acquire()`: the lock, held until `release()`.
+    Locked(Arc<Waitable<LockSource>>),
 }
 
 impl Grant {
@@ -46,6 +49,18 @@ impl Grant {
         match self {
             Self::EventSet(event) => event.0.is_set(),
             Self::Notified(notify) => notify.0.try_notified(),
+            Self::Locked(lock) => lock.try_lock(),
+        }
+    }
+
+    /// Gives a taken grant back: the coroutine is not resumed with it after all.
+    fn give_back(&self) {
+        match self {
+            Self::EventSet(_) => {}
+            Self::Notified(notify) => notify.0.notify_one(),
+            Self::Locked(lock) => {
+                lock.unlock();
+            }
         }
     }
 
@@ -54,6 +69,7 @@ impl Grant {
         match self {
             Self::EventSet(event) => event.target(),
             Self::Notified(notify) => notify.target(),
+            Self::Locked(lock) => lock.target(),
         }
     }
 }
@@ -63,7 +79,7 @@ enum State {
     /// Not granted yet: the next resume tries (the first one, or after a budget yield).
     Trying(Grant),
     /// Yielded a `Notified` trap: the driver resumes it once the wait node was granted.
-    Waiting,
+    Waiting(Grant),
     /// Returned, raised, thrown into or closed.
     Done,
 }
@@ -74,14 +90,17 @@ pub(crate) struct SyncWait {
     state: State,
     /// Whether it has been resumed: a first resume must send `None`.
     started: bool,
+    /// Called once the grant is taken, in the same step; the await evaluates to its result.
+    /// If it raises, the grant is given back and the await raises.
+    then: Option<Py<PyAny>>,
 }
 
 /// What one resume does.
 enum Stepped {
     /// Suspend, yielding this trap to the driver.
     Yield(Py<PyAny>),
-    /// The await evaluates to `None`.
-    Return,
+    /// The await evaluates to this.
+    Return(Py<PyAny>),
 }
 
 impl SyncWait {
@@ -89,6 +108,29 @@ impl SyncWait {
         Self {
             state: State::Trying(grant),
             started: false,
+            then: None,
+        }
+    }
+
+    /// A wait that calls `then()` once granted and evaluates to its result.
+    pub(super) fn calling(grant: Grant, then: Py<PyAny>) -> Self {
+        Self {
+            then: Some(then),
+            ..Self::new(grant)
+        }
+    }
+
+    /// The grant is taken: what the await evaluates to.
+    fn granted(&mut self, py: Python<'_>, grant: &Grant) -> PyResult<Stepped> {
+        let Some(then) = self.then.take() else {
+            return Ok(Stepped::Return(py.None()));
+        };
+        match then.call0(py) {
+            Ok(result) => Ok(Stepped::Return(result)),
+            Err(error) => {
+                grant.give_back();
+                Err(error)
+            }
         }
     }
 
@@ -106,14 +148,14 @@ impl SyncWait {
                     return suspend(py, TrapKind::Yield);
                 }
                 if grant.try_take() {
-                    return Ok(Stepped::Return);
+                    return self.granted(py, &grant);
                 }
                 let target = grant.target();
-                self.state = State::Waiting;
+                self.state = State::Waiting(grant);
                 suspend(py, TrapKind::Notified(target))
             }
             // The driver resumes a `Notified` wait only once it was granted.
-            State::Waiting => Ok(Stepped::Return),
+            State::Waiting(grant) => self.granted(py, &grant),
             State::Done => Err(reused_error()),
         }
     }
@@ -172,7 +214,7 @@ impl SyncWait {
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self.resume(py, &py.None().into_bound(py))? {
             Stepped::Yield(trap) => Ok(trap),
-            Stepped::Return => Err(stop_iteration(py.None().into_bound(py))),
+            Stepped::Return(value) => Err(stop_iteration(value.into_bound(py))),
         }
     }
 
@@ -181,7 +223,7 @@ impl SyncWait {
         let py = value.py();
         match self.resume(py, value)? {
             Stepped::Yield(trap) => Ok(trap),
-            Stepped::Return => Err(stop_iteration(py.None().into_bound(py))),
+            Stepped::Return(value) => Err(stop_iteration(value.into_bound(py))),
         }
     }
 
@@ -204,7 +246,7 @@ impl SyncWait {
     fn __repr__(&self) -> &'static str {
         match &self.state {
             State::Trying(_) if !self.started => "<porto._core._SyncWait fresh>",
-            State::Trying(_) | State::Waiting => "<porto._core._SyncWait waiting>",
+            State::Trying(_) | State::Waiting(_) => "<porto._core._SyncWait waiting>",
             State::Done => "<porto._core._SyncWait done>",
         }
     }
@@ -235,7 +277,7 @@ pub(crate) unsafe extern "C" fn sync_wait_am_send(
         };
         let (result, status) = match stepped {
             Ok(Stepped::Yield(trap)) => (trap, ffi::PySendResult::PYGEN_NEXT),
-            Ok(Stepped::Return) => (py.None(), ffi::PySendResult::PYGEN_RETURN),
+            Ok(Stepped::Return(value)) => (value, ffi::PySendResult::PYGEN_RETURN),
             Err(error) => {
                 error.restore(py);
                 return ffi::PySendResult::PYGEN_ERROR;
