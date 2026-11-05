@@ -24,8 +24,8 @@ static RESOLVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 /// `config` over the `PORTO_*` variables over the defaults. Raises what `RuntimeConfig` raises
 /// for an invalid value.
 ///
-/// The M1 single-lane runtime uses `timer_resolution` only; the other fields are checked (in
-/// Python) and not carried yet.
+/// The M1 single-lane runtime uses `timer_resolution` and `coop_budget` only; the other fields
+/// are checked (in Python) and not carried yet.
 pub(crate) fn resolve(
     py: Python<'_>,
     config: Option<&Bound<'_, PyAny>>,
@@ -41,8 +41,19 @@ pub(crate) fn resolve(
     let timer_resolution: f64 = resolved
         .getattr(pyo3::intern!(py, "timer_resolution"))?
         .extract()?;
+    let coop_budget: u32 = resolved
+        .getattr(pyo3::intern!(py, "coop_budget"))?
+        .extract()
+        .map_err(|_| {
+            PyValueError::new_err(format!(
+                "porto: coop_budget must be at most {}; pass a smaller budget (the default is \
+                 128)",
+                u32::MAX
+            ))
+        })?;
     RuntimeConfig::builder()
         .timer_resolution(Duration::from_secs_f64(timer_resolution))
+        .coop_budget(coop_budget)
         .build()
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }

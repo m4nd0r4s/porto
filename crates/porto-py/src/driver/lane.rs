@@ -54,11 +54,11 @@ struct LaneState {
 }
 
 /// Runs `body` with a fresh single-lane Python runtime configured by `config` (of which it uses
-/// `timer_resolution`), on this (attached) thread. The runtime
-/// is dropped before returning, still attached, so the tasks it frees release their Python
-/// objects directly. Then every task still in a linked wait (a join, a sync primitive, a scope
-/// exit) is cancelled: its wait is given up and its coroutine closed (spec 11 §3.2), so no task
-/// of the run outlives it.
+/// `timer_resolution` and `coop_budget`), on this (attached) thread. The runtime is dropped
+/// before returning, still attached, so the tasks it frees release their Python objects
+/// directly. Then every task still in a linked wait (a join, a sync primitive, a scope exit) is
+/// cancelled: its wait is given up and its coroutine closed (spec 11 §3.2), so no task of the
+/// run outlives it.
 pub(crate) fn run<T>(
     _attached: Python<'_>,
     config: &RuntimeConfig,
@@ -67,6 +67,7 @@ pub(crate) fn run<T>(
     let runtime = Runtime::builder()
         .park_hook(DetachWhileParked)
         .timer_resolution(config.timer_resolution())
+        .coop_budget(config.coop_budget())
         .build();
     let output = {
         let _lane = OnPythonLane::enter();

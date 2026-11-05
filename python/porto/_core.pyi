@@ -7,6 +7,7 @@ Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
 """
 
+import contextvars
 from collections.abc import Awaitable, Callable, Coroutine, Generator
 from types import TracebackType
 from typing import Any, Generic, Literal, NoReturn, Self, TypeVar, TypeVarTuple, final, overload
@@ -241,12 +242,19 @@ class _JoinTarget(Generic[_T_co]):
     def done(self) -> bool:
         """Whether the task finished."""
 
+    @property
+    def steps(self) -> int:
+        """How many times the driver resumed the coroutine; read it from another task."""
+
 @final
 class _TaskToken:
     """Test hook: the task that called ``_current_task_token``."""
 
-def _spawn_joinable(coro: Coroutine[Any, Any, _T], /) -> _JoinTarget[_T]:
-    """Test hook: starts ``coro`` as a task on the running runtime, to join with ``join()``."""
+def _spawn_joinable(
+    coro: Coroutine[Any, Any, _T], /, context: contextvars.Context | None = None
+) -> _JoinTarget[_T]:
+    """Test hook: starts ``coro`` as a task on the running runtime, to join with ``join()``. It
+    runs in a copy of the current context, or in ``context`` itself if given."""
 
 def _checkpoint_if_needed(value: _T, /) -> Awaitable[_T]:
     """Test hook: what a synchronous completion returns (T2): a ``_Ready``, or a yield trap that

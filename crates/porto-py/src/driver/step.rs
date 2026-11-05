@@ -12,18 +12,26 @@
 //! - `None` (a bare `yield` in a generator-based coroutine) is a yield;
 //! - anything else is an error thrown back into the coroutine, at the `await` that yielded it.
 //!
-//! The coroutine's `contextvars.Context` is entered for the whole poll. While it runs, the
-//! task's waker is reachable through [`current_waker`] and its budget through
-//! [`checkpoint_if_needed`] (T2).
+//! The coroutine's `contextvars.Context` is entered for the whole poll; a context that cannot be
+//! entered fails the task, and its coroutine is closed. While it runs, the task's waker is
+//! reachable through [`current_waker`] and its budget through [`checkpoint_if_needed`] (T2).
+//!
+//! The budget starts at the lane's `coop_budget` (`porto_core::coop`) and every step spends a
+//! unit, a throw included: a coroutine that keeps catching the error of an unsupported await
+//! yields like any other. Out of budget with a step to go, the task yields to the back of the
+//! local queue.
 //!
 //! A woken task whose wait is still not over is where a cancellation is delivered: the wait is
 //! abandoned (T3, `wait.rs`) and the exception thrown in. Until scopes deliver cancellation
 //! (porto-szb.36, `scopes::effective_cancel`), the one source is [`lane::take_interrupt`].
+//! porto-szb.36 also turns a `Cancelled` that belongs to a cancelling scope into
+//! `TaskOutcome::Cancelled`; until then every exception is `TaskOutcome::Err`.
 
 use std::cell::Cell;
 use std::ptr;
 use std::task::{Context, Poll, Waker};
 
+use porto_core::coop;
 use porto_core::task::Header;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
@@ -31,7 +39,7 @@ use pyo3::{ffi, intern};
 
 use super::lane;
 use super::pending::{Kind, Pending};
-use super::pytask::{COOP_BUDGET, PyTask, Resume, TaskOutcome};
+use super::pytask::{PyTask, Resume, TaskOutcome};
 use super::ready::Ready;
 use super::trap::{Trap, TrapKind};
 use crate::py_compat::{Sent, names, send, take_exception};
@@ -46,7 +54,7 @@ thread_local! {
 struct Running {
     waker: *const Waker,
     /// Steps and synchronous completions left in this poll (T2).
-    budget: Cell<u8>,
+    budget: Cell<u32>,
 }
 
 /// The task running on this thread, if a task is running.
@@ -61,6 +69,15 @@ fn running<'a>() -> Option<&'a Running> {
 pub(crate) fn current_waker() -> Option<Waker> {
     // SAFETY: `poll` borrows the waker for as long as it publishes it.
     running().map(|running| unsafe { &*running.waker }.clone())
+}
+
+/// Whether the task with this header is the one running on this thread (its waker's data is
+/// its header, see `lane::task_key`).
+pub(crate) fn is_running(header: &Header) -> bool {
+    running().is_some_and(|running| {
+        // SAFETY: `poll` borrows the waker for as long as it publishes it.
+        unsafe { &*running.waker }.data() == std::ptr::from_ref(header).cast()
+    })
 }
 
 /// Publishes the polled task in `RUNNING` until dropped.
@@ -81,20 +98,21 @@ impl Drop for RunningTask {
 /// T2: what a Porto awaitable that completed synchronously with `value` returns instead of a
 /// plain ready awaitable (spec 11 §5.3).
 ///
-/// It counts against the running task's budget, so a loop of synchronous completions cannot
-/// starve the lane: when the budget runs out, the result comes back as a `Yield` trap that
-/// resumes the task with `value` after the other ready tasks ran (`Pending::YieldThen`).
-/// Otherwise, and outside a porto task (a manual driver, the asyncio facade), it is a `_Ready`.
+/// It spends a unit of the running task's budget, so a loop of synchronous completions cannot
+/// starve the lane: once the budget is spent, the result comes back as a `Yield` trap that
+/// resumes the task with `value` after the other ready tasks ran (`Pending::YieldThen`, the
+/// task goes to the back of the local queue). The step that resumes it spends the next unit,
+/// so a loop of them yields every `coop_budget` awaits. Otherwise, and outside a porto task (a
+/// manual driver, the asyncio facade), it is a `_Ready`.
 ///
 /// It will also raise `Cancelled` when the task's effective scope is cancelled and this
 /// checkpoint has not delivered it yet: cancel delivery (porto-szb.36) hooks in here.
 pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
     if let Some(running) = running() {
         let budget = &running.budget;
-        let left = budget.get().saturating_sub(1);
-        budget.set(left);
-        if left == 0 {
-            return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any());
+        match budget.get() {
+            0 => return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any()),
+            left => budget.set(left - 1),
         }
     }
     Ok(Py::new(py, Ready::new(value))?.into_any())
@@ -118,6 +136,11 @@ pub(super) fn poll(
     let _context = match unsafe { EnteredContext::enter(py, task.context.as_ptr()) } {
         Ok(entered) => entered,
         Err(exception) => {
+            // The coroutine never runs again: close it, or a coroutine that never started
+            // warns that it was never awaited when it is freed.
+            if let Err(error) = coro.call_method0(intern!(py, "close")) {
+                error.write_unraisable(py, Some(&coro));
+            }
             task.coro = Some(coro.unbind());
             task.complete(py, header, TaskOutcome::Err(exception));
             return Poll::Ready(());
@@ -125,7 +148,9 @@ pub(super) fn poll(
     };
     let running = Running {
         waker: cx.waker(),
-        budget: Cell::new(COOP_BUDGET),
+        // The lane's budget for this poll (`coop_budget`), kept here so a step does not touch a
+        // thread local. Rust futures the task awaits draw on the lane's own count.
+        budget: Cell::new(coop::remaining().unwrap_or(u32::MAX)),
     };
     let outcome = {
         // Published only while the coroutine steps: Python code that `complete` runs (a
@@ -147,7 +172,7 @@ pub(super) fn poll(
 fn step_until_wait(
     task: &mut PyTask,
     coro: &Bound<'_, PyAny>,
-    budget: &Cell<u8>,
+    budget: &Cell<u32>,
     cx: &mut Context<'_>,
 ) -> Option<TaskOutcome> {
     let py = coro.py();
@@ -167,7 +192,8 @@ fn step_until_wait(
         }
         if budget.get() == 0 {
             // Out of budget with a step to go (a throw after an unsupported await, a wait that
-            // was over at once): let the other tasks run first.
+            // was over at once): let the other tasks run first. A loop that keeps catching the
+            // `TypeError` of an unsupported await yields here too, so it cannot hang the lane.
             yield_now(task, cx);
             return None;
         }
