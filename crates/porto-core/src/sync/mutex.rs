@@ -1,13 +1,13 @@
 //! [`Mutex`]: an async lock that owns its value, with fair FIFO handoff
 //! (16-sync-primitives-and-channels.md §1).
 
-use std::cell::UnsafeCell;
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use super::primitives::UnsafeCell;
 use super::{BlockingOnLane, Locked, Wait, WaitNode, WaitQueue, WaitState, blocking_wait};
 
 /// An async mutual-exclusion lock around a `T`.
@@ -126,7 +126,8 @@ impl<T: ?Sized> Mutex<T> {
 
     /// The value, through the exclusive borrow of the mutex (no locking needed).
     pub fn get_mut(&mut self) -> &mut T {
-        self.value.get_mut()
+        // SAFETY: `&mut self` rules out every other access.
+        self.value.with_mut(|value| unsafe { &mut *value })
     }
 
     /// [`Mutex::lock`] with a caller-owned node, for a waiter that embeds its [`WaitNode`] (a
@@ -204,14 +205,14 @@ impl<T: ?Sized> Deref for MutexGuard<'_, T> {
 
     fn deref(&self) -> &T {
         // SAFETY: the guard holds the lock, so no other access exists.
-        unsafe { &*self.mutex.value.get() }
+        self.mutex.value.with(|value| unsafe { &*value })
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as above; `&mut self` makes this access unique.
-        unsafe { &mut *self.mutex.value.get() }
+        self.mutex.value.with_mut(|value| unsafe { &mut *value })
     }
 }
 

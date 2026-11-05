@@ -41,12 +41,23 @@ pub(crate) fn spin(step: u32) {
 /// `std::cell::UnsafeCell` with loom's closure-based API.
 #[cfg(not(all(loom, test)))]
 #[derive(Debug)]
-pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+pub(crate) struct UnsafeCell<T: ?Sized>(std::cell::UnsafeCell<T>);
 
 #[cfg(not(all(loom, test)))]
 impl<T> UnsafeCell<T> {
     pub(crate) const fn new(value: T) -> Self {
         Self(std::cell::UnsafeCell::new(value))
+    }
+
+    pub(crate) fn into_inner(self) -> T {
+        self.0.into_inner()
+    }
+}
+
+#[cfg(not(all(loom, test)))]
+impl<T: ?Sized> UnsafeCell<T> {
+    pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        f(self.0.get())
     }
 
     pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {

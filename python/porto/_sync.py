@@ -10,10 +10,7 @@ from collections.abc import Awaitable
 from types import TracebackType
 from typing import Generic, TypeVar, final
 
-from porto._core import (
-    Lock,
-    _checkpoint_if_needed,  # pyright: ignore[reportPrivateUsage]
-)
+from porto._core import Lock
 
 _T = TypeVar("_T")
 
@@ -59,7 +56,9 @@ class Mutex(Generic[_T]):
 
     ``async with mutex as guard:`` waits for the lock (fair FIFO, like ``porto.Lock``), then
     ``guard.value`` reads the value and ``guard.set(new)`` replaces it. Not reentrant: entering
-    it again inside its own block waits forever.
+    it again inside its own block waits forever. Nothing is taken until ``__aenter__()`` is
+    awaited, and the guard is made in the step that takes the lock, so a task cancelled or
+    closed while entering never holds it.
     """
 
     __slots__ = ("_guard", "_lock", "_value")
@@ -74,29 +73,12 @@ class Mutex(Generic[_T]):
         return self._lock.locked()
 
     def __aenter__(self) -> Awaitable[MutexGuard[_T]]:
-        if not self._lock.try_acquire():
-            return self._acquire()
-        try:
-            return _checkpoint_if_needed(self._enter())
-        except BaseException:
-            self._exit()
-            raise
-
-    async def _acquire(self) -> MutexGuard[_T]:
-        await self._lock.acquire()
-        return self._enter()
+        return self._lock._acquire_then(self._enter)  # pyright: ignore[reportPrivateUsage]
 
     def _enter(self) -> MutexGuard[_T]:
         guard = MutexGuard(self)
         self._guard = guard
         return guard
-
-    def _exit(self) -> None:
-        guard = self._guard
-        if guard is not None:
-            guard._mutex = None  # pyright: ignore[reportPrivateUsage]
-            self._guard = None
-        self._lock.release()
 
     def __aexit__(
         self,
@@ -105,9 +87,12 @@ class Mutex(Generic[_T]):
         traceback: TracebackType | None,
         /,
     ) -> Awaitable[None]:
-        self._exit()
-        # After the release: a checkpoint here (T2) never holds the lock.
-        return _checkpoint_if_needed(None)
+        guard = self._guard
+        if guard is not None:
+            guard._mutex = None  # pyright: ignore[reportPrivateUsage]
+            self._guard = None
+        # Releases the lock, then a checkpoint (T2) that never holds it.
+        return self._lock.__aexit__(exc_type, exc, traceback)
 
     def __repr__(self) -> str:
         return f"<porto.Mutex {'locked' if self.locked() else 'unlocked'}>"

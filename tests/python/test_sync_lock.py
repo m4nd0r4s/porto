@@ -5,11 +5,23 @@ waiting task the way cancellation will (porto-szb.36): the wait is given up firs
 """
 
 import threading
+from collections.abc import Awaitable, Callable
 
 import pytest
 
 import porto
 from porto import _core
+
+
+def completes_at_once(awaitable: Awaitable[object]) -> bool:
+    """Resumes ``awaitable`` once by hand: whether it completed without suspending."""
+    steps = awaitable.__await__()
+    try:
+        steps.send(None)
+    except StopIteration:
+        return True
+    steps.close()
+    return False
 
 
 async def settle() -> None:
@@ -24,9 +36,7 @@ async def settle() -> None:
 def test_an_uncontended_acquire_does_not_suspend() -> None:
     async def main() -> None:
         lock = porto.Lock()
-        acquiring = lock.acquire()
-        assert isinstance(acquiring, _core._Ready)
-        await acquiring
+        assert completes_at_once(lock.acquire())
         assert lock.locked()
         assert repr(lock) == "<porto.Lock locked>"
         lock.release()
@@ -298,5 +308,116 @@ def test_an_interrupted_mutex_waiter_does_not_leak_it() -> None:
         assert not mutex.locked()
         async with mutex as guard:
             assert guard.value == 0
+
+    porto.run(main)
+
+
+# A lock the task has not observed yet is never leaked
+
+
+def close_a_spinner(spin: Callable[[], Awaitable[None]], extra_completions: int) -> None:
+    """Runs ``spin`` in a loop in a task that the run closes after a while, wherever it is
+    suspended then (often at a budget yield). ``extra_completions`` synchronous completions per
+    round shift which await of ``spin`` runs the budget out."""
+
+    async def spinner() -> None:
+        while True:
+            await spin()
+            for _ in range(extra_completions):
+                await _core._checkpoint_if_needed(None)
+
+    async def main() -> None:
+        _core._spawn(spinner())
+        await porto.sleep(0.002)
+
+    porto.run(main)
+
+
+def test_a_lock_is_free_after_the_run_closes_an_acquire_release_loop() -> None:
+    for trial in range(120):
+        lock = porto.Lock()
+
+        async def acquire_release(lock: porto.Lock = lock) -> None:
+            await lock.acquire()
+            lock.release()
+
+        close_a_spinner(acquire_release, trial % 3)
+        assert not lock.locked(), "the lock leaked when the run closed its holder"
+
+
+def test_a_lock_is_free_after_the_run_closes_an_async_with_loop() -> None:
+    for trial in range(120):
+        lock = porto.Lock()
+
+        async def enter_exit(lock: porto.Lock = lock) -> None:
+            async with lock:
+                pass
+
+        close_a_spinner(enter_exit, trial % 3)
+        assert not lock.locked(), "the lock leaked when the run closed its holder"
+
+
+def test_a_mutex_is_free_after_the_run_closes_an_async_with_loop() -> None:
+    for trial in range(120):
+        mutex = porto.Mutex(0)
+
+        async def increment(mutex: porto.Mutex[int] = mutex) -> None:
+            async with mutex as guard:
+                guard.set(guard.value + 1)
+
+        close_a_spinner(increment, trial % 3)
+        assert not mutex.locked(), "the mutex leaked when the run closed its holder"
+
+
+def test_acquire_does_nothing_until_awaited() -> None:
+    async def main() -> None:
+        lock = porto.Lock()
+        not_awaited = lock.acquire()
+        del not_awaited
+        assert not lock.locked()
+        mutex = porto.Mutex(0)
+        entering = mutex.__aenter__()
+        del entering
+        assert not mutex.locked()
+
+    porto.run(main)
+
+
+def test_a_release_by_another_task_breaks_exclusion_and_the_holder_gets_the_error() -> None:
+    # Like asyncio.Lock, the holder is not recorded: documented, not detected.
+    lock = porto.Lock()
+    log: list[str] = []
+
+    async def holder() -> None:
+        try:
+            async with lock:
+                await settle()
+                log.append(f"holder inside, locked={lock.locked()}")
+        except RuntimeError as error:
+            log.append(f"holder: {error}")
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.spawn(holder)
+            await porto.checkpoint()
+            assert lock.locked()
+            lock.release()  # the mistake: this task never acquired it
+        assert log[0] == "holder inside, locked=False"
+        assert "another task released it first" in log[1]
+
+    porto.run(main)
+
+
+def test_acquire_then_gives_the_lock_back_if_its_callback_raises() -> None:
+    def fail() -> None:
+        raise KeyError("on_acquired")
+
+    async def main() -> None:
+        lock = porto.Lock()
+        assert await lock._acquire_then(lambda: "entered") == "entered"  # pyright: ignore[reportPrivateUsage]
+        lock.release()
+        with pytest.raises(KeyError, match="on_acquired"):
+            await lock._acquire_then(fail)  # pyright: ignore[reportPrivateUsage]
+        assert not lock.locked()
 
     porto.run(main)

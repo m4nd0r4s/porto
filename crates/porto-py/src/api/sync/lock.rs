@@ -9,13 +9,13 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use super::blocking;
+use super::wait_op::{Grant, SyncWait};
 use crate::api::time::require_lane;
 use crate::driver::step::checkpoint_if_needed;
 use crate::driver::thin::{WaitSource, Waitable};
-use crate::driver::trap::{Trap, TrapKind};
 
 /// The lock: a `Mutex<()>` held without guards, since a Python holder is not a Rust scope.
-struct LockSource(Mutex<()>);
+pub(super) struct LockSource(Mutex<()>);
 
 // SAFETY: forwards to the mutex's node API, whose contract is `WaitSource`'s. A ready poll
 // means the waiting task holds the lock.
@@ -33,12 +33,12 @@ unsafe impl WaitSource for LockSource {
 
 impl LockSource {
     /// Takes the lock if it is free; the holder releases it with [`LockSource::unlock`].
-    fn try_lock(&self) -> bool {
+    pub(super) fn try_lock(&self) -> bool {
         self.0.try_lock().map(MutexGuard::leak).is_some()
     }
 
     /// Releases the lock, handing it to the first waiter; `false` if it was not locked.
-    fn unlock(&self) -> bool {
+    pub(super) fn unlock(&self) -> bool {
         // SAFETY: the value is `()`: no reference to it outlives the lock.
         unsafe { self.0.force_unlock() }
     }
@@ -46,7 +46,8 @@ impl LockSource {
 
 /// `porto.Lock()`: an async lock. Fair: waiters get it in arrival order, and `release()`
 /// hands it straight to the first one. Not reentrant: acquiring it again from the task that
-/// holds it waits forever.
+/// holds it waits forever. It does not record its holder (like `asyncio.Lock`): a `release()`
+/// from a task that does not hold it, or a second one, releases it from under the holder.
 #[pyclass(frozen, module = "porto", name = "Lock")]
 pub(super) struct Lock {
     lock: Arc<Waitable<LockSource>>,
@@ -62,16 +63,22 @@ impl Lock {
     }
 
     /// An awaitable that completes once the task holds the lock: without suspending if it is
-    /// free. Cancelling the wait never leaks the lock.
-    fn acquire(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// free. Nothing happens until it is awaited, and the lock is only taken in the step that
+    /// resumes the task with it: cancelling or closing the task never leaks it.
+    fn acquire(&self) -> PyResult<SyncWait> {
         require_lane("Lock.acquire")?;
-        if self.lock.try_lock() {
-            return checkpoint_if_needed(py, py.None()).inspect_err(|_| {
-                // Not delivered: the task does not hold the lock.
-                self.lock.unlock();
-            });
-        }
-        Ok(Py::new(py, Trap::new(TrapKind::Notified(self.lock.target())))?.into_any())
+        Ok(SyncWait::new(Grant::Locked(Arc::clone(&self.lock))))
+    }
+
+    /// `acquire()`, then `on_acquired()` in the same step; the await evaluates to its result
+    /// (if it raises, the lock is released and the await raises). Internal: `porto.Mutex`
+    /// enters through it, so its guard exists exactly when the lock is held.
+    fn _acquire_then(&self, on_acquired: Py<PyAny>) -> PyResult<SyncWait> {
+        require_lane("Mutex.__aenter__")?;
+        Ok(SyncWait::calling(
+            Grant::Locked(Arc::clone(&self.lock)),
+            on_acquired,
+        ))
     }
 
     /// Takes the lock if it is free right now; returns whether it did. Never waits.
@@ -80,14 +87,17 @@ impl Lock {
     }
 
     /// Releases the lock, handing it to the task that has waited longest. Raises
-    /// `RuntimeError` if the lock is not held.
+    /// `RuntimeError` if the lock is not held. The holder is not recorded: a release from a
+    /// task that does not hold it is not detected while some task does.
     fn release(&self) -> PyResult<()> {
         if self.lock.unlock() {
             return Ok(());
         }
         Err(PyRuntimeError::new_err(
             "porto: Lock.release() was called on a lock that is not held; release a lock once \
-             per acquire (`async with lock:` does it for you)",
+             per acquire, from the task that acquired it (`async with lock:` does it for you). \
+             If this task did hold it, another task released it first (the lock does not \
+             record its holder): find the extra release()",
         ))
     }
 
@@ -104,8 +114,8 @@ impl Lock {
         })
     }
 
-    fn __aenter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        self.acquire(py)
+    fn __aenter__(&self) -> PyResult<SyncWait> {
+        self.acquire()
     }
 
     #[pyo3(signature = (_exc_type, _exc, _traceback, /))]
