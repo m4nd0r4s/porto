@@ -162,6 +162,7 @@ impl<T> Future for SendFuture<'_, T> {
             match (poll, value.is_some()) {
                 // Pushed under the lock: wake a receiver now that the lock is released.
                 (Poll::Ready(()), false) => {
+                    chan.drain_if_receivers_closed();
                     chan.wake_receiver();
                     return Poll::Ready(Ok(()));
                 }

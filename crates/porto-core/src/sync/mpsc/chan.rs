@@ -153,6 +153,7 @@ impl<T> Chan<T> {
     /// Pushes `value` and wakes a waiting receiver.
     pub(super) fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         self.push(value)?;
+        self.drain_if_receivers_closed();
         self.wake_receiver();
         Ok(())
     }
@@ -168,13 +169,20 @@ impl<T> Chan<T> {
         if self.receivers_closed() {
             return Err(TrySendError::Closed(value));
         }
-        self.buffer.push(value).map_err(TrySendError::Full)?;
+        self.buffer.push(value).map_err(TrySendError::Full)
+    }
+
+    /// After a successful push, outside any waiter lock: if the last receiver closed during
+    /// the push, possibly after its drain, nobody can receive what landed, so free it now
+    /// rather than when the channel drops. Not under a lock because `T::drop` may use this
+    /// channel (a `Sender` clone closing, say), and the waiter locks are not reentrant.
+    pub(super) fn drain_if_receivers_closed(&self) {
+        // Orders the push's tail CAS before the closed-count load, pairing with the fence in
+        // `close_receiver` between its `fetch_sub` and its drain.
+        fence(Ordering::SeqCst);
         if self.receivers_closed() {
-            // The last receiver closed during the push, possibly after its drain: nobody can
-            // receive what landed, so free it now rather than when the channel drops.
             self.drain();
         }
-        Ok(())
     }
 
     /// Drops every buffered value. Only once every receiver is closed.
@@ -217,7 +225,7 @@ impl<T> Chan<T> {
     /// A sender's slow path, under the `send_waiters` lock: the last try before queueing.
     ///
     /// Returns `true` if the sender need not queue: `value` was pushed (it is left `None`; the
-    /// caller wakes a receiver once the lock is released) or the channel is closed (`value`
+    /// caller drains if the receivers closed and wakes a receiver once the lock is released) or the channel is closed (`value`
     /// is put back). Returns `false`, with `value` put back, if the buffer is still full.
     pub(super) fn push_or_queue(&self, waiters: &Locked<'_, Retry>, value: &mut Option<T>) -> bool {
         self.send_hint.store(waiters.len() + 1, Ordering::Relaxed);
@@ -280,7 +288,9 @@ impl<T> Chan<T> {
                 self.send_hint.store(0, Ordering::Relaxed);
             }
             // Dropped outside any lock: a value's drop may run arbitrary code. A send that
-            // races with the close may still land a value; it drains it (see `push`).
+            // races with the close may still land a value; it drains it
+            // (`drain_if_receivers_closed`, whose fence pairs with this one).
+            fence(Ordering::SeqCst);
             self.drain();
         }
     }
