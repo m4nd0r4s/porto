@@ -1,13 +1,22 @@
-//! State shared between a lane and the threads that wake or spawn onto it.
+//! State shared between the lanes of a runtime and the threads that wake or spawn onto them
+//! (`12-scheduler-and-lanes.md` §2 `Shared`).
+//!
+//! Nothing here assumes one lane: the injector is drained by whichever lane pops it, and each
+//! lane has a [`Remote`] slot (its parking state and deferred work) indexed by lane number.
+//! M1 builds one slot, lane 0; M2 builds one per lane and has injector pushes notify an idle
+//! lane from the idle set rather than lane 0.
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::Thread;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::lane;
+use porto_io::Driver;
+
+use super::context;
+use super::inject::Inject;
+use super::park::Parking;
 use super::timers::Timers;
 use crate::scope::{ScopeRef, TaskScope};
 use crate::task::{
@@ -16,59 +25,111 @@ use crate::task::{
 };
 use crate::time::{Deadline, RuntimeClock};
 
+/// Work a lane runs at its next maintenance tick ([`Handle::defer`]).
+pub type DeferredWork = Box<dyn FnOnce() + Send>;
+
 /// A cloneable, `Send + Sync` handle to a runtime: spawns tasks onto it from any thread.
 #[derive(Clone)]
 pub struct Handle {
     pub(crate) shared: Arc<Shared>,
 }
 
-/// The part of a lane other threads can reach.
+/// The part of a runtime every lane and every waking thread can reach.
 pub(crate) struct Shared {
-    inbox: Mutex<Inbox>,
+    /// Wakes and spawns from threads that are not running one of this runtime's lanes.
+    pub(crate) inject: Inject<Notified>,
+    /// One slot per lane, by lane index.
+    pub(crate) lanes: Box<[Remote]>,
     /// The runtime clock: every deadline of this runtime is on it.
     pub(crate) clock: RuntimeClock,
-    /// The lane's timer wheel shard. Here rather than lane-local because a `Sleep` dropped on
-    /// any thread unlinks its entry from it.
+    /// The timer wheel (`14-time-and-timers.md` §2). Here rather than lane-local because a
+    /// `Sleep` dropped on any thread unlinks its entry from it; sharding it per lane is internal
+    /// to `Timers`.
     pub(crate) timers: Timers,
+    /// The I/O driver, if the runtime has one (`13-io-driver.md`): polled at maintenance, and
+    /// the lane parks in it.
+    pub(crate) driver: Option<Arc<dyn Driver>>,
 }
 
-/// Tasks woken or spawned off the lane thread (`12-scheduler-and-lanes.md` §4 "remote
-/// inbox"), plus what is needed to unpark the lane.
-#[derive(Default)]
-pub(crate) struct Inbox {
-    pub(crate) tasks: VecDeque<Notified>,
-    /// The thread inside `block_on`, unparked on every remote push.
-    pub(crate) lane_thread: Option<Thread>,
-    /// Set when the runtime is dropped: later wakes drop the task instead of queueing it.
-    pub(crate) closed: bool,
+/// The part of one lane other threads can reach.
+pub(crate) struct Remote {
+    pub(crate) parking: Parking,
+    /// Whether the lane parks in the driver's `turn` rather than on its thread: an unpark then
+    /// wakes the driver.
+    pub(crate) parks_in_driver: AtomicBool,
+    /// Work handed to this lane from other threads, run at its next maintenance tick
+    /// (`12-scheduler-and-lanes.md` §2 `deferred_decref`).
+    pub(crate) deferred: Inject<DeferredWork>,
+}
+
+impl Remote {
+    fn new() -> Self {
+        Self {
+            parking: Parking::new(),
+            parks_in_driver: AtomicBool::new(false),
+            deferred: Inject::new(),
+        }
+    }
 }
 
 impl Shared {
-    pub(crate) fn inbox(&self) -> MutexGuard<'_, Inbox> {
-        // Only queue operations run under the lock, so poisoning can only come from an
-        // allocation failure; the queue is still consistent, so keep going.
-        self.inbox
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Notifies a lane after work was pushed onto the injector, which any lane can take.
+    /// With one lane that is lane 0; M2 picks an idle lane from the idle set instead.
+    fn notify_any_lane(&self) {
+        self.notify_lane(0);
     }
 
-    /// Unparks the lane thread if it is inside `block_on`, so it looks at its queues and
-    /// timers again.
-    pub(crate) fn unpark_lane(&self) {
-        let thread = self.inbox().lane_thread.clone();
-        if let Some(thread) = thread {
-            thread.unpark();
+    /// Notifies lane `index` after work was published for it: it looks at its queues before it
+    /// next parks, and is unparked if it is parked.
+    pub(crate) fn notify_lane(&self, index: usize) {
+        if self.lanes[index].parking.notify() {
+            self.unpark(index);
+        }
+    }
+
+    /// Notifies every lane, so each looks at its queues and timers again (a timer moved
+    /// earlier from another thread).
+    pub(crate) fn notify_all_lanes(&self) {
+        for index in 0..self.lanes.len() {
+            self.notify_lane(index);
+        }
+    }
+
+    fn unpark(&self, index: usize) {
+        let lane = &self.lanes[index];
+        if lane.parks_in_driver.load(Ordering::Relaxed)
+            && let Some(driver) = &self.driver
+        {
+            if let Err(error) = driver.waker().wake() {
+                // Nothing to hand the error to: the waker is on the waking thread. The lane is
+                // left parked until its next timer, which is a hang if there is none.
+                panic!(
+                    "porto: could not wake the {} I/O driver ({error}); the lane would miss \
+                     this wake. This is a resource problem (file descriptors?) or a porto bug: \
+                     report it with the OS and the backend",
+                    driver.kind()
+                );
+            }
+        } else {
+            lane.parking.unpark_thread();
         }
     }
 }
 
 impl Handle {
-    pub(crate) fn new(clock: RuntimeClock, timer_resolution: Duration) -> Self {
+    pub(crate) fn new(
+        clock: RuntimeClock,
+        timer_resolution: Duration,
+        driver: Option<Arc<dyn Driver>>,
+        lanes: usize,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
-                inbox: Mutex::new(Inbox::default()),
+                inject: Inject::new(),
+                lanes: (0..lanes).map(|_| Remote::new()).collect(),
                 clock,
                 timers: Timers::new(timer_resolution),
+                driver,
             }),
         }
     }
@@ -78,8 +139,8 @@ impl Handle {
         self.shared.clock.now()
     }
 
-    /// Spawns `future` as a new task. From inside this runtime's `block_on` it goes on the
-    /// local queue; from anywhere else, into the lane's inbox (unparking the lane).
+    /// Spawns `future` as a new task. From one of this runtime's lanes it goes on that lane's
+    /// local queue; from anywhere else, onto the injector (unparking a lane).
     ///
     /// Await the [`JoinHandle`] for the output, or drop it to detach the task. If the runtime
     /// is already dropped, the task is cancelled at once.
@@ -142,10 +203,24 @@ impl Handle {
         body
     }
 
+    /// Runs `work` on lane 0 at its next maintenance tick (every 61 tasks, and before it
+    /// parks), from any thread; a parked lane is unparked for it. This is how an object that
+    /// must be released on the lane (a Python reference, `25-cpython-integration-and-memory.md`
+    /// P1) is released from elsewhere.
+    ///
+    /// # Errors
+    /// Hands `work` back, unrun, if the runtime is already dropped: the caller decides what to
+    /// do with what it owns.
+    pub fn defer(&self, work: impl FnOnce() + Send + 'static) -> Result<(), DeferredWork> {
+        self.shared.lanes[0].deferred.push(Box::new(work))?;
+        self.shared.notify_lane(0);
+        Ok(())
+    }
+
     /// A handle to the runtime running on this thread (inside its `block_on` or one of its
     /// tasks), if any.
     pub fn try_current() -> Option<Self> {
-        lane::current_handle()
+        context::current_handle()
     }
 
     pub(crate) fn same_runtime(&self, other: &Handle) -> bool {
@@ -153,33 +228,28 @@ impl Handle {
     }
 }
 
-// SAFETY: `schedule_local` only pushes the task onto this thread's local queue, or returns it.
+// SAFETY: `schedule_local` only pushes the task onto the current thread's local queue, or
+// returns it.
 unsafe impl Schedule for Handle {
     fn schedule_local(&self, task: Notified) -> Result<(), Notified> {
-        lane::push_local(self, task)
+        context::push_local(self, task)
     }
 
     fn schedule_remote(self, task: Notified) {
-        let mut inbox = self.shared.inbox();
-        if inbox.closed {
-            drop(inbox);
-            // Dropping the entry cancels the task (`Notified`), which runs its future's
-            // destructor: not under the lock.
-            drop(task);
-            return;
-        }
-        inbox.tasks.push_back(task);
-        let thread = inbox.lane_thread.clone();
-        drop(inbox);
-        // An `unpark` that lands before the lane's `park` is not lost: the parker keeps it.
-        if let Some(thread) = thread {
-            thread.unpark();
+        match self.shared.inject.push(task) {
+            Ok(()) => self.shared.notify_any_lane(),
+            // The runtime is dropped: dropping the entry cancels the task (`Notified`), which
+            // runs its future's destructor, outside the injector's lock.
+            Err(task) => drop(task),
         }
     }
 }
 
 impl fmt::Debug for Handle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Handle").finish_non_exhaustive()
+        f.debug_struct("Handle")
+            .field("lanes", &self.shared.lanes.len())
+            .field("injected", &self.shared.inject.len())
+            .finish_non_exhaustive()
     }
 }

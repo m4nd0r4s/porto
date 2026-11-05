@@ -65,7 +65,7 @@ impl Sleep {
             && with_current_handle(|current| current.same_runtime(handle)) != Some(true)
         {
             // The lane may be parked until the old deadline: let it look again.
-            handle.shared.unpark_lane();
+            handle.shared.notify_all_lanes();
         }
     }
 

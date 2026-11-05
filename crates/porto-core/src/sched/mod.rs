@@ -1,21 +1,37 @@
-//! The scheduler. M0 has a single lane (`12-scheduler-and-lanes.md`, single-lane parts).
+//! The scheduler (`12-scheduler-and-lanes.md`). M1 runs a single lane: lane 0, the thread that
+//! calls [`Runtime::block_on`]. The loop (`lane`) and the shared state (`shared`) are already
+//! split the way M2's lanes need: a lane owns its local queue and tick, everything another
+//! thread reaches (the injector, each lane's parking slot and deferred work, the timers and
+//! the driver) is in `Shared`.
+//!
+//! The loom model of the parking protocol runs with
+//! `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release sched`.
 
+mod context;
+mod inject;
 mod lane;
 mod park;
+mod runtime;
 mod shared;
 mod timers;
 
 #[cfg(all(test, not(loom)))]
 mod tests;
 
+#[cfg(all(test, not(loom)))]
+mod loop_tests;
+
+#[cfg(all(test, loom))]
+mod loom_tests;
+
 use std::future::Future;
 
 use crate::task::JoinHandle;
 
-pub use lane::{Builder, Runtime};
-pub(crate) use lane::{current_handle, current_time, with_current_handle};
+pub(crate) use context::{current_handle, current_time, with_current_handle};
 pub use park::ParkHook;
-pub use shared::Handle;
+pub use runtime::{Builder, Runtime};
+pub use shared::{DeferredWork, Handle};
 pub(crate) use timers::Armed;
 
 /// Spawns `future` onto the runtime running on this thread. Await the [`JoinHandle`] for the
@@ -29,7 +45,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let Some(handle) = lane::current_handle() else {
+    let Some(handle) = context::current_handle() else {
         panic!(
             "porto_core::spawn called outside a runtime: call it from a task or inside \
              Runtime::block_on, or use Handle::spawn from other threads"
