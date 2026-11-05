@@ -141,7 +141,9 @@ porto follows [kinemo](https://github.com/m4nd0r4s/kinemo) and
   this repo's git config). Never the work identity. Beads sync pushes through
   the git caches in `.beads/embeddeddolt/porto/.dolt/git-remote-cache/*/repo.git`,
   which inherit the global git identity: set the same name and email in each
-  cache's local config.
+  cache's local config (or scope it with a global `includeIf "gitdir:<repo path>/"`,
+  which also covers caches Dolt creates later). CI's lint job runs
+  `scripts/check_commit_identity.py` on the beads sync refs and on each PR's commits.
 - **`main` is protected:** changes land through a PR with the eight CI checks green
   (the repository admin may push the beads export directly).
 - **English everywhere:** code, comments, docs, commit messages, beads.
