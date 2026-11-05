@@ -42,6 +42,9 @@ impl CancelReason {
     }
 }
 
+/// A `walk_cache` that matches no generation: the first check walks.
+const NO_WALK: u64 = u64::MAX;
+
 /// [`ScopeNode::status`] bits 0-2: the [`CancelReason`], 0 while not cancelled.
 const REASON_MASK: u8 = 0b0111;
 /// [`ScopeNode::status`] bit 3: the scope is shielded.
@@ -74,6 +77,9 @@ pub struct ScopeNode<E> {
     /// ancestor was cancelled, or a shield on the way changed. Tasks compare it to their
     /// snapshot after the generation moved.
     cancel_epoch: AtomicU64,
+    /// The walk's result for this scope, cached with the cancel generation it was computed at:
+    /// `generation << 1 | cancelled`. See [`ScopeNode::is_cancelled`].
+    walk_cache: AtomicU64,
     /// This scope's links in the parent's `child_scopes`, guarded by the parent's `state` lock.
     siblings: UnsafeCell<Links<E>>,
     state: Mutex<ScopeState<E>>,
@@ -210,6 +216,7 @@ impl<E: Send + 'static> ScopeNode<E> {
             owner_task,
             status: AtomicU8::new(if shield { SHIELD } else { 0 }),
             cancel_epoch: AtomicU64::new(0),
+            walk_cache: AtomicU64::new(NO_WALK),
             siblings: UnsafeCell::new(Links {
                 prev: ptr::null(),
                 next: ptr::null(),
@@ -354,6 +361,33 @@ impl<E> ScopeNode<E> {
         let filed = state.waiters.remove(&key);
         drop(state);
         drop(filed);
+    }
+
+    /// Whether a task whose innermost scope is this one is effectively cancelled: the walk's
+    /// result, cached in the scope for every task in it (§1.2).
+    ///
+    /// The check loads the global cancel generation and the scope's cached `(generation,
+    /// result)`: while no cancel or shield change happened anywhere since the cache was filled,
+    /// that is the answer, so the common check is two loads and a compare and touches nothing
+    /// shared for writing. Otherwise it walks and refills the cache. A refill by a thread that
+    /// read an older generation can overwrite a newer one; it only makes the next check walk
+    /// again, since the generation it records is the one read before its walk.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        let generation = CANCEL_GENERATION.load(Ordering::Acquire);
+        let cached = self.walk_cache.load(Ordering::Relaxed);
+        if cached >> 1 == generation & (u64::MAX >> 1) {
+            return cached & 1 != 0;
+        }
+        self.refill_walk_cache(generation)
+    }
+
+    #[cold]
+    fn refill_walk_cache(&self, generation: u64) -> bool {
+        let cancelled = self.effective_cancellation().is_some();
+        self.walk_cache
+            .store(generation << 1 | u64::from(cancelled), Ordering::Relaxed);
+        cancelled
     }
 
     /// The effective-cancellation walk (§1.2): from this scope outward, the first scope that is

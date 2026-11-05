@@ -130,6 +130,24 @@ fn a_scope_created_under_a_cancelled_one_starts_cancelled() {
 }
 
 #[test]
+fn the_scope_cache_follows_cancels_and_shields_on_the_path() {
+    let root = Scope::new_root(0);
+    let shield = shielded(&root);
+    let inner = child(&shield);
+    let other = child(&root);
+    assert!(!inner.is_cancelled());
+    other.cancel(CancelReason::Explicit);
+    assert!(!inner.is_cancelled(), "a cancel off the path");
+    root.cancel(CancelReason::Explicit);
+    assert!(!inner.is_cancelled(), "behind a shield");
+    shield.set_shield(false);
+    assert!(inner.is_cancelled());
+    assert!(inner.is_cancelled(), "cached");
+    shield.set_shield(true);
+    assert!(!inner.is_cancelled());
+}
+
+#[test]
 fn the_cache_sees_a_cancel_after_a_clean_check() {
     let root = Scope::new_root(0);
     let outer = child(&root);

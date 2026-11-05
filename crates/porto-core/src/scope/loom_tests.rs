@@ -175,3 +175,26 @@ fn register_waiter_vs_cancel() {
         scope.unregister_waiter(1);
     });
 }
+
+/// The scope's own walk cache against a cancel of its parent from another thread: whatever a
+/// check saw before, one after the cancel returned sees it, and a check from a third thread
+/// that refills the cache meanwhile never leaves a stale answer behind.
+#[test]
+fn scope_walk_cache_vs_cancel() {
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let scope = ScopeNode::new_child(&root, 1, false);
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || assert!(root.cancel(CancelReason::Explicit)))
+        };
+        let checker = {
+            let scope = Arc::clone(&scope);
+            thread::spawn(move || scope.is_cancelled())
+        };
+        scope.is_cancelled();
+        canceller.join().unwrap();
+        checker.join().unwrap();
+        assert!(scope.is_cancelled());
+    });
+}

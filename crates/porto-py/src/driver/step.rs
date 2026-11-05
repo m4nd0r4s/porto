@@ -25,8 +25,8 @@
 //!
 //! # Cancellation (spec 15 C1, C2, C10; spec 11 §5.2)
 //!
-//! While the task's effective scope is cancelled (the walk from its innermost scope, cached
-//! per poll in a `CancelCache`), every checkpoint raises `porto.Cancelled`, again and again if
+//! While the task's effective scope is cancelled (the walk from its innermost scope, cached in
+//! that scope, `ScopeNode::is_cancelled`), every checkpoint raises `porto.Cancelled`, again and again if
 //! the coroutine swallows it (level-triggered):
 //!
 //! - a trap the coroutine yields is not waited on: `Cancelled` is thrown back in at once
@@ -51,7 +51,7 @@ use std::ptr;
 use std::task::{Context, Poll, Waker};
 
 use porto_core::coop;
-use porto_core::scope::{CancelCache, CancelReason};
+use porto_core::scope::CancelReason;
 use porto_core::task::Header;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
@@ -81,9 +81,6 @@ struct Running {
     /// The task's cancel stack while its coroutine runs (moved out of the task around each
     /// step), empty otherwise. Reached through [`Running::with_stack`].
     stack: Cell<CancelStack>,
-    /// The task's effective cancellation, cached for the poll: one atomic load per check
-    /// while no scope anywhere was cancelled since the last one.
-    cache: Cell<CancelCache>,
 }
 
 impl Running {
@@ -95,18 +92,13 @@ impl Running {
         self.stack.set(stack);
         result
     }
+}
 
-    /// Whether a task whose innermost scope is `scope` is effectively cancelled.
-    #[inline]
-    fn is_cancelled(&self, scope: Option<&PyScopeNode>) -> bool {
-        let Some(scope) = scope else {
-            return false;
-        };
-        let mut cache = self.cache.get();
-        let cancelled = cache.is_cancelled(scope);
-        self.cache.set(cache);
-        cancelled
-    }
+/// Whether a task whose innermost scope is `scope` is effectively cancelled: the scope's cached
+/// walk (`ScopeNode::is_cancelled`), two loads and a compare while nothing was cancelled.
+#[inline]
+fn is_cancelled(scope: Option<&PyScopeNode>) -> bool {
+    scope.is_some_and(PyScopeNode::is_cancelled)
 }
 
 /// The task running on this thread, if a task is running.
@@ -193,7 +185,7 @@ pub(crate) fn spend_budget() -> bool {
 fn running_cancellation(py: Python<'_>, running: &Running) -> Option<Py<PyBaseException>> {
     let cancelled = running.with_stack(|stack| {
         let scope = stack.innermost()?;
-        running.is_cancelled(Some(scope)).then(|| scope.clone())
+        scope.is_cancelled().then(|| scope.clone())
     })?;
     Some(cancelled_exception(py, &cancelled))
 }
@@ -281,7 +273,6 @@ pub(super) fn poll(
         // thread local. Rust futures the task awaits draw on the lane's own count.
         budget: Cell::new(coop::remaining().unwrap_or(u32::MAX)),
         stack: Cell::new(CancelStack::default()),
-        cache: Cell::new(CancelCache::new()),
     };
     let outcome = {
         // Published only while the coroutine steps: Python code that `complete` runs (a
@@ -342,7 +333,7 @@ fn step_until_wait(
                 Poll::Pending => {
                     let exception = match lane::take_interrupt(cx.waker()) {
                         Some(exception) => exception,
-                        None => cancelled_wait(py, task, running, cx.waker())?,
+                        None => cancelled_wait(py, task, cx.waker())?,
                     };
                     task.abandon_wait();
                     task.set_resume(Resume::Throw(exception));
@@ -371,7 +362,7 @@ fn step_until_wait(
         match dispatch(task, &yielded) {
             // The hot path of a switch: no payload to pack.
             Next::Wait(Pending::Yield) => {
-                if let Some(cancelled) = cancellation(py, task, running) {
+                if let Some(cancelled) = cancellation(py, task) {
                     task.set_resume(Resume::Throw(cancelled));
                     continue;
                 }
@@ -381,7 +372,7 @@ fn step_until_wait(
             Next::Wait(pending) => {
                 let kind = pending.kind();
                 if kind.is_cancellable()
-                    && let Some(cancelled) = cancellation(py, task, running)
+                    && let Some(cancelled) = cancellation(py, task)
                 {
                     // Not waited on: nothing is linked yet, the payload is just dropped.
                     drop(pending);
@@ -405,7 +396,7 @@ fn step_until_wait(
                             return None;
                         }
                         // Still waiting, unless the task is cancelled (`None`: it waits).
-                        let cancelled = cancelled_wait(py, task, running, cx.waker())?;
+                        let cancelled = cancelled_wait(py, task, cx.waker())?;
                         task.abandon_wait();
                         task.set_resume(Resume::Throw(cancelled));
                     }
@@ -421,9 +412,9 @@ fn step_until_wait(
 
 /// The `Cancelled` to throw into `task` if it is effectively cancelled.
 #[inline]
-fn cancellation(py: Python<'_>, task: &PyTask, running: &Running) -> Option<Py<PyBaseException>> {
+fn cancellation(py: Python<'_>, task: &PyTask) -> Option<Py<PyBaseException>> {
     let scope = task.innermost_scope();
-    if !running.is_cancelled(scope) {
+    if !is_cancelled(scope) {
         return None;
     }
     scope.map(|scope| cancelled_exception(py, scope))
@@ -433,16 +424,11 @@ fn cancellation(py: Python<'_>, task: &PyTask, running: &Running) -> Option<Py<P
 /// task is effectively cancelled, else `None`, with the wait filed with the task's scope so a
 /// cancel wakes it (`PyTask::watch_cancel`, whose own check closes the race with a cancel from
 /// another thread).
-fn cancelled_wait(
-    py: Python<'_>,
-    task: &mut PyTask,
-    running: &Running,
-    waker: &Waker,
-) -> Option<Py<PyBaseException>> {
+fn cancelled_wait(py: Python<'_>, task: &mut PyTask, waker: &Waker) -> Option<Py<PyBaseException>> {
     if !task.pending_kind.is_cancellable() {
         return None;
     }
-    if let Some(cancelled) = cancellation(py, task, running) {
+    if let Some(cancelled) = cancellation(py, task) {
         return Some(cancelled);
     }
     if !task.watch_cancel(waker) {
