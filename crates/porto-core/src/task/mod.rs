@@ -136,7 +136,17 @@ impl Drop for Notified {
         );
         // SAFETY: the entry owns a reference to a SCHEDULED task; the poll takes it over and,
         // seeing CANCEL_REQ, completes the task as cancelled without polling the future.
-        unsafe { task.poll() }
+        let cancel = || unsafe { task.poll() };
+        if std::thread::panicking() {
+            // A second panic while unwinding aborts the process (a queue dropped during a
+            // panic): the cancellation's own panic (a panicking future or waker drop) is
+            // dropped instead. The task is still completed and freed.
+            drop(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                cancel,
+            )));
+        } else {
+            cancel();
+        }
     }
 }
 

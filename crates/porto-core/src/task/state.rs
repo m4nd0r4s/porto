@@ -313,10 +313,12 @@ impl State {
     /// task completed: the lane may be reading the waker.
     pub(crate) fn unset_join_waker(&self) -> Result<Snapshot, Snapshot> {
         self.try_update(|cur| {
-            debug_assert!(cur.is_join_interested() && cur.is_join_waker_set());
+            // Check COMPLETE first: after completion the lane may already have cleared
+            // JOIN_WAKER (`unset_join_waker_after_complete`), racing this call.
             if cur.is_complete() {
                 return None;
             }
+            debug_assert!(cur.is_join_interested() && cur.is_join_waker_set());
             Some(cur.unset(JOIN_WAKER))
         })
     }

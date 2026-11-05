@@ -248,6 +248,56 @@ fn join_poll_vs_completion() {
     });
 }
 
+/// The join handle polls twice with different wakers while the task completes: replacing the
+/// waker races the lane's wake and its release of the slot. Exactly one of the two wakers (or
+/// none, if the first poll already saw the output) ends up woken, and neither leaks.
+#[test]
+fn join_waker_replacement_vs_completion() {
+    loom::model(|| {
+        let queue = Queue::default();
+        let (task, join) = new_joinable_task(poll_fn(|_| Poll::Ready(7_u8)), queue.clone());
+        let joiner = thread::spawn(move || {
+            let first = std::sync::Arc::new(CountingWaker::default());
+            let second = std::sync::Arc::new(CountingWaker::default());
+            let mut join = join;
+            let wakers = [Waker::from(first.clone()), Waker::from(second.clone())];
+            let mut output = None;
+            for waker in &wakers {
+                if let Poll::Ready(ready) = poll_join(&mut join, waker) {
+                    output = Some(ready.unwrap());
+                    break;
+                }
+            }
+            drop(wakers);
+            if output.is_some() {
+                return (None, output, first, second);
+            }
+            (Some(join), None, first, second)
+        });
+        task.run();
+        let (join, output, first, second) = joiner.join().unwrap();
+        if let Some(mut join) = join {
+            let Poll::Ready(Ok(output)) = poll_join(&mut join, Waker::noop()) else {
+                panic!("completed but not ready");
+            };
+            assert_eq!(output, 7);
+        } else {
+            assert_eq!(output, Some(7));
+        }
+        assert!(queue.tasks_freed());
+        assert_eq!(
+            std::sync::Arc::strong_count(&first),
+            1,
+            "the first waker leaked"
+        );
+        assert_eq!(
+            std::sync::Arc::strong_count(&second),
+            1,
+            "the second waker leaked"
+        );
+    });
+}
+
 /// The join handle is dropped (after registering a waker) while the task completes: the
 /// output and the waker are each dropped exactly once, by whichever side owns them.
 #[test]

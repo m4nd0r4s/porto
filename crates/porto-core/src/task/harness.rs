@@ -231,12 +231,16 @@ where
             });
         }));
         let snapshot = cell.header.state.unset_join_waker_after_complete();
+        let mut dropped = Ok(());
         if !snapshot.is_join_interested() {
-            // SAFETY: the handle dropped while JOIN_WAKER was ours, so the waker is ours to
-            // drop.
-            cell.join_waker.with_mut(|waker| unsafe { *waker = None });
+            // A panicking `Waker::drop` must not skip `task_completed` and the `ref_dec` below.
+            dropped = panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: the handle dropped while JOIN_WAKER was ours, so the waker is ours
+                // to drop.
+                cell.join_waker.with_mut(|waker| unsafe { *waker = None });
+            }));
         }
-        unhandled = unhandled.or(woken.err());
+        unhandled = unhandled.or(woken.err()).or(dropped.err());
     }
     cell.scheduler.task_completed(&cell.header);
 
@@ -390,8 +394,12 @@ where
         dropped = panic::catch_unwind(AssertUnwindSafe(|| drop(output)));
     }
     if action.drop_waker {
-        // SAFETY: JOIN_WAKER is clear and JOIN_INTEREST gone: no one else touches the slot.
-        cell.join_waker.with_mut(|waker| unsafe { *waker = None });
+        // Caught like the output: a panicking `Waker::drop` must not leak our reference.
+        let waker_dropped = panic::catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: JOIN_WAKER is clear and JOIN_INTEREST gone: no one else touches the slot.
+            cell.join_waker.with_mut(|waker| unsafe { *waker = None });
+        }));
+        dropped = dropped.and(waker_dropped);
     }
     // SAFETY: the join handle owned this reference.
     unsafe { task.drop_reference() };
