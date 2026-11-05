@@ -65,8 +65,10 @@ pub(super) enum Pending {
     None,
     /// The task yielded: it was requeued, so the next poll resumes it.
     Yield,
-    /// The task sleeps until the timer fires.
-    Sleep(Sleep),
+    /// The task sleeps until the timer fires. Boxed because a `Sleep` is pinned (it embeds its
+    /// wheel entry) and a `PyTask` is moved by `&mut`; the PyTask body (porto-szb.4) embeds the
+    /// entry instead.
+    Sleep(Pin<Box<Sleep>>),
     /// The task waits for a wake arranged by the maker of a `Park` trap.
     Park,
 }

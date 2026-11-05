@@ -11,7 +11,8 @@ Hierarchical wheel: 6 levels × 64 slots. Level 0 slot = `resolution` (default 1
 - One wheel per runtime, protected by a mutex sharded per lane. Each lane owns a wheel *shard* for timers registered on that lane. The shard is processed by its lane during maintenance and before parking. The park timeout is `min(next deadline across own shard, driver-provided)`.
 - Entries are intrusive (`TimerEntry { deadline_tick, prev, next, waker/state }`). A PyTask embeds one entry for `Sleep` and one for its innermost scope deadline (§15). Rust `Sleep` futures embed their own.
 - Firing: `deadline_tick` is rounded **up** (never fire early). Expired entries are fired in batches. Firing calls the waker (Sleep) or `scope.cancel_by_deadline()` (scope).
-- Cancel: O(1) unlink.
+- Cancel: O(1) unlink. Dropping a `Sleep` (on any thread) unlinks its entry, so it never wakes its task late or keeps it alive; this is why the shard is behind a mutex even though only its lane fires it.
+- The park deadline is the earliest entry's tick (the lane walks the earliest slot instead of waking for each cascade), or the re-arm point of a clamped entry.
 
 ## 3. API surface (Python)
 ```python

@@ -22,3 +22,8 @@ loom = "0.7.2"
 [[bench]]
 name = "scope_cancel_check"
 harness = false
+
+# The timer wheel: insert + cancel, and batched firing (14-time-and-timers.md §2).
+[[bench]]
+name = "timer_wheel"
+harness = false
