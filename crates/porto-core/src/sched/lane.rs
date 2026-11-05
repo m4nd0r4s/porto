@@ -3,7 +3,7 @@
 //! This is the M0 spike of `12-scheduler-and-lanes.md` §3 with one lane and no LIFO slot,
 //! stealing, injector or reactor. Wakes on the lane thread push to the local queue without
 //! synchronization; wakes from other threads go through the shared inbox and unpark the lane.
-//! Timers live on the lane (a min-heap, see `timers`): they fire every `EVENT_INTERVAL` tasks
+//! Timers live in the lane's wheel shard (see `timers`): they fire every `EVENT_INTERVAL` tasks
 //! and before parking, and the lane parks no longer than until the earliest one. The runtime's
 //! clock (`time::clock`) decides what "now" is and how a park waits for a deadline.
 
@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
+use std::time::Duration;
 
 use super::park::ParkHook;
 use super::shared::Handle;
@@ -40,7 +41,6 @@ struct Core {
     local: RefCell<VecDeque<Notified>>,
     /// Tasks taken so far; every `EVENT_INTERVAL`th one comes from the inbox first.
     tick: Cell<usize>,
-    timers: Timers,
     park_hook: Option<Box<dyn ParkHook>>,
 }
 
@@ -60,6 +60,7 @@ pub struct Runtime {
 pub struct Builder {
     park_hook: Option<Box<dyn ParkHook>>,
     clock: Option<Box<dyn Clock>>,
+    timer_resolution: Option<Duration>,
 }
 
 impl Builder {
@@ -76,6 +77,22 @@ impl Builder {
         self
     }
 
+    /// Sets how finely timers are kept: a sleep wakes on the first tick of this length at or
+    /// after its deadline (`14-time-and-timers.md` §2). The default, 1 ms, spans about 2.2
+    /// years before a timer is re-armed; finer ticks cost more wakes for long timers.
+    ///
+    /// # Panics
+    /// If `resolution` is outside 100 µs..=10 ms.
+    pub fn timer_resolution(mut self, resolution: Duration) -> Self {
+        assert!(
+            (Timers::MIN_RESOLUTION..=Timers::MAX_RESOLUTION).contains(&resolution),
+            "porto: timer_resolution must be between 100µs and 10ms, got {resolution:?}; pass \
+             a resolution in that range, or leave it unset for the 1ms default"
+        );
+        self.timer_resolution = Some(resolution);
+        self
+    }
+
     /// Creates the runtime. The runtime clock's epoch is now, unless a clock was given.
     pub fn build(self) -> Runtime {
         let clock = match self.clock {
@@ -84,10 +101,12 @@ impl Builder {
         };
         Runtime {
             core: Core {
-                handle: Handle::new(clock),
+                handle: Handle::new(
+                    clock,
+                    self.timer_resolution.unwrap_or(Timers::DEFAULT_RESOLUTION),
+                ),
                 local: RefCell::new(VecDeque::with_capacity(256)),
                 tick: Cell::new(0),
-                timers: Timers::default(),
                 park_hook: self.park_hook,
             },
         }
@@ -99,6 +118,7 @@ impl fmt::Debug for Builder {
         f.debug_struct("Builder")
             .field("park_hook", &self.park_hook.is_some())
             .field("clock", &self.clock.is_some())
+            .field("timer_resolution", &self.timer_resolution)
             .finish()
     }
 }
@@ -208,7 +228,7 @@ impl Drop for Runtime {
         loop {
             let local = mem::take(&mut *self.core.local.borrow_mut());
             let remote = mem::take(&mut self.core.handle.shared.inbox().tasks);
-            let had_timers = self.core.timers.drop_all();
+            let had_timers = self.core.timers().drop_all();
             if local.is_empty() && remote.is_empty() && !had_timers {
                 break;
             }
@@ -222,7 +242,7 @@ impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime")
             .field("queued", &self.core.local.borrow().len())
-            .field("next_timer", &self.core.timers.next_deadline())
+            .field("next_timer", &self.core.timers().next_deadline())
             .finish_non_exhaustive()
     }
 }
@@ -232,8 +252,12 @@ impl Core {
         &self.handle.shared.clock
     }
 
+    fn timers(&self) -> &Timers {
+        &self.handle.shared.timers
+    }
+
     fn fire_expired_timers(&self) -> usize {
-        self.timers.fire_expired(|| self.clock().now())
+        self.timers().fire_expired(|| self.clock().now())
     }
 
     fn next_task(&self) -> Option<Notified> {
@@ -263,7 +287,7 @@ impl Core {
     /// Parks the lane thread until an unpark, or until the earliest timer is due, through the
     /// park hook if there is one.
     fn park(&self) {
-        let next_deadline = self.timers.next_deadline();
+        let next_deadline = self.timers().next_deadline();
         let mut park = || match next_deadline {
             None => thread::park(),
             // A park may return early; the caller then finds no timer due and parks again for
@@ -306,20 +330,12 @@ pub(crate) fn push_local(handle: &Handle, task: Notified) -> Result<(), Notified
     Ok(())
 }
 
-/// Registers a timer on the lane running on this thread: `waker` is woken once the clock
-/// reaches `deadline`.
-///
-/// # Panics
-/// If no runtime is running on this thread.
-pub(crate) fn register_timer(deadline: Deadline, waker: Waker) {
-    let core = CURRENT.try_with(Cell::get).unwrap_or(ptr::null());
-    assert!(
-        !core.is_null(),
-        "porto_core::time::Sleep polled outside a runtime: await it from a task or inside \
-         Runtime::block_on"
-    );
+/// Calls `f` with the handle of the runtime running on this thread, if any (without cloning
+/// it).
+pub(crate) fn with_current_handle<R>(f: impl FnOnce(&Handle) -> R) -> Option<R> {
+    let core = CURRENT.try_with(Cell::get).ok()?;
     // SAFETY: as in `push_local`.
-    unsafe { &*core }.timers.register(deadline, waker);
+    (!core.is_null()).then(|| f(&unsafe { &*core }.handle))
 }
 
 /// The current time on the clock of the runtime running on this thread, if any.

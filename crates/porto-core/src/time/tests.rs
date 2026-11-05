@@ -233,7 +233,9 @@ fn run_until_idle_fires_due_timers_but_does_not_wait() {
     if rt.now() < deadline {
         assert_eq!(done.load(Ordering::SeqCst), 0);
     }
-    while rt.now() < deadline {
+    // A timer fires on the first wheel tick (1 ms) at or after its deadline.
+    let due = deadline.saturating_add(Duration::from_millis(1));
+    while rt.now() < due {
         thread::sleep(ticks(1));
     }
     rt.run_until_idle();
@@ -265,9 +267,9 @@ fn dropping_the_runtime_frees_tasks_waiting_on_timers() {
 fn a_sleep_polled_outside_a_runtime_panics_with_a_hint() {
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
-    let mut sleep = sleep_until(Deadline::NEVER);
+    let mut sleep = std::pin::pin!(sleep_until(Deadline::NEVER));
     let panic = panic::catch_unwind(AssertUnwindSafe(|| {
-        std::future::Future::poll(std::pin::Pin::new(&mut sleep), &mut cx)
+        std::future::Future::poll(sleep.as_mut(), &mut cx)
     }))
     .unwrap_err();
     let message = panic.downcast_ref::<&str>().copied().unwrap_or_default();

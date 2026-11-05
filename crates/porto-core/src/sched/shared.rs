@@ -5,8 +5,10 @@ use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::Thread;
+use std::time::Duration;
 
 use super::lane;
+use super::timers::Timers;
 use crate::task::{JoinHandle, Notified, Schedule, new_joinable_task};
 use crate::time::{Deadline, RuntimeClock};
 
@@ -21,6 +23,9 @@ pub(crate) struct Shared {
     inbox: Mutex<Inbox>,
     /// The runtime clock: every deadline of this runtime is on it.
     pub(crate) clock: RuntimeClock,
+    /// The lane's timer wheel shard. Here rather than lane-local because a `Sleep` dropped on
+    /// any thread unlinks its entry from it.
+    pub(crate) timers: Timers,
 }
 
 /// Tasks woken or spawned off the lane thread (`12-scheduler-and-lanes.md` §4 "remote
@@ -42,14 +47,24 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Unparks the lane thread if it is inside `block_on`, so it looks at its queues and
+    /// timers again.
+    pub(crate) fn unpark_lane(&self) {
+        let thread = self.inbox().lane_thread.clone();
+        if let Some(thread) = thread {
+            thread.unpark();
+        }
+    }
 }
 
 impl Handle {
-    pub(crate) fn new(clock: RuntimeClock) -> Self {
+    pub(crate) fn new(clock: RuntimeClock, timer_resolution: Duration) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inbox: Mutex::new(Inbox::default()),
                 clock,
+                timers: Timers::new(timer_resolution),
             }),
         }
     }

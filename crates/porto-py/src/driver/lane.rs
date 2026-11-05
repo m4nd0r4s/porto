@@ -14,11 +14,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
-use std::pin::{Pin, pin};
+use std::pin::pin;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
-use porto_core::time::{Deadline, Sleep, sleep_until};
+use porto_core::time::{Deadline, sleep_until};
 use porto_core::{Handle, ParkHook, Runtime};
 use pyo3::exceptions::PyBaseException;
 use pyo3::ffi;
@@ -116,7 +116,7 @@ pub(crate) fn fail(exception: Py<PyBaseException>) {
 /// [`SIGNAL_CHECK_INTERVAL`], and a [`fail`]ure. MUST be polled by the lane's `block_on`.
 pub(crate) async fn main_or_interrupt(main: impl Future<Output = Outcome>) -> Outcome {
     let mut main = pin!(main);
-    let mut ticker = signal_ticker();
+    let mut ticker = pin!(sleep_until(Deadline::after(SIGNAL_CHECK_INTERVAL)));
     poll_fn(|cx| {
         if let Poll::Ready(outcome) = main.as_mut().poll(cx) {
             return Poll::Ready(outcome);
@@ -128,7 +128,7 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = Outcome>) -> Ou
         if let Some(exception) = failure {
             return Poll::Ready(Outcome::Raised(exception));
         }
-        while Pin::new(&mut ticker).poll(cx).is_ready() {
+        while ticker.as_mut().poll(cx).is_ready() {
             // SAFETY: the lane's `block_on` polls this future with the thread state attached
             // (only parks detach). Runs the Python handlers of the signals that arrived.
             if unsafe { ffi::PyErr_CheckSignals() } < 0 {
@@ -136,15 +136,13 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = Outcome>) -> Ou
                 let py = unsafe { Python::assume_attached() };
                 return Poll::Ready(Outcome::Raised(take_exception(py).unbind()));
             }
-            ticker = signal_ticker();
+            ticker
+                .as_mut()
+                .reset(Deadline::after(SIGNAL_CHECK_INTERVAL));
         }
         Poll::Pending
     })
     .await
-}
-
-fn signal_ticker() -> Sleep {
-    sleep_until(Deadline::after(SIGNAL_CHECK_INTERVAL))
 }
 
 /// Marks this thread as a Python lane until dropped.

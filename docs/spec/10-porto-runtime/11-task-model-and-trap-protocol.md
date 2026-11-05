@@ -146,7 +146,7 @@ Implement `Trap` with `tp_iternext`, `am_send` (CPython ≥ 3.10 `PyAsyncMethods
 ```rust
 pub enum TrapKind {
     Yield,                                    // schedule point (checkpoint)
-    Sleep { deadline: Instant },              // uses timer wheel entry embedded in PyTask (no alloc)
+    Sleep { deadline: Deadline },             // runtime-clock ns (§14); wheel entry embedded in PyTask (no alloc)
     Notified(WaitNodeRef),                    // intrusive waiter node for sync primitives (§16)
     Io { reg: RegistrationRef, interest: Interest, op: IoOp },  // §13 retry-on-ready
     Join { target: TaskRef },                 // await another task

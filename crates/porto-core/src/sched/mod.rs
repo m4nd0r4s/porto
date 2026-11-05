@@ -13,9 +13,10 @@ use std::future::Future;
 use crate::task::JoinHandle;
 
 pub use lane::{Builder, Runtime};
-pub(crate) use lane::{current_handle, current_time, register_timer};
+pub(crate) use lane::{current_handle, current_time, with_current_handle};
 pub use park::ParkHook;
 pub use shared::Handle;
+pub(crate) use timers::Armed;
 
 /// Spawns `future` onto the runtime running on this thread. Await the [`JoinHandle`] for the
 /// output, or drop it to detach the task.

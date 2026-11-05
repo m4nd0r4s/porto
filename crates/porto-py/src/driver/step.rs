@@ -16,7 +16,6 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::mem;
-use std::pin::Pin;
 use std::ptr;
 use std::task::{Context, Poll, Waker};
 
@@ -101,7 +100,7 @@ fn step_until_wait(
             Pending::None => {}
             // A parked task is only polled after a wake: whoever woke it ended the wait.
             Pending::Yield | Pending::Park => task.pending = Pending::None,
-            Pending::Sleep(sleep) => match Pin::new(sleep).poll(cx) {
+            Pending::Sleep(sleep) => match sleep.as_mut().poll(cx) {
                 Poll::Pending => return None,
                 Poll::Ready(()) => task.pending = Pending::None,
             },
@@ -116,9 +115,9 @@ fn step_until_wait(
                 return None;
             }
             Next::Sleep(deadline) => {
-                let mut sleep = sleep_until(deadline);
+                let mut sleep = Box::pin(sleep_until(deadline));
                 // A deadline that already passed is still a schedule point (spec 11 §4 notes).
-                if Pin::new(&mut sleep).poll(cx).is_ready() {
+                if sleep.as_mut().poll(cx).is_ready() {
                     yield_now(task, cx);
                 } else {
                     task.pending = Pending::Sleep(sleep);
