@@ -27,8 +27,7 @@ use pyo3::{ffi, intern};
 
 use super::pytask::{Outcome, Pending, PyTask, Resume};
 use super::trap::{Trap, TrapKind};
-use crate::interned::names;
-use crate::py_compat::take_exception;
+use crate::py_compat::{Sent, names, send, take_exception};
 
 thread_local! {
     /// The waker of the task this lane is polling, null between polls.
@@ -154,26 +153,11 @@ enum Stepped<'py> {
 fn resume<'py>(coro: &Bound<'py, PyAny>, resume: Resume) -> Stepped<'py> {
     let py = coro.py();
     match resume {
-        Resume::None => {
-            let mut result = ptr::null_mut();
-            // SAFETY: attached (we hold `py`); `coro` and `None` are live for the call, and
-            // `result` is a valid out-pointer. `PyIter_Send` borrows its arguments.
-            let status =
-                unsafe { ffi::PyIter_Send(coro.as_ptr(), ffi::Py_None(), &raw mut result) };
-            match status {
-                // SAFETY: on RETURN and NEXT, `result` is a new, non-null reference.
-                ffi::PySendResult::PYGEN_RETURN => Stepped::Finished(Outcome::Returned(
-                    unsafe { Bound::from_owned_ptr(py, result) }.unbind(),
-                )),
-                ffi::PySendResult::PYGEN_NEXT => {
-                    // SAFETY: as above.
-                    Stepped::Yielded(unsafe { Bound::from_owned_ptr(py, result) })
-                }
-                ffi::PySendResult::PYGEN_ERROR => {
-                    Stepped::Finished(Outcome::Raised(take_exception(py).unbind()))
-                }
-            }
-        }
+        Resume::None => match send(coro, None) {
+            Sent::Returned(value) => Stepped::Finished(Outcome::Returned(value.unbind())),
+            Sent::Yielded(yielded) => Stepped::Yielded(yielded),
+            Sent::Raised(exception) => Stepped::Finished(Outcome::Raised(exception.unbind())),
+        },
         Resume::Throw(exception) => {
             // SAFETY: attached; `coro`, the interned name and `exception` are live for the call.
             // Returns a new reference, or NULL with an exception set.

@@ -4,6 +4,8 @@
 //!   `_yield_trap()` and `_sleep_trap(delay)`);
 //! - `_send(iterator, value)` calls `PyIter_Send` directly, which is how the step driver resumes
 //!   a coroutine, so tests reach `am_send` even where the `SEND` opcode does not use it;
+//! - `_take_unnormalized_exception(exc_type, value, traceback)` raises a raw exception triple
+//!   and takes it back through `take_exception`, which normalizes it on 3.11;
 //! - `_count_allocations(fn)` counts every allocation CPython makes while `fn()` runs.
 
 use core::ffi::c_void;
@@ -11,16 +13,19 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::{PyTraceback, PyType};
 
 use crate::Ready;
+use crate::py_compat::{self, Sent, take_exception};
 
 /// Adds the hooks to `module`.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(make_ready, module)?)?;
     module.add_function(wrap_pyfunction!(send, module)?)?;
+    module.add_function(wrap_pyfunction!(take_unnormalized_exception, module)?)?;
     module.add_function(wrap_pyfunction!(count_allocations, module)?)
 }
 
@@ -36,20 +41,57 @@ fn make_ready(value: Py<PyAny>) -> Ready {
 #[pyo3(signature = (iterator, value, /))]
 fn send<'py>(
     iterator: &Bound<'py, PyAny>,
-    value: &Bound<'py, PyAny>,
+    value: Bound<'py, PyAny>,
 ) -> PyResult<(bool, Bound<'py, PyAny>)> {
-    let py = iterator.py();
-    let mut result = ptr::null_mut();
-    // SAFETY: attached (we hold `py`); both objects are live for the call, `result` is a valid
-    // out-pointer. PyIter_Send borrows its arguments and writes a new reference to `result`.
-    let status = unsafe { ffi::PyIter_Send(iterator.as_ptr(), value.as_ptr(), &raw mut result) };
-    match status {
-        ffi::PySendResult::PYGEN_ERROR => Err(PyErr::fetch(py)),
-        // SAFETY: on PYGEN_RETURN and PYGEN_NEXT, `result` is a new, non-null reference.
-        _ => Ok((status == ffi::PySendResult::PYGEN_RETURN, unsafe {
-            Bound::from_owned_ptr(py, result)
-        })),
+    match py_compat::send(iterator, Some(value)) {
+        Sent::Returned(result) => Ok((true, result)),
+        Sent::Yielded(yielded) => Ok((false, yielded)),
+        Sent::Raised(exception) => Err(PyErr::from_value(exception.into_any())),
     }
+}
+
+/// Sets the raised exception to the raw `(exc_type, value, traceback)` triple, as a C extension
+/// calling `PyErr_Restore` would, then returns what `take_exception` makes of it. On 3.11 the
+/// triple stays unnormalized (`value` need not be an `exc_type` instance) until
+/// `take_exception` normalizes it; 3.12+ normalizes it in `PyErr_Restore`.
+#[pyfunction(name = "_take_unnormalized_exception")]
+#[pyo3(signature = (exc_type, value, traceback, /))]
+#[allow(
+    deprecated,
+    reason = "PyErr_Restore is deprecated from 3.12, but it is the raw-triple API C extensions \
+              still call, which is what this hook reproduces"
+)]
+fn take_unnormalized_exception<'py>(
+    exc_type: &Bound<'py, PyType>,
+    value: &Bound<'py, PyAny>,
+    traceback: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBaseException>> {
+    let py = exc_type.py();
+    if !exc_type.is_subclass_of::<PyBaseException>()? {
+        return Err(PyTypeError::new_err(format!(
+            "_take_unnormalized_exception: exc_type must be an exception class, not {}",
+            exc_type.name()?
+        )));
+    }
+    if !traceback.is_none() && !traceback.is_instance_of::<PyTraceback>() {
+        return Err(PyTypeError::new_err(
+            "_take_unnormalized_exception: traceback must be a traceback or None",
+        ));
+    }
+    let value = if value.is_none() {
+        ptr::null_mut()
+    } else {
+        value.clone().into_ptr()
+    };
+    let traceback = if traceback.is_none() {
+        ptr::null_mut()
+    } else {
+        traceback.clone().into_ptr()
+    };
+    // SAFETY: attached (we hold `py`); `exc_type` is an exception class and `traceback` a
+    // traceback or NULL (checked above). PyErr_Restore steals the three new references.
+    unsafe { ffi::PyErr_Restore(exc_type.clone().into_ptr(), value, traceback) };
+    Ok(take_exception(py))
 }
 
 /// Allocations made through the wrapped allocators since they were installed.

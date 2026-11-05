@@ -1,4 +1,10 @@
-//! What differs between the CPython versions porto supports (3.11 to 3.14t).
+//! Taking the raised exception out of the thread state, on every supported version.
+//!
+//! 3.12+ keeps only normalized exceptions in the thread state; 3.11 keeps the
+//! `(type, value, traceback)` triple a C extension set with `PyErr_Restore` as it is, so it is
+//! normalized here. The two disagree on one corner: a value that is an instance of a *subclass* of
+//! the type is kept by 3.11's normalization, while 3.12's `PyErr_Restore` wraps it in a new
+//! instance of the type (`tests/python/test_py_compat.py`).
 
 use pyo3::exceptions::{PyBaseException, PySystemError};
 use pyo3::ffi;

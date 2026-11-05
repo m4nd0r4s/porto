@@ -8,13 +8,13 @@ use pyo3::prelude::*;
 mod api;
 pub mod async_slots;
 pub mod driver;
-pub mod interned;
 mod py_compat;
 pub mod testing;
 mod throw_args;
 
 pub use driver::ready::Ready;
 pub use driver::trap::{Trap, TrapKind};
+pub use py_compat::interned;
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,
 /// `checkpoint`), the trap protocol's awaitables (`_Trap`, `_Ready`), the step driver's private
@@ -33,7 +33,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // them yet, so this is the one point where their `am_send` slot can be set (see async_slots).
     async_slots::install_am_send::<Trap>(py, driver::trap::trap_am_send)?;
     async_slots::install_am_send::<Ready>(py, driver::ready::ready_am_send)?;
-    interned::names(py);
+    py_compat::names(py);
     api::run::register(module)?;
     api::scope::register(module)?;
     api::time::register(module)?;
