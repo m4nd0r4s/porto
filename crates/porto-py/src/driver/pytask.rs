@@ -351,9 +351,12 @@ impl PyTask {
             }
         }
         drop(coro);
-        // Nothing is pending once the coroutine finished; release it if a wait was abandoned
-        // half-way (a failed context enter).
-        self.release_wait();
+        // Nothing is pending once the coroutine finished; give the wait up if it was left
+        // half-way (a failed context enter). On the lane (only `step::poll` completes a task),
+        // so a sleep's timer is unlinked too instead of keeping the task until its deadline.
+        self.abandon_wait();
+        // An interrupt filed for this task and never delivered goes with it.
+        lane::forget_interrupt(header);
         let (kind, payload) = match outcome {
             TaskOutcome::Ok(value) => (SlotKind::Ok, Some(value)),
             TaskOutcome::Err(exception) => (SlotKind::Err, Some(exception.into_any())),

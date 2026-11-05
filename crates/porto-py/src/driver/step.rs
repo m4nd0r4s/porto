@@ -128,8 +128,12 @@ pub(super) fn poll(
         waker: cx.waker(),
         budget: Cell::new(COOP_BUDGET),
     };
-    let _running = RunningTask::set(&running);
-    let outcome = step_until_wait(task, &coro, &running.budget, cx);
+    let outcome = {
+        // Published only while the coroutine steps: Python code that `complete` runs (a
+        // `Task.finish`, an unraisable hook) must not see the finished task as running.
+        let _running = RunningTask::set(&running);
+        step_until_wait(task, &coro, &running.budget, cx)
+    };
     task.coro = Some(coro.unbind());
     match outcome {
         Some(outcome) => {

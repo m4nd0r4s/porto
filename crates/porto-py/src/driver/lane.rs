@@ -20,6 +20,7 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use porto_core::config::RuntimeConfig;
+use porto_core::task::Header;
 use porto_core::time::{Deadline, sleep_until};
 use porto_core::{Handle, ParkHook, Runtime};
 use pyo3::exceptions::PyBaseException;
@@ -56,7 +57,8 @@ struct LaneState {
 /// `timer_resolution`), on this (attached) thread. The runtime
 /// is dropped before returning, still attached, so the tasks it frees release their Python
 /// objects directly. Tasks still waiting on a scope are freed after it (their coroutines are
-/// closed).
+/// closed). A task still waiting on a join or a sync primitive is kept alive by the waker that
+/// wait holds and is not freed until the wait is woken (porto-szb.100: shutdown cancels it).
 pub(crate) fn run<T>(
     _attached: Python<'_>,
     config: &RuntimeConfig,
@@ -124,6 +126,20 @@ pub(crate) fn interrupt(waker: &Waker, exception: Py<PyBaseException>) {
     let previous = LANE.with_borrow_mut(|lane| lane.interrupts.insert(task_key(waker), exception));
     drop(previous);
     waker.wake_by_ref();
+}
+
+/// Drops the interrupt filed for the task with this header, if any: a task that completes before
+/// a wait received it must not keep the exception (and its traceback) alive, nor pass it to a
+/// later task allocated at the same address.
+pub(crate) fn forget_interrupt(header: &Header) {
+    let key = core::ptr::from_ref(header).addr();
+    let forgotten = LANE.with_borrow_mut(|lane| {
+        if lane.interrupts.is_empty() {
+            return None;
+        }
+        lane.interrupts.remove(&key)
+    });
+    drop(forgotten);
 }
 
 /// Takes the interrupt filed for the task `waker` wakes, if any.
