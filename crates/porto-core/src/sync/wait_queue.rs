@@ -194,6 +194,15 @@ impl<S: WaitState> WaitQueue<S> {
     /// - Calls with the same node (`poll_wait`, `cancel`) are not concurrent.
     /// - From a `Pending` return until a `Ready` return or [`WaitQueue::cancel`], the node is
     ///   used with this queue only, and this queue outlives that period.
+    /// - In that period the node stays at its address and is not freed without running
+    ///   [`WaitNode`]'s `Drop` (an allocation that embeds it, such as a task body, must drop it
+    ///   in place rather than free the memory raw).
+    /// - The granter reads the node through shared references while the owner may hold the
+    ///   embedding struct, so the owner reaches the node only through `&`/`Pin<&>`; a struct
+    ///   that embeds it is `!Unpin` through it, which keeps `&mut` to that struct from
+    ///   asserting exclusive access.
+    /// - Cancellation requested from another thread is forwarded to the owner, which calls
+    ///   [`WaitQueue::cancel`]; calling it from that other thread breaks the first rule.
     pub unsafe fn poll_wait<A>(
         &self,
         node: Pin<&WaitNode>,
@@ -279,7 +288,11 @@ impl<S: WaitState> WaitQueue<S> {
 impl<S> Drop for WaitQueue<S> {
     fn drop(&mut self) {
         // `Wait` borrows the queue, so only a broken `poll_wait` contract leaves nodes here.
-        let len = self.inner.get_mut().map_or(0, |inner| inner.len);
+        let len = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len;
         debug_assert_eq!(len, 0, "WaitQueue dropped with {len} queued waiters");
     }
 }
