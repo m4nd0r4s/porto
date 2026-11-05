@@ -16,7 +16,7 @@ criterion = "0.8.2"
 proptest.workspace = true
 
 [target."cfg(loom)".dev-dependencies]
-loom = "0.7.2"
+loom = { version = "0.7.2", features = ["futures"] }
 
 # The cancel check's fast path (15-structured-concurrency-and-cancellation.md §1.2).
 [[bench]]
@@ -26,4 +26,9 @@ harness = false
 # The timer wheel: insert + cancel, and batched firing (14-time-and-timers.md §2).
 [[bench]]
 name = "timer_wheel"
+harness = false
+
+# The channel's uncontended send + receive (16-sync-primitives-and-channels.md §2.4).
+[[bench]]
+name = "mpsc"
 harness = false
