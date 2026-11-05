@@ -9,7 +9,7 @@ mod clock;
 mod deadline;
 mod sleep;
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests;
 
 pub(crate) use clock::RuntimeClock;

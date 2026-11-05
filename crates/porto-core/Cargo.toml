@@ -13,6 +13,7 @@ workspace = true
 
 [dev-dependencies]
 criterion = "0.8.2"
+proptest.workspace = true
 
 [target."cfg(loom)".dev-dependencies]
 loom = "0.7.2"

@@ -13,11 +13,14 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Poll, Waker};
 use std::thread;
 
-use super::{Notified, Schedule, TaskFlags, new_task};
+use super::{Header, Notified, Schedule, TaskFlags, new_task};
 
 /// Never on a lane: every wake goes through `schedule_remote` into a shared queue.
 #[derive(Clone, Default)]
-struct MockScheduler(Arc<Mutex<VecDeque<Notified>>>);
+pub(super) struct MockScheduler {
+    queue: Arc<Mutex<VecDeque<Notified>>>,
+    completed: Arc<AtomicUsize>,
+}
 
 // SAFETY: `schedule_local` always returns the task untouched.
 unsafe impl Schedule for MockScheduler {
@@ -25,21 +28,28 @@ unsafe impl Schedule for MockScheduler {
         Err(task)
     }
     fn schedule_remote(self, task: Notified) {
-        self.0.lock().unwrap().push_back(task);
+        self.queue.lock().unwrap().push_back(task);
+    }
+    fn task_completed(&self, _task: &Header) {
+        self.completed.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 impl MockScheduler {
-    fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+    pub(super) fn len(&self) -> usize {
+        self.queue.lock().unwrap().len()
     }
-    fn pop(&self) -> Option<Notified> {
-        self.0.lock().unwrap().pop_front()
+    pub(super) fn pop(&self) -> Option<Notified> {
+        self.queue.lock().unwrap().pop_front()
+    }
+    /// How many tasks reported completion.
+    pub(super) fn completed(&self) -> usize {
+        self.completed.load(Ordering::SeqCst)
     }
 }
 
 /// Counts drops of the value it is moved into, i.e. drops of the future that owns it.
-struct DropCounter(Arc<AtomicUsize>);
+pub(super) struct DropCounter(Arc<AtomicUsize>);
 
 impl Drop for DropCounter {
     fn drop(&mut self) {
@@ -47,7 +57,7 @@ impl Drop for DropCounter {
     }
 }
 
-fn counter() -> (Arc<AtomicUsize>, DropCounter) {
+pub(super) fn counter() -> (Arc<AtomicUsize>, DropCounter) {
     let count = Arc::new(AtomicUsize::new(0));
     (count.clone(), DropCounter(count))
 }
@@ -302,10 +312,15 @@ fn a_task_ref_outlives_the_queue_entry() {
     let (_sched, task, drops) = spawn(|_| Poll::Ready(()));
     let held = task.task_ref();
     drop(task);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(held.header().state().load().ref_count(), 1);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "a dropped queue entry cancels the task"
+    );
+    let state = held.header().state().load();
+    assert!(state.is_complete() && state.is_cancel_requested());
+    assert_eq!(state.ref_count(), 1);
     drop(held);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]

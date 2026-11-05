@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::Thread;
 
 use super::lane;
-use crate::task::{Notified, Schedule, new_task};
+use crate::task::{JoinHandle, Notified, Schedule, new_joinable_task};
 use crate::time::{Deadline, RuntimeClock};
 
 /// A cloneable, `Send + Sync` handle to a runtime: spawns tasks onto it from any thread.
@@ -61,14 +61,19 @@ impl Handle {
 
     /// Spawns `future` as a new task. From inside this runtime's `block_on` it goes on the
     /// local queue; from anywhere else, into the lane's inbox (unparking the lane).
-    pub fn spawn<F>(&self, future: F)
+    ///
+    /// Await the [`JoinHandle`] for the output, or drop it to detach the task. If the runtime
+    /// is already dropped, the task is cancelled at once.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
-        let task = new_task(future, self.clone());
+        let (task, join) = new_joinable_task(future, self.clone());
         if let Err(task) = self.schedule_local(task) {
             self.clone().schedule_remote(task);
         }
+        join
     }
 
     /// A handle to the runtime running on this thread (inside its `block_on` or one of its
@@ -92,7 +97,8 @@ unsafe impl Schedule for Handle {
         let mut inbox = self.shared.inbox();
         if inbox.closed {
             drop(inbox);
-            // Dropping may free the task and run its future's destructor: not under the lock.
+            // Dropping the entry cancels the task (`Notified`), which runs its future's
+            // destructor: not under the lock.
             drop(task);
             return;
         }

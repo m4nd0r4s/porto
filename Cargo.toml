@@ -21,6 +21,8 @@ pyo3 = "0.30"
 pyo3-build-config = "0.30"
 # The epoll/kqueue/IOCP poller under porto-io. No `log`: porto reports through its own channels.
 mio = { version = "1.2.4", default-features = false, features = ["os-poll", "os-ext"] }
+# Property tests (dev only).
+proptest = "1.12"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

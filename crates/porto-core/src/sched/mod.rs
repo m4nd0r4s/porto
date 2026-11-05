@@ -5,24 +5,28 @@ mod park;
 mod shared;
 mod timers;
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests;
 
 use std::future::Future;
+
+use crate::task::JoinHandle;
 
 pub use lane::{Builder, Runtime};
 pub(crate) use lane::{current_handle, current_time, register_timer};
 pub use park::ParkHook;
 pub use shared::Handle;
 
-/// Spawns `future` onto the runtime running on this thread.
+/// Spawns `future` onto the runtime running on this thread. Await the [`JoinHandle`] for the
+/// output, or drop it to detach the task.
 ///
 /// # Panics
 /// If no runtime is running on this thread. Call it from a task or from inside
 /// [`Runtime::block_on`], or use [`Handle::spawn`] from other threads.
-pub fn spawn<F>(future: F)
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
-    F: Future<Output = ()> + Send + 'static,
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
 {
     let Some(handle) = lane::current_handle() else {
         panic!(
@@ -30,5 +34,5 @@ where
              Runtime::block_on, or use Handle::spawn from other threads"
         );
     };
-    handle.spawn(future);
+    handle.spawn(future)
 }

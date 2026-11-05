@@ -17,14 +17,16 @@ pub struct Header {
     registry: RegistryNode,      // intrusive list for introspection (§23)
 }
 ```
-- **RustTask<F: Future>**: Header + `F` + output slot + join waker. Polled via `Future::poll`.
+- **RustTask<F: Future>**: Header + scheduler handle + `F` (then its output, in the same slot) + join waker. Polled via `Future::poll`.
 - **PyTask**: Header + PyTask body (§2). Its `poll` implementation performs **steps** (§4).
 
 The two 16-bit fields sit in the padding after `state`, so the header is 56 B on 64-bit targets (vtable first would pad it to 64 B).
 
 Target (ADR-034): `size_of::<Header>() <= 64` including the registry node, `size_of::<PyTaskBody>() <= 192` including the embedded timer entry and wait node (excluding the Python coroutine).
 
-Reference counting: tasks are `Arc`-like with a manual refcount packed in `state` (as in Tokio: `REF_ONE = 1 << 6`). Wakers clone and drop refs.
+The 64 B budget counts the header only. The scheduler handle a task stores right after it (the `Schedule` implementation a wake pushes through; 8 B, one `Arc`, for the built-in scheduler) belongs to the body. On 64-bit targets it fills the last 8 B of the header's cache line, so a wake reads one line; a layout test keeps it at offset 56 and the body at 64.
+
+Reference counting: tasks are `Arc`-like with a manual refcount packed in `state` (as in Tokio, from `REF_ONE = 1 << 7` here: one more lifecycle bit than Tokio's six). Wakers, run-queue entries and the join handle each own one reference.
 
 ## 2. PyTask body
 
@@ -53,18 +55,32 @@ Bits in `state: AtomicU32`:
 | 0 | RUNNING | A lane is currently stepping/polling it |
 | 1 | NOTIFIED | A wake arrived. Must be (re)scheduled after the current poll |
 | 2 | COMPLETE | Output stored, coroutine released |
-| 3 | CANCEL_REQ | An enclosing scope requested cancellation (hint; the truth is the scope tree) |
+| 3 | CANCEL_REQ | Cancellation requested. For a PyTask, a hint from an enclosing scope (the truth is the scope tree). A RustTask that sees it at poll start drops its future instead of polling it and completes as cancelled (`JoinHandle::abort`, shutdown) |
 | 4 | JOIN_INTEREST | Someone holds a join handle |
 | 5 | SCHEDULED | Currently in a run queue |
-| 6.. | REF count | |
+| 6 | JOIN_WAKER | The join handle's waker is stored in the task (hands the waker slot between handle and lane, as Tokio's bit of the same name) |
+| 7.. | REF count | |
 
 Transitions (CAS loops) follow Tokio's `harness.rs` logic:
 - `wake`: if RUNNING, set NOTIFIED. Else if neither SCHEDULED nor COMPLETE, set SCHEDULED and push to a queue.
 - `poll start`: SCHEDULED→RUNNING (clear NOTIFIED).
 - `poll end Pending`: if NOTIFIED, reschedule (to the LIFO slot if the current lane is woken by itself, otherwise the local queue). Else clear RUNNING.
-- `poll end Ready`: set COMPLETE, clear RUNNING, wake joiners, notify scope.
+- `poll end Ready`: set COMPLETE, clear RUNNING, wake joiners, notify scope. The future is dropped (on the lane, while still RUNNING) and the output stored before COMPLETE is set. If JOIN_INTEREST is clear at that point, the lane drops the output; a panic nobody joins is resumed on the lane. The scope hears of the completion through the scheduler (`Schedule::task_completed`), after the joiner is woken and before the run reference is released.
+- `abort` (`JoinHandle::abort`): set CANCEL_REQ, then act as `wake`, so the task is polled once more and cancels. A poll in progress finishes first; if it returns `Ready`, the output wins.
 
 `loom` model tests MUST cover wake-during-poll, wake-after-complete, concurrent cancel+wake, and drop-of-last-waker.
+
+### 3.1 What a wake publishes
+
+Every transition that changes the state word is an `AcqRel` read-modify-write, so it synchronizes-with every later transition. A wake that changes nothing writes nothing (as in Tokio): `wake_by_ref` on a task that is SCHEDULED, COMPLETE, or RUNNING with NOTIFIED already set is a plain `Acquire` load. A by-value `wake` always writes, because it drops its reference.
+
+The guarantee is therefore: every wake is followed by a poll that starts after the wake's read of the state word. It is **not** a release fence: writes the waker made before a wake that wrote nothing may be invisible to that poll (the store-buffer pattern). A future MUST therefore observe its event through synchronization the waker also uses: a lock, or a read-modify-write on the resource's own atomic (as an `AtomicWaker`-style registration does). Porto's primitives do (the wait queue publishes under its lock, timers fire on the lane). A plain `Release` store of a flag followed by `wake_by_ref` is not enough. A loom model pins this boundary, so making wakes release operations later would be a visible, deliberate change.
+
+### 3.2 Join handle, cancellation and shutdown
+
+`spawn` returns a `JoinHandle<T>` (Rust API, §21). It owns one reference and JOIN_INTEREST. Awaiting it yields `Result<T, JoinError>`, where `JoinError` is either a panic (with its payload) or a cancellation. Dropping it detaches the task. Waker slot ownership follows Tokio: while JOIN_WAKER is clear only the handle touches the slot; while it is set the handle may only read it, and the lane may read it once COMPLETE; after completion only the lane clears JOIN_WAKER, and whoever clears the last of JOIN_INTEREST and JOIN_WAKER drops the waker. The output belongs to the handle if JOIN_INTEREST was set at completion, to the lane otherwise.
+
+Dropping a run-queue entry instead of running it cancels the task: the drop polls it with CANCEL_REQ set, which drops the future, completes the task as cancelled and wakes the joiner. This defines a wake after runtime shutdown: the closed scheduler drops the entry the wake hands it, so the task is cancelled on the waking thread, its joiner gets a cancelled `JoinError`, and the allocation goes with its last reference. A task that is never woken again keeps its future until its last waker is dropped.
 
 ## 4. The step algorithm (PyTask::poll)
 

@@ -9,8 +9,8 @@
 //!
 //! ```
 //! let rt = porto_core::Runtime::new();
-//! rt.spawn(async { porto_core::spawn(async {}) });
-//! assert_eq!(rt.block_on(async { 1 + 1 }), 2);
+//! let task = rt.spawn(async { porto_core::spawn(async { 1 + 1 }).await.unwrap() });
+//! assert_eq!(rt.block_on(task).unwrap(), 2);
 //! ```
 
 pub mod sched;
