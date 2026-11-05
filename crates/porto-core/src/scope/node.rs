@@ -226,6 +226,10 @@ impl<E> ScopeNode<E> {
 
     /// Locks the scope's state. A panic while it was locked leaves plain counters behind, so a
     /// poisoned lock is used as is.
+    ///
+    /// Never drop a task handle, a task waker or a body reference while holding the guard: the
+    /// last one can free a task of this scope, which locks it again to count the task out. Take
+    /// the old value out (`mem::replace`), drop the guard, then drop the value.
     pub fn lock_state(&self) -> MutexGuard<'_, ScopeState<E>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

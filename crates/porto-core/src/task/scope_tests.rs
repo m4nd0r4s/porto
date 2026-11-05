@@ -301,11 +301,14 @@ enum BodyScript {
     Panic,
     /// Stay pending without keeping the waker.
     Idle,
+    /// Finish, then panic when asked for a failure.
+    PanicInTakeFailure,
 }
 
 struct ScriptedBody {
     script: BodyScript,
     take_failures: Arc<AtomicUsize>,
+    cancels: Arc<AtomicUsize>,
 }
 
 impl TaskBody for ScriptedBody {
@@ -317,13 +320,16 @@ impl TaskBody for ScriptedBody {
         }
     }
 
-    fn cancel(self: Pin<&mut Self>, _: &Header) {}
+    fn cancel(self: Pin<&mut Self>, _: &Header) {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+    }
 
     fn take_failure(self: Pin<&mut Self>) -> Option<Box<dyn Any + Send>> {
         self.take_failures.fetch_add(1, Ordering::SeqCst);
         match self.script {
             BodyScript::Fail => Some(Box::new(String::from("body failed"))),
             BodyScript::FailWithOther => Some(Box::new(42_u8)),
+            BodyScript::PanicInTakeFailure => panic!("take_failure panicked"),
             _ => None,
         }
     }
@@ -334,6 +340,7 @@ fn scripted(script: BodyScript) -> (ScriptedBody, Arc<AtomicUsize>) {
     let body = ScriptedBody {
         script,
         take_failures: Arc::clone(&take_failures),
+        cancels: Arc::default(),
     };
     (body, take_failures)
 }
@@ -424,4 +431,29 @@ fn a_body_outside_a_scope_is_never_asked_for_a_failure() {
     task.run();
     assert!(body.is_complete());
     assert_eq!(take_failures.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_panic_in_take_failure_fails_the_scope_without_cancelling_the_finished_body() {
+    let fixture = Fixture::new();
+    let (body, take_failures) = scripted(BodyScript::PanicInTakeFailure);
+    let cancels = Arc::clone(&body.cancels);
+    let (task, _body) = new_body_task_in(
+        body,
+        MockScheduler::default(),
+        TaskFlags::PYTHON,
+        fixture.attach(),
+    );
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| task.run())).is_err());
+    assert_eq!(fixture.live(), 1);
+    assert_eq!(take_failures.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        cancels.load(Ordering::SeqCst),
+        0,
+        "a finished body is never cancelled"
+    );
+    assert_eq!(
+        fixture.scope.cancel_called(),
+        Some(CancelReason::ChildFailed)
+    );
 }

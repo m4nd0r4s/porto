@@ -231,22 +231,18 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
         let mut body = unsafe { body_mut(cell) };
         if prev.is_cancel_requested() {
             body.cancel(&cell.header);
-            return Poll::Ready(TaskEnd::Cancelled);
+            return Poll::Ready(Some(TaskEnd::Cancelled));
         }
         // SAFETY: the run reference outlives `waker`, which is not used after the poll.
         let waker = unsafe { WakerRef::new(task) };
         let polled = body
             .as_mut()
             .poll(&cell.header, &mut Context::from_waker(&waker));
-        // Only a task in a scope asks its body for a failure.
+        // Only a task in a scope asks its body for a failure (`None` below), outside this panic
+        // guard: a body that returned `Ready` is never cancelled.
         // SAFETY: we hold RUNNING and nobody else touches the slot.
-        if polled.is_pending() || !unsafe { cell.header.has_scope() } {
-            return polled.map(|()| TaskEnd::Completed);
-        }
-        Poll::Ready(match body.take_failure() {
-            Some(failure) => TaskEnd::Failed(Some(failure)),
-            None => TaskEnd::Completed,
-        })
+        let in_scope = unsafe { cell.header.has_scope() };
+        polled.map(|()| (!in_scope).then_some(TaskEnd::Completed))
     }));
     match polled {
         Ok(Poll::Pending) => match cell.header.state.transition_to_idle() {
@@ -257,7 +253,23 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
             IdleAction::Dealloc => unsafe { task.dealloc() },
         },
         // SAFETY: still RUNNING with the run reference, which `complete` releases.
-        Ok(Poll::Ready(end)) => unsafe { complete::<B, S>(task, end, None) },
+        Ok(Poll::Ready(Some(end))) => unsafe { complete::<B, S>(task, end, None) },
+        // A panic in `take_failure` fails the task without a payload for the scope, and goes
+        // on once the task is released, like a panic in the poll (but the body is not
+        // cancelled: it already finished).
+        Ok(Poll::Ready(None)) => {
+            let failure = panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: still RUNNING.
+                unsafe { body_mut(cell) }.take_failure()
+            }));
+            let (end, unhandled) = match failure {
+                Ok(Some(failure)) => (TaskEnd::Failed(Some(failure)), None),
+                Ok(None) => (TaskEnd::Completed, None),
+                Err(payload) => (TaskEnd::Failed(None), Some(payload)),
+            };
+            // SAFETY: still RUNNING with the run reference, which `complete` releases.
+            unsafe { complete::<B, S>(task, end, unhandled) }
+        }
         // A body that panics completes: it is not polled again, and the panic goes on from
         // here once the task is released. It is cancelled first, so its joiners are released
         // instead of waiting forever; a panic from that cleanup is dropped (the first wins).
@@ -333,12 +345,17 @@ unsafe fn drop_body<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
 unsafe fn dealloc<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
     // SAFETY: allocated by `Box` in `new_body_task_in`, and no reference is left to observe it.
     let cell = unsafe { Box::from_raw(ptr.cast::<BodyCell<B, S>>().as_ptr()) };
-    // A task that never completed still holds its scope: it ends as freed, once the body is
-    // dropped (on unwind too, since `scope` is a local).
+    // A task that never completed still holds its scope: it ends as freed once what it owns
+    // is dropped. A panic from that drop goes on after the scope is told, which happens outside
+    // the unwind (a second panic there would abort).
     // SAFETY: we hold the last reference.
     let scope = unsafe { cell.header.take_scope() };
-    drop(cell);
-    drop(scope);
+    let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(cell))) else {
+        drop(scope);
+        return;
+    };
+    drop(panic::catch_unwind(AssertUnwindSafe(|| drop(scope))));
+    panic::resume_unwind(payload);
 }
 
 /// A body task has no join handle: its joiners wait through the body.

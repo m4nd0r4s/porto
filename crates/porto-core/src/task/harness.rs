@@ -445,12 +445,17 @@ where
 {
     // SAFETY: allocated by `Box` in `allocate`, and no reference is left to observe it.
     let cell = unsafe { Box::from_raw(ptr.cast::<Cell<F, S>>().as_ptr()) };
-    // A task that never completed still holds its scope: it ends as freed, once what it owns
-    // is dropped (on unwind too, since `scope` is a local).
+    // A task that never completed still holds its scope: it ends as freed once what it owns
+    // is dropped. A panic from that drop goes on after the scope is told, which happens outside
+    // the unwind (a second panic there would abort).
     // SAFETY: we hold the last reference.
     let scope = unsafe { cell.header.take_scope() };
-    drop(cell);
-    drop(scope);
+    let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(cell))) else {
+        drop(scope);
+        return;
+    };
+    drop(panic::catch_unwind(AssertUnwindSafe(|| drop(scope))));
+    panic::resume_unwind(payload);
 }
 
 #[cfg(all(test, not(loom), target_pointer_width = "64"))]

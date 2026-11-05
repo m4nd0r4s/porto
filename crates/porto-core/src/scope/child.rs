@@ -148,6 +148,11 @@ impl<E: Send + 'static> ScopeNode<E> {
             TaskEnd::Failed(Some(payload)) => payload.downcast::<E>().ok().map(|error| *error),
             _ => None,
         };
+        // Cancelled before the child is counted out: `cancel` takes the same lock, so an owner
+        // that sees the last child gone also sees the cancellation (C4).
+        if failed {
+            self.cancel(CancelReason::ChildFailed);
+        }
         let mut state = self.lock_state();
         debug_assert!(
             state.live_children > 0,
@@ -163,10 +168,6 @@ impl<E: Send + 'static> ScopeNode<E> {
             None
         };
         drop(state);
-        // Cancelled before the owner is woken, so its exit sees the cancellation.
-        if failed {
-            self.cancel(CancelReason::ChildFailed);
-        }
         if let Some(waiter) = waiter {
             waiter.wake();
         }

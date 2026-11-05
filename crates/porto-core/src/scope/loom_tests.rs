@@ -111,12 +111,33 @@ fn child_ends_vs_exit_wait() {
             state.exit_waiter = Some(cx.waker().clone());
             Poll::Pending
         }));
-        // The failure is recorded under the same lock as the count, the cancel just after:
-        // both are in once the ending threads are done.
+        // The cancel comes before the count, the failure under the same lock as the count: an
+        // owner that sees no child left sees both, without waiting for the ending threads.
+        assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
         assert_eq!(scope.lock_state().errors, [7]);
         first.join().unwrap();
         second.join().unwrap();
-        assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
         assert_eq!(Arc::strong_count(&scope), 1);
+    });
+}
+
+/// A single failing child (C4): the owner that sees it gone already sees the scope cancelled.
+#[test]
+fn a_failing_child_cancels_before_the_owner_can_exit() {
+    loom::model(|| {
+        let scope = ScopeNode::<u8>::new_root(0);
+        let failing = TaskScope::attach(&scope);
+        let first = thread::spawn(move || failing.end(TaskEnd::Failed(None)));
+        loom::future::block_on(poll_fn(|cx| {
+            let mut state = scope.lock_state();
+            if state.live_children == 0 {
+                return Poll::Ready(());
+            }
+            state.exit_waiter = Some(cx.waker().clone());
+            Poll::Pending
+        }));
+        let seen = scope.cancel_called();
+        first.join().unwrap();
+        assert_eq!(seen, Some(CancelReason::ChildFailed));
     });
 }
