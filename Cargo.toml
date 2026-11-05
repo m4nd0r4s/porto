@@ -23,7 +23,7 @@ pyo3-build-config = "0.30"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
-# The loom models: `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release scope`.
+# The loom models: `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release scope` (or `sync`).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [workspace.lints.clippy]
