@@ -20,6 +20,7 @@ use super::state::IdleAction;
 use super::sync::UnsafeCell;
 use super::waker::WakerRef;
 use super::{Notified, Schedule};
+use crate::scope::{TaskEnd, TaskScope};
 
 /// Header + scheduler handle + future or output + join waker, in one allocation (a
 /// `RustTask`). `repr(C)` keeps the header first, so a `NonNull<Header>` and a
@@ -67,7 +68,7 @@ where
     F::Output: Send + 'static,
     S: Schedule,
 {
-    Notified(allocate(future, scheduler, false))
+    Notified(allocate(future, scheduler, false, None))
 }
 
 /// Allocates a task and its join handle, each owning one reference.
@@ -77,20 +78,34 @@ where
     F::Output: Send + 'static,
     S: Schedule,
 {
-    let task = allocate(future, scheduler, true);
+    new_joinable_task_in(future, scheduler, None)
+}
+
+/// As [`new_joinable_task`], for a task spawned into `scope`, which hears of its end.
+pub(crate) fn new_joinable_task_in<F, S>(
+    future: F,
+    scheduler: S,
+    scope: Option<TaskScope>,
+) -> (Notified, JoinHandle<F::Output>)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+    S: Schedule,
+{
+    let task = allocate(future, scheduler, true, scope);
     // SAFETY: the allocation's output type is `F::Output`, and the state holds the join
     // handle's reference and JOIN_INTEREST.
     (Notified(task), unsafe { JoinHandle::from_raw(task) })
 }
 
-fn allocate<F, S>(future: F, scheduler: S, join_handle: bool) -> RawTask
+fn allocate<F, S>(future: F, scheduler: S, join_handle: bool, scope: Option<TaskScope>) -> RawTask
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
     S: Schedule,
 {
     let cell = Box::new(Cell {
-        header: Header::new(vtable::<F, S>(), TaskFlags::NONE, join_handle),
+        header: Header::new(vtable::<F, S>(), TaskFlags::NONE, join_handle, scope),
         scheduler,
         stage: UnsafeCell::new(Stage::Running(future)),
         join_waker: UnsafeCell::new(None),
@@ -182,8 +197,9 @@ where
 }
 
 /// Poll end with `Ready`: drop the future, store `output`, set COMPLETE, hand the output to
-/// the joiner or drop it, notify the scheduler and release the run reference. A panic that
-/// nobody joins (or one from a destructor) is resumed once the task is released.
+/// the joiner or drop it, notify the scope and the scheduler and release the run reference. A
+/// panic that nobody joins (or one from a destructor, or the scope's waker) is resumed once the
+/// task is released.
 ///
 /// # Safety
 /// The caller holds RUNNING and the run reference, which this consumes.
@@ -195,6 +211,13 @@ where
 {
     // SAFETY: the run reference keeps the allocation alive until the `ref_dec` below.
     let cell = unsafe { cell::<F, S>(task.as_ptr()) };
+    // SAFETY: we hold RUNNING and are completing the task.
+    let scope = unsafe { cell.header.take_scope() };
+    let end = scope.as_ref().map(|_| match &output {
+        Ok(_) => TaskEnd::Completed,
+        Err(error) if error.is_cancelled() => TaskEnd::Cancelled,
+        Err(_) => TaskEnd::Failed(None),
+    });
     // Drop the future while still RUNNING: wakes it performs on itself while dropping only
     // set NOTIFIED, which completion discards. The stage is `Consumed` before the destructor
     // runs, so a panicking destructor leaves nothing half-dropped.
@@ -241,6 +264,10 @@ where
             }));
         }
         unhandled = unhandled.or(woken.err()).or(dropped.err());
+    }
+    if let (Some(scope), Some(end)) = (scope, end) {
+        let notified = panic::catch_unwind(AssertUnwindSafe(|| scope.end(end)));
+        unhandled = unhandled.or(notified.err());
     }
     cell.scheduler.task_completed(&cell.header);
 
@@ -417,7 +444,13 @@ where
     S: Schedule,
 {
     // SAFETY: allocated by `Box` in `allocate`, and no reference is left to observe it.
-    drop(unsafe { Box::from_raw(ptr.cast::<Cell<F, S>>().as_ptr()) });
+    let cell = unsafe { Box::from_raw(ptr.cast::<Cell<F, S>>().as_ptr()) };
+    // A task that never completed still holds its scope: it ends as freed, once what it owns
+    // is dropped (on unwind too, since `scope` is a local).
+    // SAFETY: we hold the last reference.
+    let scope = unsafe { cell.header.take_scope() };
+    drop(cell);
+    drop(scope);
 }
 
 #[cfg(all(test, not(loom), target_pointer_width = "64"))]

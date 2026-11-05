@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use super::flags::TaskFlags;
 use super::raw::TaskVTable;
 use super::state::State;
+use crate::scope::TaskScope;
 
 /// The fixed prefix of every task (`11-task-model-and-trap-protocol.md` §1).
 ///
@@ -30,25 +31,17 @@ pub struct Header {
     pub(crate) vtable: &'static TaskVTable,
     /// Monotonically increasing, never reused.
     pub(crate) id: u64,
-    /// The spawning scope. Null until spawns go into scopes; the task body holds the strong
-    /// reference. Completion reaches the scheduler through [`super::Schedule::task_completed`].
-    #[allow(dead_code, reason = "set once spawns go into scopes (porto-szb.93)")]
-    pub(crate) scope: *const ScopeNode,
+    /// The spawning scope, `None` for a task spawned outside one. The slot owns the task's
+    /// counted reference to the scope, set at spawn and taken exactly once when the task ends:
+    /// by the lane that completes it (holding RUNNING), or by `dealloc` if it never completed.
+    /// Nothing else touches it.
+    scope: UnsafeCell<Option<TaskScope>>,
     /// Intrusive run-queue link for the injector.
     #[allow(dead_code, reason = "used by the intrusive injector queue (M2)")]
     pub(crate) queue_next: UnsafeCell<*const Header>,
     /// Intrusive node in the per-lane task registry (introspection).
     #[allow(dead_code, reason = "linked by the task registry (porto-szb.24)")]
     pub(crate) registry: RegistryNode,
-}
-
-/// The scope a task was spawned in, as seen from the header: opaque here.
-///
-/// A placeholder so the header has its final type and size; the scope wiring (porto-szb.93)
-/// replaces it with the real scope node.
-#[repr(C)]
-pub struct ScopeNode {
-    _opaque: [u8; 0],
 }
 
 /// A node in the intrusive, doubly linked list of live tasks.
@@ -72,6 +65,11 @@ impl RegistryNode {
 }
 
 const _: () = assert!(
+    size_of::<Option<TaskScope>>() == size_of::<usize>(),
+    "the header's scope slot is one thin pointer"
+);
+
+const _: () = assert!(
     size_of::<Header>() <= 64,
     "ADR-034: the task header must fit in 64 bytes (one cache line)"
 );
@@ -89,14 +87,20 @@ fn next_id() -> u64 {
 impl Header {
     /// A header for a task that is about to be queued for the first time, with the queue's
     /// reference, plus a join handle's if `join_handle`.
-    pub(crate) fn new(vtable: &'static TaskVTable, flags: TaskFlags, join_handle: bool) -> Self {
+    /// `scope` is the scope the task is spawned into, already counting it as a child.
+    pub(crate) fn new(
+        vtable: &'static TaskVTable,
+        flags: TaskFlags,
+        join_handle: bool,
+        scope: Option<TaskScope>,
+    ) -> Self {
         Self {
             state: State::new_scheduled(join_handle),
             owner_lane: AtomicU16::new(0),
             flags,
             vtable,
             id: next_id(),
-            scope: ptr::null(),
+            scope: UnsafeCell::new(scope),
             queue_next: UnsafeCell::new(ptr::null()),
             registry: RegistryNode::unlinked(),
         }
@@ -120,6 +124,36 @@ impl Header {
     /// The type name of the task's future, for introspection and debugging.
     pub fn type_name(&self) -> &'static str {
         (self.vtable.type_name)()
+    }
+
+    /// Whether the task still holds its scope: spawned into one and not ended yet.
+    ///
+    /// # Safety
+    /// As for [`Header::take_scope`].
+    #[inline]
+    pub(crate) unsafe fn has_scope(&self) -> bool {
+        // SAFETY: the caller's contract: no one writes the slot concurrently.
+        unsafe { (*self.scope.get()).is_some() }
+    }
+
+    /// Takes the task's scope reference out, leaving `None`: the task is ending. A task outside
+    /// any scope pays this one null check.
+    ///
+    /// # Safety
+    /// The caller holds RUNNING and is completing the task, or holds the last reference (in
+    /// `dealloc`): either way, no other thread can reach the slot.
+    #[inline]
+    pub(crate) unsafe fn take_scope(&self) -> Option<TaskScope> {
+        let slot = self.scope.get();
+        // SAFETY: the caller's contract. Checked first so a task without a scope writes
+        // nothing to the header.
+        unsafe {
+            if (*slot).is_some() {
+                (*slot).take()
+            } else {
+                None
+            }
+        }
     }
 }
 

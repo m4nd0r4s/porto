@@ -7,6 +7,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 use std::task::Waker;
 
+use super::child::{ChildVTableRef, child_vtable};
 use super::sync::{Arc, AtomicU8, AtomicU64, CANCEL_GENERATION, Mutex, MutexGuard, UnsafeCell};
 
 /// Why a scope was cancelled. The first reason wins: cancelling a cancelled scope does nothing.
@@ -53,7 +54,13 @@ static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// A child holds its parent alive, and the parent lists its children intrusively without
 /// owning them: a child unlinks itself when it is dropped. `E` is the failure type the scope
 /// collects (Python exceptions for porto-py); this crate never looks inside it.
+///
+/// `repr(C)` keeps `child_vtable` first: a task's type-erased [`super::TaskScope`] points at
+/// the node and reads it there.
+#[repr(C)]
 pub struct ScopeNode<E> {
+    /// How a child task, which does not know `E`, reports its end to this scope.
+    child_vtable: ChildVTableRef,
     id: u64,
     parent: Option<Arc<ScopeNode<E>>>,
     /// The task whose `async with` created the scope.
@@ -136,7 +143,7 @@ impl<E> ScopeState<E> {
     }
 }
 
-impl<E> ScopeNode<E> {
+impl<E: Send + 'static> ScopeNode<E> {
     /// A scope with no parent: the root scope of a runtime, owned by its main task.
     pub fn new_root(owner_task: u64) -> Arc<Self> {
         Arc::new(Self::new(None, owner_task, false))
@@ -165,6 +172,7 @@ impl<E> ScopeNode<E> {
 
     fn new(parent: Option<Arc<Self>>, owner_task: u64, shield: bool) -> Self {
         Self {
+            child_vtable: child_vtable::<E>(),
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent,
             owner_task,
@@ -183,7 +191,9 @@ impl<E> ScopeNode<E> {
             _not_unique: PhantomPinned,
         }
     }
+}
 
+impl<E> ScopeNode<E> {
     /// Unique for the process lifetime, never reused.
     pub fn id(&self) -> u64 {
         self.id

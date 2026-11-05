@@ -31,6 +31,9 @@ mod body_tests;
 #[cfg(all(test, not(loom)))]
 mod proptests;
 
+#[cfg(all(test, not(loom)))]
+mod scope_tests;
+
 #[cfg(all(test, loom))]
 mod loom_tests;
 
@@ -39,15 +42,15 @@ use std::mem;
 
 pub use body::{TaskBody, TaskBodyRef};
 pub use flags::TaskFlags;
-pub use header::{Header, RegistryNode, ScopeNode};
+pub use header::{Header, RegistryNode};
 pub use join::{JoinError, JoinHandle};
 pub use raw::TaskVTable;
 pub use task_ref::TaskRef;
 
-pub(crate) use body::new_body_task;
-pub(crate) use harness::new_joinable_task;
+pub(crate) use body::{new_body_task, new_body_task_in};
 #[cfg(all(test, not(loom)))]
 pub(crate) use harness::new_task;
+pub(crate) use harness::{new_joinable_task, new_joinable_task_in};
 use raw::RawTask;
 
 /// Where a woken task goes. Implemented by a cheap, cloneable scheduler handle that is stored
@@ -72,10 +75,14 @@ pub unsafe trait Schedule: Clone + Send + Sync + 'static {
     /// A scheduler that is shut down drops `task`, which cancels it (see [`Notified`]).
     fn schedule_remote(self, task: Notified);
 
-    /// Called once per task, on the thread that completed it: after COMPLETE is set and the
-    /// joiner woken, before the run reference is released (§3 "poll end Ready: notify
-    /// scope"). The scope tree hooks in here (porto-szb.93). `self` is borrowed from inside
-    /// the task, as for `schedule_local`.
+    /// Called once per completed task, on the thread that completed it: after COMPLETE is set,
+    /// the joiner woken and the task's scope notified, before the run reference is released
+    /// (§3 "poll end Ready"). `self` is borrowed from inside the task, as for
+    /// `schedule_local`.
+    ///
+    /// A task freed without completing (idle when its last reference went) never calls it.
+    /// Scopes do not hear of task ends through this hook: the task notifies its scope itself,
+    /// on every end, freed included (see [`crate::scope::TaskScope`]).
     fn task_completed(&self, task: &Header) {
         let _ = task;
     }

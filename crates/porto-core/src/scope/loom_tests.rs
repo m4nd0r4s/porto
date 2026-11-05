@@ -1,11 +1,15 @@
-//! loom models of the scope tree (`52-testing-strategy.md` §2: scope cancel vs spawn).
+//! loom models of the scope tree (`52-testing-strategy.md` §2: scope cancel vs spawn), and of
+//! children ending while the owner waits for them.
 //!
 //! `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release scope`
+
+use std::future::poll_fn;
+use std::task::Poll;
 
 use loom::sync::Arc;
 use loom::thread;
 
-use super::{CancelCache, CancelReason, ScopeNode};
+use super::{CancelCache, CancelReason, ScopeNode, TaskEnd, TaskScope};
 
 type Scope = ScopeNode<()>;
 
@@ -84,5 +88,35 @@ fn scope_cancel_vs_unshield() {
 
         canceller.join().unwrap();
         assert!(task.is_cancelled(&inner));
+    });
+}
+
+/// Two children end on two threads, one failing (C4), while the owner waits in `ScopeExit`
+/// (C5): the owner wakes after both ended, and sees the failure recorded and the scope
+/// cancelled.
+#[test]
+fn child_ends_vs_exit_wait() {
+    loom::model(|| {
+        let scope = ScopeNode::<u8>::new_root(0);
+        let failing = TaskScope::attach(&scope);
+        let completing = TaskScope::attach(&scope);
+        let first = thread::spawn(move || failing.end(TaskEnd::Failed(Some(Box::new(7_u8)))));
+        let second = thread::spawn(move || completing.end(TaskEnd::Completed));
+
+        loom::future::block_on(poll_fn(|cx| {
+            let mut state = scope.lock_state();
+            if state.live_children == 0 {
+                return Poll::Ready(());
+            }
+            state.exit_waiter = Some(cx.waker().clone());
+            Poll::Pending
+        }));
+        // The failure is recorded under the same lock as the count, the cancel just after:
+        // both are in once the ending threads are done.
+        assert_eq!(scope.lock_state().errors, [7]);
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
+        assert_eq!(Arc::strong_count(&scope), 1);
     });
 }

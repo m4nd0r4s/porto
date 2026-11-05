@@ -5,11 +5,13 @@
 //! carries the cancel and shield bits the walk reads without locking. A task is cancelled when
 //! the walk from its innermost scope outward meets a cancelled scope before a shielded one; a
 //! shielded scope's own cancellation still counts. A [`CancelCache`] per task makes the common
-//! check one atomic load of the global cancel generation.
+//! check one atomic load of the global cancel generation. A task spawned into a scope holds a
+//! [`TaskScope`], through which the scope hears how the task ended ([`TaskEnd`]), exactly once.
 //!
 //! The loom models run with `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release scope`.
 
 mod check;
+mod child;
 mod node;
 mod sync;
 
@@ -20,6 +22,7 @@ mod tests;
 mod loom_tests;
 
 pub use check::CancelCache;
+pub use child::{TaskEnd, TaskScope};
 pub use node::{CancelReason, Cancellation, ScopeNode, ScopeState};
 
 /// A counted reference to a scope: what a task holds for the scopes it entered

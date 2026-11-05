@@ -12,7 +12,7 @@ pub struct Header {
     flags: u16,                  // PIN, PYTHON, DETACHED_DROP, ...; fixed at spawn
     vtable: &'static TaskVTable, // poll, drop, dealloc, schedule, type-name hooks
     id: u64,                     // monotonically increasing, never reused
-    scope: *const ScopeNode,     // spawning scope (strong ref held by body)
+    scope: Option<TaskScope>,    // spawning scope: one thin pointer, owns a counted ref
     queue_next: UnsafeCell<*const Header>, // intrusive run-queue link (injector)
     registry: RegistryNode,      // intrusive list for introspection (§23)
 }
@@ -21,6 +21,8 @@ pub struct Header {
 - **PyTask**: Header + PyTask body (§2). Its `poll` implementation performs **steps** (§4).
 
 The two 16-bit fields sit in the padding after `state`, so the header is 56 B on 64-bit targets (vtable first would pad it to 64 B).
+
+`scope` links the type-erased header to a `ScopeNode<E>`, which is generic over the failure type it collects. It is a thin pointer to the node, whose first field (`repr(C)`) is a `&'static` vtable for its `E`, so the header stays one word and a task outside any scope pays one null check. The pointer is a counted reference to the node, set at spawn (after `live_children` was incremented) and taken exactly once when the task ends: by the lane completing it (completed, cancelled or panicked), or by `dealloc` when the task is freed without completing (it was idle when its last reference went). Either way the scope hears of the end once, then the reference is released.
 
 Target (ADR-034): `size_of::<Header>() <= 64` including the registry node, `size_of::<PyTaskBody>() <= 192` including the embedded timer entry and wait node (excluding the Python coroutine).
 
@@ -77,7 +79,7 @@ Transitions (CAS loops) follow Tokio's `harness.rs` logic:
 - `wake`: if RUNNING, set NOTIFIED. Else if neither SCHEDULED nor COMPLETE, set SCHEDULED and push to a queue.
 - `poll start`: SCHEDULED→RUNNING (clear NOTIFIED).
 - `poll end Pending`: if NOTIFIED, reschedule (to the LIFO slot if the current lane is woken by itself, otherwise the local queue). Else clear RUNNING.
-- `poll end Ready`: set COMPLETE, clear RUNNING, wake joiners, notify scope. The future is dropped (on the lane, while still RUNNING) and the output stored before COMPLETE is set. If JOIN_INTEREST is clear at that point, the lane drops the output; a panic nobody joins is resumed on the lane. The scope hears of the completion through the scheduler (`Schedule::task_completed`), after the joiner is woken and before the run reference is released.
+- `poll end Ready`: set COMPLETE, clear RUNNING, wake joiners, notify scope. The future is dropped (on the lane, while still RUNNING) and the output stored before COMPLETE is set. If JOIN_INTEREST is clear at that point, the lane drops the output; a panic nobody joins is resumed on the lane. The task notifies its scope itself (decrement `live_children`, wake the `exit_waiter` at zero, record a failure and cancel the scope for C4), after the joiner is woken and before the scheduler hears of it (`Schedule::task_completed`) and the run reference is released. A task freed without completing notifies its scope from `dealloc`, after its future is dropped; it does not call `task_completed`.
 - `abort` (`JoinHandle::abort`): set CANCEL_REQ, then act as `wake`, so the task is polled once more and cancels. A poll in progress finishes first; if it returns `Ready`, the output wins.
 
 `loom` model tests MUST cover wake-during-poll, wake-after-complete, concurrent cancel+wake, and drop-of-last-waker.
