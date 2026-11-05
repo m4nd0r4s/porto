@@ -4,12 +4,12 @@
 #[cfg(all(loom, test))]
 pub(crate) use loom::cell::UnsafeCell;
 #[cfg(all(loom, test))]
-pub(crate) use loom::sync::atomic::AtomicU8;
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU8};
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::{Mutex, MutexGuard};
 
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::atomic::AtomicU8;
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU8};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::{Mutex, MutexGuard};
 
