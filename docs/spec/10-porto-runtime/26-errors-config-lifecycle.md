@@ -3,6 +3,7 @@
 ## 1. Configuration precedence
 explicit `porto.run(..., **overrides)` > `RuntimeConfig` object > env vars `PORTO_*` > defaults.
 Env parsing: ints, floats, bools (`1/0/true/false/yes/no`), and enums by lowercase name. Unknown `PORTO_*` vars produce a warning listing valid names (typo protection).
+A field left out of `RuntimeConfig(...)` reads its `PORTO_<FIELD>` variable when the config is created, so `RuntimeConfig()` is the environment over the defaults; an explicit field never reads (or fails on) its variable. `deterministic` has no variable; `PORTO_SEED` overrides its seed (§24). Optional fields (`slow_step_threshold`, `console`) take `none` for `None`. `"auto"` lanes follow the build (`Py_GIL_DISABLED`), not whether the GIL is enabled at run time (that is GIL-degraded mode, `12` §8).
 
 ## 2. Runtime lifecycle
 

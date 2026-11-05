@@ -18,6 +18,7 @@ use std::pin::pin;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
+use porto_core::config::RuntimeConfig;
 use porto_core::time::{Deadline, sleep_until};
 use porto_core::{Handle, ParkHook, Runtime};
 use pyo3::exceptions::PyBaseException;
@@ -48,12 +49,20 @@ struct LaneState {
     root: Option<Waker>,
 }
 
-/// Runs `body` with a fresh single-lane Python runtime, on this (attached) thread. The runtime
+/// Runs `body` with a fresh single-lane Python runtime configured by `config` (of which it uses
+/// `timer_resolution`), on this (attached) thread. The runtime
 /// is dropped before returning, still attached, so the tasks it frees release their Python
 /// objects directly. Tasks still waiting on a scope are freed after it (their coroutines are
 /// closed).
-pub(crate) fn run<T>(_attached: Python<'_>, body: impl FnOnce(&Runtime) -> T) -> T {
-    let runtime = Runtime::with_park_hook(DetachWhileParked);
+pub(crate) fn run<T>(
+    _attached: Python<'_>,
+    config: &RuntimeConfig,
+    body: impl FnOnce(&Runtime) -> T,
+) -> T {
+    let runtime = Runtime::builder()
+        .park_hook(DetachWhileParked)
+        .timer_resolution(config.timer_resolution())
+        .build();
     let output = {
         let _lane = OnPythonLane::enter();
         body(&runtime)

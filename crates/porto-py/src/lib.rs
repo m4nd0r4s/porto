@@ -35,6 +35,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     async_slots::install_am_send::<Trap>(py, driver::trap::trap_am_send)?;
     async_slots::install_am_send::<Ready>(py, driver::ready::ready_am_send)?;
     py_compat::names(py);
+    api::config::register(module)?;
     api::run::register(module)?;
     api::scope::register(module)?;
     api::time::register(module)?;

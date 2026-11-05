@@ -5,7 +5,8 @@
 //! [architecture overview](https://github.com/m4nd0r4s/porto/blob/main/docs/spec/10-porto-runtime/10-architecture-overview.md).
 //!
 //! M0 spike: the task core ([`task`]), a single-lane executor ([`sched`]) and its timers
-//! ([`time`]). M1 adds the wait queue the sync primitives build on ([`sync`]).
+//! ([`time`]). M1 adds the wait queue the sync primitives build on ([`sync`]) and the runtime
+//! configuration ([`config`]).
 //!
 //! ```
 //! let rt = porto_core::Runtime::new();
@@ -13,6 +14,7 @@
 //! assert_eq!(rt.block_on(task).unwrap(), 2);
 //! ```
 
+pub mod config;
 pub mod sched;
 pub mod scope;
 pub mod sync;
