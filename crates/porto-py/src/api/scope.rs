@@ -1,21 +1,22 @@
-//! `porto.scope()`, `Scope` and `Task`: the nursery (15-structured-concurrency-and-
-//! cancellation.md §1-§2, the parts without cancel delivery).
+//! `porto.scope()`, `Scope` and `Task`: the nursery and cancel scope (15-structured-concurrency-
+//! and-cancellation.md §1-§2).
 //!
-//! A scope is a node of porto-core's scope tree (`ScopeNode`), made when its block is entered.
-//! Its children are spawned into the node, which counts them (`live_children`) and records
-//! their failures, each of which cancels the scope with `ChildFailed` (C4, through
-//! `PyTask::take_failure`). `__aexit__` waits until no child is left (C5) on a `ScopeExit`
-//! trap, which files the owner's waker as the node's `exit_waiter`; the last child to end wakes
-//! it. The failures are raised at exit as a strict exception group, the body's exception first
-//! (ADR-009). Spawning into a closed scope raises (C7).
+//! A scope is a node of porto-core's scope tree (`ScopeNode`), made when its block is entered,
+//! nested in the entering task's innermost scope (a root for a task in none), and pushed on that
+//! task's cancel stack until its exit (`step::enter_cancel_scope`). Its children are spawned into
+//! the node, which counts them (`live_children`) and records their failures, each of which
+//! cancels the scope with `ChildFailed` (C4). `__aexit__` waits until no child is left (C5) on a
+//! `ScopeExit` trap, which files the owner's waker as the node's `exit_waiter`; the last child to
+//! end wakes it. The failures are raised at exit as a strict exception group, the body's
+//! exception first (ADR-009). Spawning into a closed scope raises (C7).
 //!
-//! Not yet: delivering the cancellation (porto-szb.36). A failing child cancels the scope, but
-//! its siblings and the body only stop once checkpoints raise `Cancelled`; until then they run
-//! to completion. Nor are deadlines and timeouts (C9), shields (C8), `start()` (§3),
-//! `Task.cancel()` and awaiting a task (§4), names, and spawning from other lanes or threads
-//! (C10). The node is a root for now, owned by no recorded task: linking it under the owner's
-//! innermost scope needs the running task's cancel stack, which cancel delivery makes
-//! reachable from Python calls (porto-szb.36).
+//! `Scope.cancel()` cancels the node, from any thread (C10): the tasks in it and in the scopes
+//! nested in it get `Cancelled` at their next checkpoint, and the waiting ones are woken
+//! (`step.rs`). A `Cancelled` the body lets out is absorbed at the exit when this scope itself
+//! is cancelled (C3, `cancelled_caught`); one from an enclosing scope goes on.
+//!
+//! Not yet: deadlines and timeouts (C9), shields (C8), names, `start()` (§3), `Task.cancel()` and
+//! awaiting a task (§4), and spawning from other lanes or threads (C10).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -24,16 +25,16 @@ use porto_core::scope::{CancelReason, ScopeNode};
 use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyList, PyTuple, PyType};
+use pyo3::types::{PyBool, PyList, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
 use super::run::coroutine_from;
 use crate::driver::lane;
 use crate::driver::pytask::{self, PyScopeRef, Spawned, TaskOutcome};
 use crate::driver::ready::Ready;
-use crate::driver::step::checkpoint_if_needed;
+use crate::driver::step::{self, checkpoint_if_needed};
 use crate::driver::trap::{Trap, TrapKind};
-use crate::errors::{InvalidStateError, NoRuntimeError};
+use crate::errors::{Cancelled, InvalidStateError, NoRuntimeError};
 
 /// Adds the classes and functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -48,6 +49,8 @@ fn scope() -> Scope {
     Scope {
         node: OnceLock::new(),
         closed: AtomicBool::new(false),
+        cancel_request: Mutex::new(None),
+        cancelled_caught: AtomicBool::new(false),
     }
 }
 
@@ -58,6 +61,17 @@ pub struct Scope {
     node: OnceLock<PyScopeRef>,
     /// Whether its `async with` block exited.
     closed: AtomicBool,
+    /// Set by the first `cancel()`, with its reason. Also how a cancel before the block is
+    /// entered reaches the node: `cancel` reads `node` under this lock, and `__aenter__` reads
+    /// the request under it after setting `node`, so one of them cancels the node.
+    cancel_request: Mutex<Option<CancelRequest>>,
+    /// Whether the exit absorbed a `Cancelled` this scope caused (C3).
+    cancelled_caught: AtomicBool,
+}
+
+/// A `Scope.cancel()` call.
+struct CancelRequest {
+    reason: Option<String>,
 }
 
 /// Where a scope is in its life.
@@ -126,14 +140,34 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         }
-        if slf.get().node.set(ScopeNode::new_root(0)).is_err() {
-            return Err(PyRuntimeError::new_err(
-                "porto: a scope can be entered only once; open a new one with \
-                 `async with porto.scope() as s:` for each block",
-            ));
+        let this = slf.get();
+        if this.node.get().is_some() {
+            return Err(entered_twice());
         }
-        // T2: entering completes synchronously.
-        checkpoint_if_needed(slf.py(), slf.clone().into_any().unbind())
+        // T2: entering completes synchronously. The checkpoint belongs to the enclosing scope
+        // (a cancellation there raises here, before this scope exists); the scope is entered
+        // as its effect.
+        let entered = checkpoint_if_needed(slf.py(), slf.clone().into_any().unbind())?;
+        let node = step::enter_cancel_scope(|parent, owner| match parent {
+            Some(parent) => ScopeNode::new_child(parent, owner, false),
+            None => ScopeNode::new_root(owner),
+        })?
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "porto: a scope must be entered by a porto task, inside its coroutine: \
+                 `async with porto.scope() as s:` in code that porto.run() runs",
+            )
+        })?;
+        if this.node.set(node.clone()).is_err() {
+            // Another task entered it at the same time.
+            step::exit_cancel_scope(&node);
+            return Err(entered_twice());
+        }
+        if this.lock_cancel_request().is_some() {
+            // Cancelled before it was entered.
+            node.cancel(CancelReason::Explicit);
+        }
+        Ok(entered)
     }
 
     #[pyo3(signature = (_exc_type, exc, _traceback, /))]
@@ -144,22 +178,74 @@ impl Scope {
         _traceback: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
+        let this = slf.get();
         // The owner is being closed (its runtime is shutting down): it cannot wait any more, its
         // children are dropped with the runtime, and `GeneratorExit` must go through, so the
-        // exit must not yield (no checkpoint).
+        // exit must not yield (no checkpoint). The coroutine may be closed outside its task's
+        // poll, where there is no cancel stack to pop: it goes with the task.
         if exc.is_instance_of::<PyGeneratorExit>() {
-            let errors = slf.get().close();
+            if let Some(node) = this.node.get() {
+                step::exit_cancel_scope(node);
+            }
+            let errors = this.close();
             drop(errors);
             return Ok(Bound::new(py, Ready::new(py.None()))?.into_any());
         }
-        if slf.get().live_children() == 0 {
-            slf.get().finish(exc)?;
+        // The exit runs outside the scope: waiting for the children (C5) is not cancelled by
+        // it, and its checkpoint belongs to the enclosing scope.
+        if let Some(node) = this.node.get()
+            && !step::exit_cancel_scope(node)
+        {
+            return Err(PyRuntimeError::new_err(
+                "porto: a scope must be exited by the task that entered it, innermost first; \
+                 use `async with porto.scope() as s:` and do not call __aexit__ yourself",
+            ));
+        }
+        if this.live_children() == 0 {
+            let absorbed = this.finish(exc)?;
+            if !exc.is_none() {
+                // The block raised: no checkpoint, so nothing replaces its exception.
+                let absorbed = PyBool::new(py, absorbed).to_owned().into_any().unbind();
+                return Ok(Bound::new(py, Ready::new(absorbed))?.into_any());
+            }
             // T2: no child to wait for, so the exit completes synchronously.
             return Ok(checkpoint_if_needed(py, py.None())?.into_bound(py));
         }
         FINISH_SCOPE
             .import(py, "porto._bridge", "finish_scope")?
             .call1((slf, exc))
+    }
+
+    /// Cancels the scope: every task in it, and in the scopes nested in it, gets
+    /// `porto.Cancelled` at its next checkpoint, and the waiting ones are woken (C1, C10).
+    /// Safe from any thread. Cancelling again, or a closed scope, does nothing.
+    #[pyo3(signature = (reason = None))]
+    fn cancel(&self, reason: Option<String>) {
+        let node = {
+            let mut request = self.lock_cancel_request();
+            if request.is_none() {
+                *request = Some(CancelRequest { reason });
+            }
+            self.node.get().cloned()
+        };
+        if let Some(node) = node {
+            node.cancel(CancelReason::Explicit);
+        }
+    }
+
+    /// Whether the scope was cancelled: `cancel()` was called, or a child failed (C4).
+    #[getter]
+    fn cancel_called(&self) -> bool {
+        self.node
+            .get()
+            .is_some_and(|node| node.cancel_called().is_some())
+            || self.lock_cancel_request().is_some()
+    }
+
+    /// Whether the exit absorbed a `Cancelled` this scope's cancellation raised (C3).
+    #[getter]
+    fn cancelled_caught(&self) -> bool {
+        self.cancelled_caught.load(Ordering::Acquire)
     }
 
     /// While children run: a `ScopeExit` trap to await, which resumes the awaiting task once
@@ -173,9 +259,10 @@ impl Scope {
     }
 
     /// Closes the scope; raises the children's failures, after `exc` (the body's exception, or
-    /// `None`), as an exception group.
+    /// `None`), as an exception group. Returns whether `exc` is a `Cancelled` the scope
+    /// absorbs (the `__aexit__` result).
     #[pyo3(signature = (exc, /))]
-    fn _finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn _finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         self.finish(exc)
     }
 
@@ -188,13 +275,18 @@ impl Scope {
         let Some(node) = self.node.get() else {
             return format!("<porto.Scope {phase}>");
         };
-        let cancelled = match node.cancel_called() {
-            None => "",
-            Some(CancelReason::Explicit) => ", cancelled",
-            Some(CancelReason::Deadline) => ", cancelled: deadline",
-            Some(CancelReason::Parent) => ", cancelled: parent",
-            Some(CancelReason::ChildFailed) => ", cancelled: a child failed",
-            Some(CancelReason::Shutdown) => ", cancelled: shutdown",
+        let reason = self
+            .lock_cancel_request()
+            .as_ref()
+            .and_then(|request| request.reason.clone());
+        let cancelled = match (node.cancel_called(), reason) {
+            (None, _) => String::new(),
+            (Some(CancelReason::Explicit), Some(reason)) => format!(", cancelled: {reason:?}"),
+            (Some(CancelReason::Explicit), None) => ", cancelled".to_owned(),
+            (Some(CancelReason::Deadline), _) => ", cancelled: deadline".to_owned(),
+            (Some(CancelReason::Parent), _) => ", cancelled: parent".to_owned(),
+            (Some(CancelReason::ChildFailed), _) => ", cancelled: a child failed".to_owned(),
+            (Some(CancelReason::Shutdown), _) => ", cancelled: shutdown".to_owned(),
         };
         let state = node.lock_state();
         let exit = if state.exit_waiter.is_some() {
@@ -220,6 +312,12 @@ impl Scope {
         }
     }
 
+    fn lock_cancel_request(&self) -> MutexGuard<'_, Option<CancelRequest>> {
+        self.cancel_request
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Children spawned and not ended.
     fn live_children(&self) -> u32 {
         self.node
@@ -237,14 +335,25 @@ impl Scope {
         std::mem::take(&mut node.lock_state().errors)
     }
 
-    fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// Closes the scope and raises the children's failures, after `exc` unless the scope
+    /// absorbs it. Returns whether it absorbs `exc`: a `Cancelled` while this scope itself is
+    /// cancelled (C3; one from an enclosing scope's cancellation goes on).
+    fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         let py = exc.py();
+        let absorbed = exc.is_instance_of::<Cancelled>()
+            && self
+                .node
+                .get()
+                .is_some_and(|node| node.cancel_called().is_some());
+        if absorbed {
+            self.cancelled_caught.store(true, Ordering::Release);
+        }
         let errors = self.close();
         if errors.is_empty() {
-            return Ok(());
+            return Ok(absorbed);
         }
         let exceptions = PyList::empty(py);
-        if !exc.is_none() {
+        if !exc.is_none() && !absorbed {
             exceptions.append(exc)?;
         }
         for error in errors {
@@ -315,7 +424,7 @@ impl Task {
             None => "<porto.Task running>",
             Some(TaskOutcome::Ok(_)) => "<porto.Task returned>",
             Some(TaskOutcome::Err(_)) => "<porto.Task raised>",
-            Some(TaskOutcome::Cancelled) => "<porto.Task cancelled>",
+            Some(TaskOutcome::Cancelled(_)) => "<porto.Task cancelled>",
         }
     }
 
@@ -328,8 +437,10 @@ impl Task {
         };
         match &*outcome {
             Some(TaskOutcome::Ok(value)) => visit.call(value),
-            Some(TaskOutcome::Err(exception)) => visit.call(exception),
-            Some(TaskOutcome::Cancelled) | None => Ok(()),
+            Some(TaskOutcome::Err(exception) | TaskOutcome::Cancelled(Some(exception))) => {
+                visit.call(exception)
+            }
+            Some(TaskOutcome::Cancelled(None)) | None => Ok(()),
         }
     }
 
@@ -337,4 +448,11 @@ impl Task {
         let outcome = self.lock().take();
         drop(outcome);
     }
+}
+
+fn entered_twice() -> PyErr {
+    PyRuntimeError::new_err(
+        "porto: a scope can be entered only once; open a new one with \
+         `async with porto.scope() as s:` for each block",
+    )
 }

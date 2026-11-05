@@ -8,12 +8,13 @@ from porto._core import Scope
 _T = TypeVar("_T")
 
 
-async def finish_scope(scope: Scope, exc: BaseException | None) -> None:
+async def finish_scope(scope: Scope, exc: BaseException | None) -> bool:
     """The waiting part of ``Scope.__aexit__``: waits on ``ScopeExit`` traps until no child
-    runs, then closes the scope (raising the children's failures)."""
+    runs, then closes the scope (raising the children's failures). Returns whether the scope
+    absorbs ``exc`` (a ``Cancelled`` it caused)."""
     while (trap := scope._wait_trap()) is not None:  # pyright: ignore[reportPrivateUsage]
         await trap
-    scope._finish(exc)  # pyright: ignore[reportPrivateUsage]
+    return scope._finish(exc)  # pyright: ignore[reportPrivateUsage]
 
 
 async def await_awaitable(awaitable: Awaitable[_T]) -> _T:

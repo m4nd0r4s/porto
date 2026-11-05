@@ -24,14 +24,17 @@ async def total() -> int:
 
 
 async def main(hosts: list[str]) -> list[bytes]:
+    # The exit may absorb a `Cancelled` (`__aexit__` returns a bool), so names bound in the
+    # block are possibly unbound after it.
+    from_function: list[porto.Task[bytes]] = []
     async with porto.scope() as s:
         assert_type(s, porto.Scope)
         from_function = [s.spawn(fetch, host, 443) for host in hosts]
         from_coroutine = s.spawn(total())
         assert_type(from_function[0], porto.Task[bytes])
         assert_type(from_coroutine, porto.Task[int])
-    assert_type(from_coroutine.result(), int)
-    assert_type(from_coroutine.done(), bool)
+        assert_type(from_coroutine.done(), bool)
+    assert_type(s.cancelled_caught, bool)
     return [task.result() for task in from_function]
 
 

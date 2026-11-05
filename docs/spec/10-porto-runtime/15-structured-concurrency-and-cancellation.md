@@ -33,6 +33,7 @@ struct ScopeState {
     child_scopes: IntrusiveList<ScopeNode>, // nested scopes (for propagation)
     errors: Vec<PyObj>,                   // failures collected (ExceptionGroup at exit)
     exit_waiter: Option<Waker>,           // owner waiting in ScopeExit
+    waiters: HashMap<TaskKey, Waker>,     // tasks in a cancellable wait, innermost scope here (C10)
 }
 ```
 
@@ -41,7 +42,7 @@ A task is **effectively cancelled** if walking from its innermost entered scope 
 
 Tasks spawned into scope S start with S as their base scope. The walk continues through S's ancestors.
 
-Optimization: each task caches `(scope_id, cancel_epoch_snapshot)` and the walk's result. The cache compares scope ids, not pointers, because a freed scope's address can be reused by a new one. The global `cancel_generation: AtomicU64` is bumped on any cancel or shield change. A cancel bumps the `cancel_epoch` of the scope and of every descendant its cancellation reaches, stopping at shielded scopes. Changing a shield does the same from that scope. The check costs one atomic load when the generation is unchanged. When it moved, the check compares the scope's epoch with the snapshot, and the walk runs only if the epoch changed too.
+Optimization: each task caches `(scope_id, cancel_epoch_snapshot)` and the walk's result. A PyTask keeps the cache for the duration of a poll (its body has no room for it across polls), so its first check of a poll walks. The cache compares scope ids, not pointers, because a freed scope's address can be reused by a new one. The global `cancel_generation: AtomicU64` is bumped on any cancel or shield change. A cancel bumps the `cancel_epoch` of the scope and of every descendant its cancellation reaches, stopping at shielded scopes. Changing a shield does the same from that scope. The check costs one atomic load when the generation is unchanged. When it moved, the check compares the scope's epoch with the snapshot, and the walk runs only if the epoch changed too.
 
 ## 2. Semantics (normative)
 
@@ -60,7 +61,7 @@ Optimization: each task caches `(scope_id, cancel_epoch_snapshot)` and the walk'
   ```
   A scope used with sync `with` cannot `spawn`; calling it raises `RuntimeError`.
 - **C9 Deadlines nest:** the effective deadline is the min over unshielded ancestors. Setting `scope.deadline` later re-arms the timer.
-- **C10 Cross-lane:** scopes span lanes. `cancel()` from any lane or thread is safe. It bumps the epoch, then wakes every waiting task in the subtree whose pending trap is cancellable. Wakes are delivered to owning lanes via inbox.
+- **C10 Cross-lane:** scopes span lanes. `cancel()` from any lane or thread is safe. It bumps the epoch, then wakes every waiting task in the subtree whose pending trap is cancellable (the `waiters` of each scope the cancel reaches, collected under the locks and woken after them). Wakes are delivered to owning lanes via inbox.
 - **C11 Cancelled type:** `porto.Cancelled(asyncio.CancelledError)`. Users MUST NOT swallow it. The debug mode warns when a task finishes normally after having been delivered `Cancelled` inside an effectively-cancelled scope ("cancellation was swallowed").
 - **C12 Unhandled errors in the root scope:** if `main` raises, `porto.run` re-raises after shutdown. Background tasks in the root scope that fail cancel `main` (the root scope is a nursery).
 

@@ -333,3 +333,100 @@ fn tasks_spawned_into_a_scope_on_a_runtime_end_in_it() {
     assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
     assert_eq!(Arc::strong_count(&scope), 1);
 }
+
+mod waiters {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    use super::*;
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counting_waker() -> (Arc<CountWakes>, Waker) {
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        (wakes.clone(), Waker::from(wakes))
+    }
+
+    fn wakes(counter: &CountWakes) -> usize {
+        counter.0.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_cancel_wakes_the_waiters_of_its_subtree_but_not_of_a_shielded_one() {
+        let root = Scope::new_root(0);
+        let inner = child(&root);
+        let shield = shielded(&root);
+        let (in_root, root_waker) = counting_waker();
+        let (in_inner, inner_waker) = counting_waker();
+        let (in_shield, shield_waker) = counting_waker();
+        assert!(!root.register_waiter(1, &root_waker));
+        assert!(!inner.register_waiter(2, &inner_waker));
+        assert!(!shield.register_waiter(3, &shield_waker));
+
+        assert!(root.cancel(CancelReason::Explicit));
+        assert_eq!(wakes(&in_root), 1);
+        assert_eq!(wakes(&in_inner), 1);
+        assert_eq!(wakes(&in_shield), 0, "the shield stops the cancel");
+        // The registrations stay until the waits end: the scope holds the wakers till then.
+        assert_eq!(inner.lock_state().waiter_count(), 1);
+        root.unregister_waiter(1);
+        inner.unregister_waiter(2);
+        shield.unregister_waiter(3);
+        drop(root_waker);
+        assert_eq!(
+            Arc::strong_count(&in_root),
+            1,
+            "the scope dropped its clone"
+        );
+
+        assert!(!root.cancel(CancelReason::Explicit), "cancelled already");
+        assert_eq!(wakes(&in_root), 1);
+    }
+
+    #[test]
+    fn registering_in_a_cancelled_scope_says_so() {
+        let root = Scope::new_root(0);
+        let inner = child(&root);
+        root.cancel(CancelReason::Shutdown);
+        let (_, waker) = counting_waker();
+        assert!(inner.register_waiter(1, &waker));
+        inner.unregister_waiter(1);
+        // Unregistering a key that is not filed does nothing.
+        inner.unregister_waiter(1);
+    }
+
+    #[test]
+    fn unshielding_wakes_the_waiters_an_outer_cancel_now_reaches() {
+        let root = Scope::new_root(0);
+        let shield = shielded(&root);
+        let (counter, waker) = counting_waker();
+        assert!(!shield.register_waiter(1, &waker));
+        root.cancel(CancelReason::Explicit);
+        assert_eq!(wakes(&counter), 0);
+        shield.set_shield(false);
+        assert_eq!(wakes(&counter), 1);
+        shield.set_shield(true);
+        assert_eq!(wakes(&counter), 1, "shielding cancels nobody");
+        shield.unregister_waiter(1);
+    }
+
+    #[test]
+    fn a_cancel_from_another_thread_wakes_the_waiter() {
+        let root = Scope::new_root(0);
+        let (counter, waker) = counting_waker();
+        assert!(!root.register_waiter(1, &waker));
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || root.cancel(CancelReason::Explicit))
+        };
+        assert!(canceller.join().unwrap());
+        assert_eq!(wakes(&counter), 1);
+        root.unregister_waiter(1);
+    }
+}

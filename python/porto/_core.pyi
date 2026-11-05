@@ -77,8 +77,12 @@ class Scope:
     """A nursery: every task spawned into it finishes before its ``async with`` block exits.
 
     If children raised, the exit raises them in an ``ExceptionGroup`` (``BaseExceptionGroup`` if
-    one is not an ``Exception``), after the body's exception if the body raised. M0 scopes have
-    no cancellation: a failing child does not stop its siblings.
+    one is not an ``Exception``), after the body's exception if the body raised. A failing child
+    cancels the scope, which stops its siblings and the body.
+
+    It is also a cancel scope: once cancelled, every task in it (and in the scopes nested in it)
+    gets ``porto.Cancelled`` at each of its awaits, until it leaves the scope. A ``Cancelled``
+    the block lets out is absorbed at the exit when this scope was cancelled.
     """
 
     def spawn(
@@ -91,6 +95,21 @@ class Scope:
         async function called with ``args``. Raises ``RuntimeError`` outside the block
         (``porto.NoRuntimeError`` outside ``porto.run``)."""
 
+    def cancel(self, reason: str | None = None) -> None:
+        """Cancels the scope: every task in it, and in the scopes nested in it, gets
+        ``porto.Cancelled`` at its next await; waiting tasks are woken. Safe from any thread;
+        cancelling again does nothing. Cancelling before the block is entered cancels it as it
+        is entered."""
+
+    @property
+    def cancel_called(self) -> bool:
+        """Whether the scope was cancelled: ``cancel()`` was called, or a child failed."""
+
+    @property
+    def cancelled_caught(self) -> bool:
+        """Whether the exit absorbed a ``porto.Cancelled`` raised by this scope's
+        cancellation."""
+
     async def __aenter__(self) -> Self: ...
     async def __aexit__(
         self,
@@ -98,9 +117,9 @@ class Scope:
         exc: BaseException | None,
         traceback: TracebackType | None,
         /,
-    ) -> None: ...
+    ) -> bool: ...
     def _wait_trap(self) -> _Trap | None: ...
-    def _finish(self, exc: BaseException | None, /) -> None: ...
+    def _finish(self, exc: BaseException | None, /) -> bool: ...
 
 @final
 class Task(Generic[_T_co]):
@@ -110,8 +129,9 @@ class Task(Generic[_T_co]):
         """Whether the task finished (returned or raised)."""
 
     def result(self) -> _T_co:
-        """What the task returned, or raises what it raised; ``porto.InvalidStateError`` if it
-        has not finished yet, ``porto.RuntimeClosed`` if its runtime shut down first."""
+        """What the task returned, or raises what it raised (``porto.Cancelled`` if it was
+        cancelled); ``porto.InvalidStateError`` if it has not finished yet,
+        ``porto.RuntimeClosed`` if its runtime shut down first."""
 
 # Synchronization (16-sync-primitives-and-channels.md §1)
 
@@ -438,11 +458,20 @@ def _raise_rust_panic(message: str, /) -> NoReturn:
 
 @final
 class _WaitProbe:
-    """Test hook: a bare wait queue. ``wait()`` is a ``Notified`` trap on it."""
+    """Test hook: a wait queue with permits. ``wait()`` is a ``Notified`` trap on it."""
 
     def __init__(self) -> None: ...
     def wait(self) -> _Trap:
-        """A trap that waits until a notify grants the awaiting task's wait node."""
+        """A trap that takes a stored permit, or waits until a notify grants the awaiting task's
+        wait node."""
+
+    def release(self) -> None:
+        """Grants the longest waiting task, or stores a permit if none waits (a lock's
+        release)."""
+
+    @property
+    def permits(self) -> int:
+        """The permits stored for the next waits."""
 
     def notify_all(self) -> int:
         """Wakes every task waiting now; returns how many."""
@@ -488,4 +517,5 @@ def _current_task_token() -> _TaskToken:
 
 def _interrupt(token: _TaskToken, exception: BaseException, /) -> None:
     """Test hook: throws ``exception`` into the task at the await it waits in, giving its wait
-    up first (T3), or at its next wait that is not over at once."""
+    up first (T3), or at its next wait that is not over at once. Also for waits a cancellation
+    does not give up (``ScopeExit``)."""

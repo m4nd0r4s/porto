@@ -1,5 +1,6 @@
 //! The scope tree: [`ScopeNode`], its lock-protected [`ScopeState`], and cancellation.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomPinned;
 use std::ptr;
@@ -94,6 +95,10 @@ pub struct ScopeState<E> {
     pub exit_waiter: Option<Waker>,
     /// Nested scopes, for propagating a cancel down the tree.
     child_scopes: ChildList<E>,
+    /// The tasks whose innermost scope this is and that wait in a cancellable wait, by task
+    /// key: a cancel that reaches this scope wakes them (C10). See
+    /// [`ScopeNode::register_waiter`].
+    waiters: HashMap<usize, Waker>,
 }
 
 /// An intrusive list of child scopes: the head here, the links in each child.
@@ -141,6 +146,11 @@ impl<E> ScopeState<E> {
     pub(super) fn child_scopes_is_empty(&self) -> bool {
         self.child_scopes.head.is_null()
     }
+
+    /// How many tasks are registered as waiting in this scope.
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.len()
+    }
 }
 
 impl<E: Send + 'static> ScopeNode<E> {
@@ -187,6 +197,7 @@ impl<E: Send + 'static> ScopeNode<E> {
                 errors: Vec::new(),
                 exit_waiter: None,
                 child_scopes: ChildList { head: ptr::null() },
+                waiters: HashMap::new(),
             }),
             _not_unique: PhantomPinned,
         }
@@ -236,51 +247,91 @@ impl<E> ScopeNode<E> {
 
     /// Cancels the scope. Returns `false`, and changes nothing, if it was already cancelled.
     ///
-    /// Safe from any thread. Every task whose walk now reaches this scope sees itself cancelled
-    /// at its next check; waking the ones that are parked is the caller's job.
+    /// Safe from any thread (C10). Every task whose walk now reaches this scope sees itself
+    /// cancelled at its next check, and the waiters registered in the subtree the cancel
+    /// reaches ([`ScopeNode::register_waiter`]) are woken, after every lock is released.
     pub fn cancel(&self, reason: CancelReason) -> bool {
+        let mut wake = Vec::new();
         let state = self.lock_state();
         let status = self.status.load(Ordering::Relaxed);
         if status & REASON_MASK != 0 {
             return false;
         }
         self.status.store(status | reason as u8, Ordering::Release);
-        self.bump_subtree(&state);
+        self.bump_subtree(&state, Some(&mut wake));
         drop(state);
         CANCEL_GENERATION.fetch_add(1, Ordering::Release);
+        wake_all(wake);
         true
     }
 
-    /// Shields the scope from its ancestors' cancellation, or stops shielding it.
+    /// Shields the scope from its ancestors' cancellation, or stops shielding it. Unshielding
+    /// wakes the waiters of the subtree, which may be cancelled now.
     pub fn set_shield(&self, shield: bool) {
+        let mut wake = Vec::new();
         let state = self.lock_state();
         let status = self.status.load(Ordering::Relaxed);
         if (status & SHIELD != 0) == shield {
             return;
         }
         self.status.store(status ^ SHIELD, Ordering::Release);
-        self.bump_subtree(&state);
+        self.bump_subtree(&state, (!shield).then_some(&mut wake));
         drop(state);
         CANCEL_GENERATION.fetch_add(1, Ordering::Release);
+        wake_all(wake);
     }
 
     /// Bumps the epoch of this scope and of every descendant its cancellation reaches: the walk
-    /// stops at a shielded child, so its subtree is left alone. `state` is this scope's state,
-    /// locked; the children's locks are taken under it (parent before child, the tree's order).
-    fn bump_subtree(&self, state: &ScopeState<E>) {
+    /// stops at a shielded child, so its subtree is left alone. Collects the wakers of their
+    /// waiters into `wake`, if given. `state` is this scope's state, locked; the children's
+    /// locks are taken under it (parent before child, the tree's order).
+    fn bump_subtree(&self, state: &ScopeState<E>, mut wake: Option<&mut Vec<Waker>>) {
         self.cancel_epoch.fetch_add(1, Ordering::Release);
+        if let Some(wake) = wake.as_deref_mut() {
+            wake.extend(state.waiters.values().cloned());
+        }
         let mut child = state.child_scopes.head;
         // SAFETY: this scope's lock is held, so no child can unlink itself (it takes that lock
         // first) and every linked child stays alive while we use it.
         while let Some(node) = unsafe { child.as_ref() } {
             let child_state = node.lock_state();
             if !node.is_shielded() {
-                node.bump_subtree(&child_state);
+                node.bump_subtree(&child_state, wake.as_deref_mut());
             }
             drop(child_state);
             // SAFETY: still under this scope's lock, which guards the child's links.
             child = unsafe { node.siblings.with(|links| (*links).next) };
         }
+    }
+
+    /// Files `waker` as the waker of the task keyed `key` (any value unique among live tasks,
+    /// such as its header's address), which waits in a cancellable wait and whose innermost
+    /// scope this is: a cancel that reaches this scope wakes it (C10). A later registration of
+    /// the same key replaces it. Unregister it when the wait ends
+    /// ([`ScopeNode::unregister_waiter`]): the scope holds the waker until then.
+    ///
+    /// Returns whether the scope is effectively cancelled, walked after the waker is filed, so
+    /// a cancel that raced with the registration is never missed: either it found the waker,
+    /// or the walk sees it. The check MUST NOT use a [`super::CancelCache`], whose generation
+    /// the cancel bumps only after it woke nobody here.
+    pub fn register_waiter(&self, key: usize, waker: &Waker) -> bool {
+        let mut state = self.lock_state();
+        let stale = match state.waiters.get(&key) {
+            Some(filed) if filed.will_wake(waker) => None,
+            _ => state.waiters.insert(key, waker.clone()),
+        };
+        drop(state);
+        // Dropped after the unlock: dropping a waker can free its task, which locks the scope.
+        drop(stale);
+        self.effective_cancellation().is_some()
+    }
+
+    /// Forgets the waker [`ScopeNode::register_waiter`] filed under `key`, if any.
+    pub fn unregister_waiter(&self, key: usize) {
+        let mut state = self.lock_state();
+        let filed = state.waiters.remove(&key);
+        drop(state);
+        drop(filed);
     }
 
     /// The effective-cancellation walk (§1.2): from this scope outward, the first scope that is
@@ -303,11 +354,23 @@ impl<E> ScopeNode<E> {
     }
 }
 
+/// Wakes `wakers` by value: a by-value wake always writes the task's state word, so the poll
+/// it causes sees what the waker wrote before it (the cancel bits, spec 11 §3.1).
+fn wake_all(wakers: Vec<Waker>) {
+    for waker in wakers {
+        waker.wake();
+    }
+}
+
 impl<E> Drop for ScopeNode<E> {
     fn drop(&mut self) {
         debug_assert!(
             self.lock_state().child_scopes.head.is_null(),
             "a child scope outlived its parent, but children hold their parent alive"
+        );
+        debug_assert!(
+            self.lock_state().waiters.is_empty(),
+            "a waiter outlived its scope, but waiting tasks hold their scope alive"
         );
         let Some(parent) = &self.parent else {
             return;

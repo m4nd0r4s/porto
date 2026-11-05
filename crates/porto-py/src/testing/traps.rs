@@ -1,12 +1,14 @@
 //! Test hooks for the trap kinds that no public API makes yet (11-task-model §5.2, §5.3):
 //!
-//! - `_WaitProbe`: a bare wait queue; `probe.wait()` is a `Notified` trap on it;
+//! - `_WaitProbe`: a wait queue with permits, like a semaphore's; `probe.wait()` is a
+//!   `Notified` trap on it that takes a permit if one is stored;
 //! - `_spawn_joinable(coro, context=None)` spawns a task and returns a `_JoinTarget`, whose
 //!   `join()` is a `Join` trap (the Python `Task` gets `await` with porto-szb.8) and whose
 //!   `steps` counts the coroutine resumes (the step loop's round trips are tested with it);
 //! - `_checkpoint_if_needed(value)`: what a synchronous completion returns (T2);
 //! - `_current_task_token()` and `_interrupt(token, exc)`: throw `exc` into a waiting task,
-//!   which gives its wait up first (T3), as cancellation will (porto-szb.36).
+//!   which gives its wait up first (T3), as a scope's cancellation does with `Cancelled`; the
+//!   trap-rule tests throw other exceptions with it.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,13 +36,18 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(interrupt, module)?)
 }
 
-/// The probe's queue state: nothing to acquire, every wait waits for a notify.
-struct ProbeState;
+/// The probe's queue state: the permits stored by `release` while nobody waited.
+struct ProbeState {
+    permits: usize,
+}
 
 impl WaitState for ProbeState {
-    /// A `notify_one` grant whose waiter gave up: the next waiter gets it (T3: not lost).
+    /// A grant whose waiter gave up: the next waiter gets it, or it is stored as a permit if
+    /// nobody waits (T3: not lost).
     fn pass_grant(waiters: &mut Locked<'_, Self>, _token: usize) {
-        waiters.grant_front();
+        if !waiters.grant_front() {
+            waiters.permits += 1;
+        }
     }
 }
 
@@ -50,7 +57,13 @@ struct ProbeQueue(WaitQueue<ProbeState>);
 unsafe impl WaitSource for ProbeQueue {
     unsafe fn poll_wait(&self, node: Pin<&WaitNode>, cx: &mut Context<'_>) -> Poll<()> {
         // SAFETY: the caller's contract is `WaitQueue::poll_wait`'s.
-        unsafe { self.0.poll_wait(node, cx, |_| false) }
+        unsafe {
+            self.0.poll_wait(node, cx, |state| {
+                let available = state.permits > 0;
+                state.permits -= usize::from(available);
+                available
+            })
+        }
     }
 
     unsafe fn cancel(&self, node: Pin<&WaitNode>) {
@@ -70,11 +83,12 @@ impl WaitProbe {
     #[new]
     fn new() -> Self {
         Self {
-            queue: Waitable::new(ProbeQueue(WaitQueue::new(ProbeState))),
+            queue: Waitable::new(ProbeQueue(WaitQueue::new(ProbeState { permits: 0 }))),
         }
     }
 
-    /// A `Notified` trap: the awaiting task waits until a notify grants its wait node.
+    /// A `Notified` trap: the awaiting task takes a stored permit, or waits until a notify
+    /// grants its wait node.
     fn wait(&self) -> Trap {
         Trap::new(TrapKind::Notified(self.queue.target()))
     }
@@ -87,6 +101,21 @@ impl WaitProbe {
     /// Grants the longest waiting task; returns whether one was waiting.
     fn notify_one(&self) -> bool {
         self.queue.0.lock().grant_front()
+    }
+
+    /// Grants the longest waiting task, or stores a permit for the next wait if none waits
+    /// (a lock's release).
+    fn release(&self) {
+        let mut waiters = self.queue.0.lock();
+        if !waiters.grant_front() {
+            waiters.permits += 1;
+        }
+    }
+
+    /// The permits stored for the next waits.
+    #[getter]
+    fn permits(&self) -> usize {
+        self.queue.0.lock().permits
     }
 
     /// How many tasks are queued (their wait node is linked).

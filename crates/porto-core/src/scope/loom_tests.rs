@@ -141,3 +141,37 @@ fn a_failing_child_cancels_before_the_owner_can_exit() {
         assert_eq!(seen, Some(CancelReason::ChildFailed));
     });
 }
+
+/// A task registers as a waiter of a nested scope while another thread cancels the root
+/// (C10): either the cancel wakes it, or its registration sees the cancel. Never neither, which
+/// would leave it waiting forever.
+#[test]
+fn register_waiter_vs_cancel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let scope = ScopeNode::new_child(&root, 1, false);
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || assert!(root.cancel(CancelReason::Explicit)))
+        };
+
+        let wakes = std::sync::Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&wakes));
+        let saw_cancel = scope.register_waiter(1, &waker);
+
+        canceller.join().unwrap();
+        assert!(saw_cancel || wakes.0.load(Ordering::SeqCst) == 1);
+        scope.unregister_waiter(1);
+    });
+}

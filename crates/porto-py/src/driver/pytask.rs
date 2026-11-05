@@ -17,7 +17,7 @@
 //!   once it finished (the two never coexist);
 //! - `pending_payload` holds the [`Pending`](super::pending::Pending) payload (`pending.rs`):
 //!   one word, for every kind;
-//! - the cancel stack is its innermost scope plus a depth, see [`PyTask::cancel_scopes`].
+//! - the cancel stack is its innermost scope plus a depth, see [`CancelStack`].
 
 use std::any::Any;
 use std::future::Future;
@@ -38,11 +38,60 @@ use pyo3::prelude::*;
 use super::pending::{Kind, Payload};
 use super::{lane, step};
 use crate::api::scope::Task;
-use crate::errors::{Cancelled, RuntimeClosed};
+use crate::errors::RuntimeClosed;
 use crate::py_compat::take_exception;
 
 /// The scope type of the cancel stack: scopes collect Python exceptions.
 pub(crate) type PyScopeRef = ScopeRef<Py<PyBaseException>>;
+/// A scope of the cancel stack, borrowed.
+pub(crate) type PyScopeNode = ScopeNode<Py<PyBaseException>>;
+
+/// The scopes a task entered, innermost first (spec 11 §2, `cancel_stack`).
+///
+/// Scopes a task enters nest (each one's parent is the scope the task was in when it entered
+/// it), so the stack is the innermost one and its first `depth - 1` ancestors: one pointer
+/// instead of a `SmallVec<[ScopeRef; 2]>` (24 bytes, and an allocation past two). Below them
+/// is the base scope (depth 0): the scope the task was spawned into, which it never exits.
+#[derive(Default)]
+pub(crate) struct CancelStack {
+    innermost: Option<PyScopeRef>,
+    depth: u8,
+}
+
+impl CancelStack {
+    /// The innermost scope, where the effective-cancellation walk starts.
+    pub(crate) fn innermost(&self) -> Option<&PyScopeRef> {
+        self.innermost.as_ref()
+    }
+
+    /// Records that the task entered `scope`, whose parent MUST be the innermost scope.
+    pub(crate) fn enter(&mut self, scope: PyScopeRef) -> PyResult<()> {
+        if self.depth == u8::MAX {
+            return Err(PyRuntimeError::new_err(
+                "porto: more than 255 cancel scopes nested in one task; flatten the nesting \
+                 or move part of the work into a child task",
+            ));
+        }
+        self.innermost = Some(scope);
+        self.depth += 1;
+        Ok(())
+    }
+
+    /// Records that the task exited `scope`: its parent is the innermost one again (the base
+    /// scope once it exited every scope it entered). Returns `false`, changing nothing, if
+    /// `scope` is not its innermost entered one (scopes exit in the reverse order they were
+    /// entered).
+    pub(crate) fn exit(&mut self, scope: &PyScopeNode) -> bool {
+        let Some(innermost) = self.innermost.take_if(|innermost| {
+            self.depth > 0 && std::ptr::eq(std::ptr::from_ref(&**innermost), scope)
+        }) else {
+            return false;
+        };
+        self.depth -= 1;
+        self.innermost = innermost.parent().cloned();
+        true
+    }
+}
 
 /// The body of a Python task.
 pub(crate) struct PyTask {
@@ -57,7 +106,7 @@ pub(crate) struct PyTask {
     /// by `wait.rs`.
     pub(super) pending_payload: Payload,
     /// The innermost scope the task is in: the last one it entered, else the scope it was
-    /// spawned into, its base scope (spec 15 §1.2). See [`PyTask::cancel_scopes`].
+    /// spawned into, its base scope (spec 15 §1.2). See [`CancelStack`].
     cancel_scope: Option<PyScopeRef>,
     /// Who waits for the task to finish. Closed once the outcome is in `slot`.
     join: JoinWaiters,
@@ -66,9 +115,9 @@ pub(crate) struct PyTask {
     pub(super) stats: TaskStats,
     slot_kind: SlotKind,
     pub(super) pending_kind: Kind,
-    /// Whether the lane keeps the task's waker for its current wait (`wait.rs`,
-    /// `lane::keep_linked_wait`).
-    pub(super) linked_wait: bool,
+    /// Who else keeps the task's waker for its current wait: the lane, its innermost scope
+    /// (`wait.rs`, [`WaitLinks`](super::wait::WaitLinks)).
+    pub(super) wait_links: u8,
     /// How many cancel scopes this task entered and has not exited.
     cancel_depth: u8,
     /// The entry of a `Sleep` wait.
@@ -119,8 +168,10 @@ pub(crate) enum TaskOutcome {
     Ok(Py<PyAny>),
     /// The coroutine raised this exception.
     Err(Py<PyBaseException>),
-    /// The task was cancelled before it finished (its runtime shut down).
-    Cancelled,
+    /// The task was cancelled: its coroutine raised this `Cancelled` while its scope was
+    /// cancelling (spec 11 §4), or, with `None`, it was cancelled before it finished (its
+    /// runtime shut down).
+    Cancelled(Option<Py<PyBaseException>>),
 }
 
 impl TaskOutcome {
@@ -129,7 +180,9 @@ impl TaskOutcome {
         match self {
             Self::Ok(value) => Self::Ok(value.clone_ref(py)),
             Self::Err(exception) => Self::Err(exception.clone_ref(py)),
-            Self::Cancelled => Self::Cancelled,
+            Self::Cancelled(exception) => {
+                Self::Cancelled(exception.as_ref().map(|exception| exception.clone_ref(py)))
+            }
         }
     }
 
@@ -137,17 +190,20 @@ impl TaskOutcome {
     pub(crate) fn into_result(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match self {
             Self::Ok(value) => Ok(value),
-            Self::Err(exception) => Err(PyErr::from_value(exception.into_bound(py).into_any())),
-            Self::Cancelled => Err(cancelled_error()),
+            Self::Err(exception) | Self::Cancelled(Some(exception)) => {
+                Err(PyErr::from_value(exception.into_bound(py).into_any()))
+            }
+            Self::Cancelled(None) => Err(shut_down_error()),
         }
     }
 }
 
-/// What reading the outcome of a cancelled task raises.
-pub(crate) fn cancelled_error() -> PyErr {
+/// What reading the outcome of a task cancelled by its runtime raises.
+pub(crate) fn shut_down_error() -> PyErr {
     RuntimeClosed::new_err(
-        "porto: the task was cancelled before it finished: its runtime shut down; keep \
-         porto.run() running until the tasks you wait for are done",
+        "porto: the task was cancelled before it finished: its runtime stopped (porto.run() \
+         returned, or an error stopped it); keep porto.run() running until the tasks you wait \
+         for are done",
     )
 }
 
@@ -222,7 +278,7 @@ pub(crate) fn spawn_in_context(
         stats: TaskStats::default(),
         slot_kind: SlotKind::ResumeNone,
         pending_kind: Kind::None,
-        linked_wait: false,
+        wait_links: 0,
         cancel_depth: 0,
         timer: TaskTimer::new(),
         wait_node: WaitNode::new(0),
@@ -275,51 +331,24 @@ impl PyTask {
         unsafe { Pin::new_unchecked(&self.wait_node) }
     }
 
-    /// The scopes this task entered, innermost first (spec 11 §2, `cancel_stack`).
-    ///
-    /// Scopes a task enters nest (each one's parent is the scope the task was in when it
-    /// entered it), so the stack is the innermost one and its first `cancel_depth - 1`
-    /// ancestors: one pointer instead of a `SmallVec<[ScopeRef; 2]>` (24 bytes, and an
-    /// allocation past two).
-    #[allow(dead_code, reason = "read by cancel delivery (porto-szb.36)")]
-    pub(super) fn cancel_scopes(&self) -> impl Iterator<Item = &ScopeNode<Py<PyBaseException>>> {
-        let mut next = self.cancel_scope.as_deref();
-        (0..self.cancel_depth).map_while(move |_| {
-            let scope = next?;
-            next = scope.parent().map(|parent| &**parent);
-            Some(scope)
-        })
+    /// The innermost scope the task is in, if any: where its effective cancellation is walked
+    /// from (spec 15 §1.2).
+    pub(super) fn innermost_scope(&self) -> Option<&PyScopeNode> {
+        self.cancel_scope.as_deref()
     }
 
-    /// Records that the task entered `scope`, whose parent MUST be the scope it was in.
-    #[allow(dead_code, reason = "called by cancel scopes (porto-szb.36)")]
-    pub(super) fn enter_cancel_scope(&mut self, scope: PyScopeRef) -> PyResult<()> {
-        if self.cancel_depth == u8::MAX {
-            return Err(PyRuntimeError::new_err(
-                "porto: more than 255 cancel scopes nested in one task; flatten the nesting \
-                 or move part of the work into a child task",
-            ));
+    /// Moves the cancel stack out, for the step to run with it reachable from Python calls
+    /// (`step.rs`); [`PyTask::put_cancel_stack`] puts it back.
+    pub(super) fn take_cancel_stack(&mut self) -> CancelStack {
+        CancelStack {
+            innermost: self.cancel_scope.take(),
+            depth: std::mem::take(&mut self.cancel_depth),
         }
-        self.cancel_scope = Some(scope);
-        self.cancel_depth += 1;
-        Ok(())
     }
 
-    /// Records that the task exited `scope`: its parent is the innermost one again (the base
-    /// scope once it exited every scope it entered). Returns `false`, changing nothing, if
-    /// `scope` is not its innermost one (scopes exit in the reverse order they were entered).
-    #[allow(dead_code, reason = "called by cancel scopes (porto-szb.36)")]
-    pub(super) fn exit_cancel_scope(&mut self, scope: &ScopeNode<Py<PyBaseException>>) -> bool {
-        let Some(innermost) = self.cancel_scope.take() else {
-            return false;
-        };
-        if !std::ptr::eq(std::ptr::from_ref(&*innermost), scope) {
-            self.cancel_scope = Some(innermost);
-            return false;
-        }
-        self.cancel_depth -= 1;
-        self.cancel_scope = innermost.parent().cloned();
-        true
+    pub(super) fn put_cancel_stack(&mut self, stack: CancelStack) {
+        self.cancel_scope = stack.innermost;
+        self.cancel_depth = stack.depth;
     }
 
     /// The outcome, once the task finished; `None` before.
@@ -339,7 +368,10 @@ impl PyTask {
                 // SAFETY: only `complete` stores `Err`, with an exception.
                 TaskOutcome::Err(unsafe { error.into_bound(py).cast_into_unchecked() }.unbind())
             }),
-            SlotKind::Cancelled => Some(TaskOutcome::Cancelled),
+            SlotKind::Cancelled => Some(TaskOutcome::Cancelled(object().map(|exception| {
+                // SAFETY: only `complete` stores `Cancelled` with a payload, an exception.
+                unsafe { exception.into_bound(py).cast_into_unchecked() }.unbind()
+            }))),
             _ => None,
         }
     }
@@ -392,7 +424,7 @@ impl PyTask {
         let (kind, payload) = match outcome {
             TaskOutcome::Ok(value) => (SlotKind::Ok, Some(value)),
             TaskOutcome::Err(exception) => (SlotKind::Err, Some(exception.into_any())),
-            TaskOutcome::Cancelled => (SlotKind::Cancelled, None),
+            TaskOutcome::Cancelled(exception) => (SlotKind::Cancelled, exception.map(Py::into_any)),
         };
         self.slot_kind = kind;
         self.slot = payload;
@@ -420,8 +452,8 @@ impl TaskBody for PyTask {
     }
 
     /// The exception the coroutine raised, for the scope it was spawned into (C4): `None` if it
-    /// returned, or if it raised `Cancelled` while its scope is cancelled (the scope, or one of
-    /// its ancestors, is what cancelled it). The outcome stays for the joiners.
+    /// returned, or if it was cancelled (a `Cancelled` raised while its scope was cancelling
+    /// ends the task as cancelled, see `step::poll`). The outcome stays for the joiners.
     ///
     /// A Rust panic in the step loop is not asked for here: the task fails without a payload
     /// for the scope, which is cancelled with `ChildFailed`, and the panic goes on out of
@@ -433,22 +465,11 @@ impl TaskBody for PyTask {
         // SAFETY: porto-core asks right after the poll that returned `Ready`, on the lane that
         // ran it, which is attached (see `poll`).
         let py = unsafe { Python::assume_attached() };
+        let exception = self.slot.as_ref()?.clone_ref(py);
         // SAFETY: only `complete` stores `Err`, with an exception.
-        let exception = unsafe {
-            self.slot
-                .as_ref()?
-                .bind(py)
-                .cast_unchecked::<PyBaseException>()
-        };
-        let cancelled_by_its_scope = exception.is_instance_of::<Cancelled>()
-            && self
-                .cancel_scope
-                .as_deref()
-                .is_some_and(|scope| scope.effective_cancellation().is_some());
-        if cancelled_by_its_scope {
-            return None;
-        }
-        Some(Box::new(exception.clone().unbind()))
+        let exception: Py<PyBaseException> =
+            unsafe { exception.into_bound(py).cast_into_unchecked() }.unbind();
+        Some(Box::new(exception))
     }
 
     fn cancel(self: Pin<&mut Self>, _header: &Header) {
@@ -459,7 +480,10 @@ impl TaskBody for PyTask {
         // defers that to the next attached one.
         this.release_wait();
         drop(this.coro.take());
-        drop(this.py_handle.take());
+        if let Some(task) = this.py_handle.take() {
+            // Its scope's exit, or whoever holds the `porto.Task`, learns how it ended.
+            task.get().finish(TaskOutcome::Cancelled(None));
+        }
         this.slot_kind = SlotKind::Cancelled;
         this.slot = None;
         this.join.close();
@@ -507,7 +531,7 @@ impl Future for Join {
         let py = unsafe { Python::assume_attached() };
         // SAFETY: the wait is over, so `join` is closed: the outcome is published.
         let outcome = unsafe { PyTask::outcome(body, py) };
-        Poll::Ready(outcome.unwrap_or(TaskOutcome::Cancelled))
+        Poll::Ready(outcome.unwrap_or(TaskOutcome::Cancelled(None)))
     }
 }
 
@@ -524,6 +548,25 @@ impl Drop for Join {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cancel_stack_exits_innermost_first_and_keeps_its_base_scope() {
+        let base = PyScopeNode::new_root(1);
+        let mut stack = CancelStack {
+            innermost: Some(base.clone()),
+            depth: 0,
+        };
+        assert!(!stack.exit(&base), "the base scope is never exited");
+        let outer = PyScopeNode::new_child(&base, 1, false);
+        stack.enter(outer.clone()).unwrap();
+        let inner = PyScopeNode::new_child(&outer, 1, false);
+        stack.enter(inner.clone()).unwrap();
+        assert!(!stack.exit(&outer), "not the innermost one");
+        assert!(stack.exit(&inner));
+        assert!(stack.exit(&outer));
+        assert!(std::ptr::eq(&**stack.innermost().unwrap(), &*base));
+        assert_eq!(stack.depth, 0);
+    }
 
     #[test]
     fn the_body_fits_its_budget() {
