@@ -71,6 +71,9 @@ pub(crate) struct PyTask {
     pub(super) stats: TaskStats,
     slot_kind: SlotKind,
     pub(super) pending_kind: Kind,
+    /// Whether the lane keeps the task's waker for its current wait (`wait.rs`,
+    /// `lane::keep_linked_wait`).
+    pub(super) linked_wait: bool,
     /// How many cancel scopes this task entered and has not exited.
     cancel_depth: u8,
     /// The entry of a `Sleep` wait.
@@ -213,6 +216,7 @@ pub(crate) fn spawn(
         stats: TaskStats::default(),
         slot_kind: SlotKind::ResumeNone,
         pending_kind: Kind::None,
+        linked_wait: false,
         cancel_depth: 0,
         timer: TaskTimer::new(),
         wait_node: WaitNode::new(0),

@@ -16,13 +16,19 @@
 //! - `Future`, `Io`: the future is dropped, which unregisters its wakers (an operation
 //!   consumes data only in the attempt that completes it);
 //! - `Yield`, `YieldThen`: nothing is linked; the value is dropped.
+//!
+//! A `Notified`, `Join` or `ScopeExit` wait is a reference cycle while it is pending: the task
+//! holds what it waits on (the payload), which holds the task's waker. If nothing ends the wait,
+//! nothing ever frees either, so the lane keeps the waker too ([`lane::keep_linked_wait`]) and
+//! wakes it when the run ends, which cancels the task (spec 11 §3.2).
 
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker};
 
 use porto_core::scope::ScopeNode;
 use pyo3::prelude::*;
 
+use super::lane;
 use super::pending::{Kind, Payload, Pending};
 use super::pytask::{PyTask, Resume, TaskOutcome, cancelled_error};
 
@@ -87,7 +93,7 @@ impl PyTask {
                 // only, until the wait is resolved or released (here and `release_wait`), which
                 // only the task's own poll, cancel and drop do, one at a time.
                 if unsafe { target.poll_wait(self.wait_node(), cx) }.is_pending() {
-                    return Poll::Pending;
+                    return self.linked_pending(cx.waker());
                 }
                 Resume::None
             }
@@ -99,7 +105,7 @@ impl PyTask {
                 let joined =
                     unsafe { PyTask::join_waiters(target).poll_wait(self.wait_node(), cx) };
                 if joined.is_pending() {
-                    return Poll::Pending;
+                    return self.linked_pending(cx.waker());
                 }
                 // SAFETY: the wait returned ready, so the join list is closed and the outcome
                 // published; the reference keeps the body alive.
@@ -109,7 +115,7 @@ impl PyTask {
                 // SAFETY: `scope` is the live field of a ScopeExit payload.
                 let scope = unsafe { &*self.pending_payload.scope };
                 if poll_scope_exit(scope, cx.waker()).is_pending() {
-                    return Poll::Pending;
+                    return self.linked_pending(cx.waker());
                 }
                 Resume::None
             }
@@ -172,8 +178,28 @@ impl PyTask {
         drop(self.take_pending());
     }
 
-    /// Moves the payload out; the task waits for nothing afterwards.
+    /// `Pending` for a wait whose target now holds `waker` (the task's), which the lane then
+    /// keeps too, once per wait: see the module docs.
+    fn linked_pending(&mut self, waker: &Waker) -> Poll<Resume> {
+        if !self.linked_wait {
+            self.linked_wait = true;
+            lane::keep_linked_wait(self.key(), waker);
+        }
+        Poll::Pending
+    }
+
+    /// The key the lane keeps the task's linked wait under: the body's address, which is the
+    /// task's while it lives (the lane's waker keeps it alive while the key is in use).
+    fn key(&self) -> usize {
+        ptr::from_ref(self).addr()
+    }
+
+    /// Moves the payload out; the task waits for nothing afterwards, and the lane no longer
+    /// keeps its waker.
     fn take_pending(&mut self) -> Pending {
+        if std::mem::take(&mut self.linked_wait) {
+            lane::forget_linked_wait(self.key());
+        }
         let kind = std::mem::replace(&mut self.pending_kind, Kind::None);
         let payload = std::mem::replace(&mut self.pending_payload, Payload::EMPTY);
         // SAFETY: the payload was packed with `kind` (`set_pending`), and is replaced above.
