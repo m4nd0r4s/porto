@@ -13,8 +13,8 @@ Waiting tasks use intrusive `WaitNode`s embedded in the task (PyTask: `wait_node
 | `porto.RwLock()` | `sync::RwLock` | writer-preferring |
 | `porto.Semaphore(n)` | `sync::Semaphore` | `acquire(k=1)`, `release(k=1)`, `async with`, `available` |
 | `porto.CapacityLimiter(n)` | Semaphore + owner tracking | AnyIO-compatible; per-task borrow |
-| `porto.Event()` | `sync::Event` | `set()`, `is_set()`, `await wait()`. Not clearable (Trio semantics); for clearable events use `watch` |
-| `porto.Notify()` | `sync::Notify` | `notify_one()` (stores a permit if nobody waits), `notify_all()`, `await notified()` |
+| `porto.Event()` | `sync::Event` | `set()`, `is_set()`, `await wait()`, `blocking_wait()`. Not clearable (Trio semantics); for clearable events use `watch` |
+| `porto.Notify()` | `sync::Notify` | `notify_one()` (stores a permit if nobody waits), `notify_all()`, `await notified()`, `blocking_notified()` |
 | `porto.Condition(lock=None)` | | `wait()`, `wait_for(pred)`, `notify(n)`, `notify_all()` |
 | `porto.Barrier(n)` | | `await wait() -> bool` (True for the leader) |
 

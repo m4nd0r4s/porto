@@ -18,7 +18,8 @@ pub use driver::trap::Trap;
 pub use py_compat::interned;
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,
-/// `checkpoint`, `current_time`, `monotonic`), the trap protocol's awaitables (`_Trap`, `_Ready`), the step driver's private
+/// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`), the trap protocol's
+/// awaitables (`_Trap`, `_Ready`), the step driver's private
 /// entry points (`_run`, `_spawn`, the trap constructors) and test hooks.
 ///
 /// `gil_used = false` (the pyo3 0.30 default, stated on purpose): the module supports
@@ -39,5 +40,6 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     api::run::register(module)?;
     api::scope::register(module)?;
     api::time::register(module)?;
+    api::sync::register(module)?;
     testing::register(module)
 }

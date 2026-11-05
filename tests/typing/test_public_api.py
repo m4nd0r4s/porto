@@ -93,9 +93,23 @@ def check_errors_are_the_builtins_they_extend() -> None:
     del no_runtime, closed, end, cancelled, terminated, every
 
 
+async def sync_primitives() -> int:
+    event, notify = porto.Event(), porto.Notify()
+    event.set()
+    assert_type(event.is_set(), bool)
+    await event.wait()
+    notify.notify_one()
+    await notify.notified()
+    return 1
+
+
 def test_the_sample_runs() -> None:
     assert porto.run(main, ["a", "b"]) == [b"a:443", b"b:443"]
 
 
 def test_the_config_sample_runs() -> None:
     check_run_takes_a_config_and_overrides()
+
+
+def test_the_sync_sample_runs() -> None:
+    assert porto.run(sync_primitives) == 1
