@@ -14,6 +14,9 @@
 //! - [`Notify`]: `notify_one` wakes one waiter or stores one permit, `notify_all` wakes the
 //!   current waiters.
 //!
+//! And [`JoinWaiters`]: the one-word intrusive list of a task's joiners, built on the same
+//! nodes and closed once when the task finishes.
+//!
 //! And:
 //!
 //! - [`blocking_wait`]: waits from a thread that does not run a lane, the backing of every
@@ -29,6 +32,7 @@
 
 mod blocking;
 mod event;
+mod join_waiters;
 pub mod mpsc;
 mod notify;
 mod primitives;
@@ -40,6 +44,9 @@ mod tests;
 #[cfg(all(test, not(loom)))]
 mod event_notify_tests;
 
+#[cfg(test)]
+mod join_waiters_tests;
+
 #[cfg(all(test, loom))]
 mod loom_tests;
 
@@ -48,5 +55,6 @@ mod loom_event_notify_tests;
 
 pub use blocking::{BlockingOnLane, blocking_wait};
 pub use event::{Event, EventWait};
+pub use join_waiters::JoinWaiters;
 pub use notify::{Notified, Notify};
 pub use wait_queue::{Locked, Wait, WaitNode, WaitQueue, WaitState};

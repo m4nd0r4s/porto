@@ -5,8 +5,8 @@
 //! wait:
 //!
 //! - a `_Trap` (exact type) is taken and its [`TrapKind`] handled: `Yield` requeues the task at
-//!   the back of the local queue, `Sleep` registers a lane timer, `Park` waits for a wake that
-//!   the trap's maker arranged through [`current_waker`];
+//!   the back of the local queue, `Sleep` arms the task's embedded timer, `Park` waits for a
+//!   wake that the trap's maker arranged through [`current_waker`];
 //! - `None` (a bare `yield` in a generator-based coroutine) is a yield;
 //! - anything else is an error thrown back into the coroutine, at the `await` that yielded it.
 //!
@@ -14,17 +14,16 @@
 //! reachable through [`current_waker`] while it runs.
 
 use std::cell::Cell;
-use std::future::Future;
-use std::mem;
 use std::ptr;
 use std::task::{Context, Poll, Waker};
 
-use porto_core::time::{Deadline, sleep_until};
+use porto_core::task::Header;
+use porto_core::time::Deadline;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::{ffi, intern};
 
-use super::pytask::{Outcome, Pending, PyTask, Resume};
+use super::pytask::{COOP_BUDGET, Pending, PyTask, Resume, TaskOutcome};
 use super::trap::{Trap, TrapKind};
 use crate::py_compat::{Sent, names, send, take_exception};
 
@@ -58,34 +57,38 @@ impl Drop for RunningWaker {
 }
 
 /// Polls `task`: steps its coroutine until it finishes (`Ready`) or waits (`Pending`).
-pub(super) fn poll(task: &mut PyTask, py: Python<'_>, cx: &mut Context<'_>) -> Poll<()> {
-    // Moved out for the poll (no refcount traffic) and put back if the task has to wait.
+pub(super) fn poll(
+    task: &mut PyTask,
+    header: &Header,
+    py: Python<'_>,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    // Moved out for the poll (no refcount traffic) and put back before `complete` or `Pending`.
     let Some(coro) = task.coro.take() else {
-        // porto-core never polls a completed future; nothing to do if it did.
+        // porto-core never polls a completed body; nothing to do if it did.
         return Poll::Ready(());
     };
     let coro = coro.into_bound(py);
-    // SAFETY: `task` owns the context and keeps it for the whole poll (`complete` releases
-    // only the coroutine), so it outlives the guard.
+    // SAFETY: `task` owns the context and keeps it until it is freed (`complete` releases only
+    // the coroutine), so it outlives the guard.
     let _context = match unsafe { EnteredContext::enter(py, task.context.as_ptr()) } {
         Ok(entered) => entered,
         Err(exception) => {
             task.coro = Some(coro.unbind());
-            task.complete(py, Outcome::Raised(exception));
+            task.complete(py, header, TaskOutcome::Err(exception));
             return Poll::Ready(());
         }
     };
     let _waker = RunningWaker::set(cx.waker());
-    match step_until_wait(task, &coro, cx) {
+    task.budget = COOP_BUDGET;
+    let outcome = step_until_wait(task, &coro, cx);
+    task.coro = Some(coro.unbind());
+    match outcome {
         Some(outcome) => {
-            task.coro = Some(coro.unbind());
-            task.complete(py, outcome);
+            task.complete(py, header, outcome);
             Poll::Ready(())
         }
-        None => {
-            task.coro = Some(coro.unbind());
-            Poll::Pending
-        }
+        None => Poll::Pending,
     }
 }
 
@@ -94,18 +97,34 @@ fn step_until_wait(
     task: &mut PyTask,
     coro: &Bound<'_, PyAny>,
     cx: &mut Context<'_>,
-) -> Option<Outcome> {
+) -> Option<TaskOutcome> {
     loop {
-        match &mut task.pending {
-            Pending::None => {}
-            // A parked task is only polled after a wake: whoever woke it ended the wait.
-            Pending::Yield | Pending::Park => task.pending = Pending::None,
-            Pending::Sleep(sleep) => match sleep.as_mut().poll(cx) {
-                Poll::Pending => return None,
-                Poll::Ready(()) => task.pending = Pending::None,
-            },
+        match task.take_pending() {
+            // A yielded task was requeued; a parked one is only polled after a wake: whoever
+            // woke it ended the wait.
+            Pending::None | Pending::Yield | Pending::Park => {}
+            Pending::Sleep(deadline) => {
+                // SAFETY: the timer is embedded in this task, which its lane polls with the
+                // task's own waker.
+                if unsafe { task.timer().poll(cx) }.is_pending() {
+                    task.set_pending(Pending::Sleep(deadline));
+                    return None;
+                }
+            }
+            Pending::YieldThen(value) => task.set_resume(Resume::Value(value)),
+            Pending::AsyncioFuture(_) => {
+                unreachable!("asyncio futures are not awaited yet (the compatibility layer)")
+            }
         }
-        let yielded = match resume(coro, mem::replace(&mut task.resume, Resume::None)) {
+        if task.budget == 0 {
+            // Out of budget with a step to go (a throw after an unsupported await): let the
+            // other tasks run first.
+            yield_now(task, cx);
+            return None;
+        }
+        task.budget -= 1;
+        task.stats.steps = task.stats.steps.wrapping_add(1);
+        let yielded = match resume(coro, task.take_resume(coro.py())) {
             Stepped::Finished(outcome) => return Some(outcome),
             Stepped::Yielded(yielded) => yielded,
         };
@@ -115,20 +134,19 @@ fn step_until_wait(
                 return None;
             }
             Next::Sleep(deadline) => {
-                let mut sleep = Box::pin(sleep_until(deadline));
-                // A deadline that already passed is still a schedule point (spec 11 §4 notes).
-                if sleep.as_mut().poll(cx).is_ready() {
+                task.set_pending(Pending::Sleep(deadline));
+                // SAFETY: as above.
+                if unsafe { task.timer().poll(cx) }.is_ready() {
+                    // A deadline that already passed is still a schedule point (spec 11 §4).
                     yield_now(task, cx);
-                } else {
-                    task.pending = Pending::Sleep(sleep);
                 }
                 return None;
             }
             Next::Park => {
-                task.pending = Pending::Park;
+                task.set_pending(Pending::Park);
                 return None;
             }
-            Next::Throw(error) => task.resume = Resume::Throw(error.unbind()),
+            Next::Throw(error) => task.set_resume(Resume::Throw(error.unbind())),
         }
     }
 }
@@ -136,14 +154,14 @@ fn step_until_wait(
 /// Requeues the task at the back of its lane's local queue: a wake while it runs makes the lane
 /// reschedule it when this poll returns `Pending`.
 fn yield_now(task: &mut PyTask, cx: &Context<'_>) {
-    task.pending = Pending::Yield;
+    task.set_pending(Pending::Yield);
     cx.waker().wake_by_ref();
 }
 
 /// What one step of the coroutine did.
 enum Stepped<'py> {
     /// It returned or raised: the task is done.
-    Finished(Outcome),
+    Finished(TaskOutcome),
     /// It suspended, yielding this object to the driver.
     Yielded(Bound<'py, PyAny>),
 }
@@ -151,41 +169,43 @@ enum Stepped<'py> {
 /// Resumes the coroutine once with `resume`.
 fn resume<'py>(coro: &Bound<'py, PyAny>, resume: Resume) -> Stepped<'py> {
     let py = coro.py();
-    match resume {
-        Resume::None => match send(coro, None) {
-            Sent::Returned(value) => Stepped::Finished(Outcome::Returned(value.unbind())),
-            Sent::Yielded(yielded) => Stepped::Yielded(yielded),
-            Sent::Raised(exception) => Stepped::Finished(Outcome::Raised(exception.unbind())),
-        },
-        Resume::Throw(exception) => {
-            // SAFETY: attached; `coro`, the interned name and `exception` are live for the call.
-            // Returns a new reference, or NULL with an exception set.
-            let result = unsafe {
-                ffi::PyObject_CallMethodOneArg(
-                    coro.as_ptr(),
-                    names(py).throw.as_ptr(),
-                    exception.as_ptr(),
-                )
-            };
-            drop(exception);
-            // SAFETY: a new reference, or NULL.
-            match unsafe { Bound::from_owned_ptr_or_opt(py, result) } {
-                Some(yielded) => Stepped::Yielded(yielded),
-                None => Stepped::Finished(thrown_outcome(take_exception(py))),
-            }
-        }
+    let sent = match resume {
+        Resume::None => send(coro, None),
+        Resume::Value(value) => send(coro, Some(value.into_bound(py))),
+        Resume::Throw(exception) => return throw(coro, exception),
+    };
+    match sent {
+        Sent::Returned(value) => Stepped::Finished(TaskOutcome::Ok(value.unbind())),
+        Sent::Yielded(yielded) => Stepped::Yielded(yielded),
+        Sent::Raised(exception) => Stepped::Finished(TaskOutcome::Err(exception.unbind())),
+    }
+}
+
+/// Throws `exception` into the coroutine (`coro.throw(exception)`).
+fn throw<'py>(coro: &Bound<'py, PyAny>, exception: Py<PyBaseException>) -> Stepped<'py> {
+    let py = coro.py();
+    // SAFETY: attached; `coro`, the interned name and `exception` are live for the call.
+    // Returns a new reference, or NULL with an exception set.
+    let result = unsafe {
+        ffi::PyObject_CallMethodOneArg(coro.as_ptr(), names(py).throw.as_ptr(), exception.as_ptr())
+    };
+    drop(exception);
+    // SAFETY: a new reference, or NULL.
+    match unsafe { Bound::from_owned_ptr_or_opt(py, result) } {
+        Some(yielded) => Stepped::Yielded(yielded),
+        None => Stepped::Finished(thrown_outcome(take_exception(py))),
     }
 }
 
 /// The outcome of a `throw()` that did not suspend: `StopIteration` means the coroutine caught
 /// the exception and returned (a coroutine cannot raise `StopIteration` itself, PEP 479).
-fn thrown_outcome(raised: Bound<'_, PyBaseException>) -> Outcome {
+fn thrown_outcome(raised: Bound<'_, PyBaseException>) -> TaskOutcome {
     if !raised.is_instance_of::<PyStopIteration>() {
-        return Outcome::Raised(raised.unbind());
+        return TaskOutcome::Err(raised.unbind());
     }
     match raised.getattr(intern!(raised.py(), "value")) {
-        Ok(value) => Outcome::Returned(value.unbind()),
-        Err(error) => Outcome::Raised(error.into_value(raised.py())),
+        Ok(value) => TaskOutcome::Ok(value.unbind()),
+        Err(error) => TaskOutcome::Err(error.into_value(raised.py())),
     }
 }
 

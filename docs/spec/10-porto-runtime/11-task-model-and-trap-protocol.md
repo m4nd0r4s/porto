@@ -42,9 +42,21 @@ struct PyTaskBody {
     join: JoinWaiters,                   // intrusive list of awaiting tasks
     py_handle: *mut ffi::PyObject,       // weakly-cached porto.Task wrapper (lazily created)
     stats: TaskStats,                    // first_poll, total_poll_ns, steps, last_step_start
+    timer: TaskTimer,                    // embedded wheel entry + deadline (§6)
+    wait_node: WaitNode,                 // embedded waiter node (§6)
 }
 enum Resume { None, Value(PyObj), Throw(PyObj) }
 ```
+
+A PyTask has no output stage and no join-handle waker slot (a RustTask has both): the body keeps its outcome and its joiners itself. In porto-core it is a `TaskBody` (`Handle::spawn_body`), polled with the same state transitions as a RustTask; a body cancelled instead of polled (its run-queue entry dropped at shutdown) records `Cancelled` and closes `join`.
+
+The fields above are logical. The layout packs them so the body is 64 B without its two embedded nodes (168 B with them on 64-bit targets: `TaskTimer` 56 B, `WaitNode` 48 B):
+
+- `resume` and `result` share one payload word with a one-byte kind: the resume value exists only while the task runs, the outcome only once it finished.
+- `pending` is a one-byte kind plus one payload word (a Python object; later kinds carry one pointer each). A `Sleep`'s deadline lives in the timer.
+- `cancel_stack` is the innermost entered scope plus a one-byte depth. Scopes a task enters nest (each one's parent is the scope the task was in), so the rest of the stack is that scope's first `depth - 1` ancestors; scopes exit in reverse order.
+- `join` is one word: the head of an intrusive list of `WaitNode`s, a spin-lock bit and a CLOSED bit. Completion stores the outcome, then closes the list (waking every waiter); a waiter reads the outcome only after its wait returned ready.
+- `stats` counts steps. The timing fields need a clock read per step, too slow for the hot path; they come with the task registry (§23), behind its switch.
 
 ## 3. Task state machine
 

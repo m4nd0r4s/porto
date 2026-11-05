@@ -5,12 +5,12 @@
 #[cfg(all(loom, test))]
 pub(crate) use loom::cell::UnsafeCell;
 #[cfg(all(loom, test))]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, fence};
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, fence};
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, fence};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, fence};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -48,4 +48,16 @@ impl<T> UnsafeCell<T> {
     pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
         f(self.0.get())
     }
+}
+
+/// One turn of a spin loop. Loom must see a yield, or it explores the loop forever.
+#[cfg(all(loom, test))]
+pub(crate) fn spin() {
+    loom::thread::yield_now();
+}
+
+/// One turn of a spin loop.
+#[cfg(not(all(loom, test)))]
+pub(crate) fn spin() {
+    std::thread::yield_now();
 }

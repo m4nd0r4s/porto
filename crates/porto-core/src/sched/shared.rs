@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use super::lane;
 use super::timers::Timers;
-use crate::task::{JoinHandle, Notified, Schedule, new_joinable_task};
+use crate::task::{
+    JoinHandle, Notified, Schedule, TaskBody, TaskBodyRef, TaskFlags, new_body_task,
+    new_joinable_task,
+};
 use crate::time::{Deadline, RuntimeClock};
 
 /// A cloneable, `Send + Sync` handle to a runtime: spawns tasks onto it from any thread.
@@ -89,6 +92,17 @@ impl Handle {
             self.clone().schedule_remote(task);
         }
         join
+    }
+
+    /// Spawns a task running `body` (a task that is not a Rust future, such as a PyTask),
+    /// with `flags`, queued like [`Handle::spawn`]. The returned reference reaches the body,
+    /// which keeps the outcome and the joiners itself.
+    pub fn spawn_body<B: TaskBody>(&self, body: B, flags: TaskFlags) -> TaskBodyRef<B> {
+        let (task, body) = new_body_task(body, self.clone(), flags);
+        if let Err(task) = self.schedule_local(task) {
+            self.clone().schedule_remote(task);
+        }
+        body
     }
 
     /// A handle to the runtime running on this thread (inside its `block_on` or one of its

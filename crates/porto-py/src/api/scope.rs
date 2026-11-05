@@ -20,7 +20,7 @@ use pyo3::{PyTraverseError, PyVisit};
 
 use super::run::coroutine_from;
 use crate::driver::lane;
-use crate::driver::pytask::{self, Completion, Outcome};
+use crate::driver::pytask::{self, Spawned, TaskOutcome};
 use crate::driver::ready::Ready;
 use crate::driver::step::current_waker;
 use crate::driver::trap::Trap;
@@ -146,7 +146,7 @@ impl Scope {
             },
         )?;
         self.shared.lock().live += 1;
-        if let Err(error) = pytask::spawn(&handle, coro, Completion::Child(task.clone_ref(py))) {
+        if let Err(error) = pytask::spawn(&handle, coro, Spawned::Child(task.clone_ref(py))) {
             self.shared.lock().live -= 1;
             return Err(error);
         }
@@ -267,19 +267,19 @@ impl Scope {
 pub struct Task {
     scope: Arc<ScopeShared>,
     /// `None` until the task finishes. Only held to store, read or take the outcome.
-    outcome: Mutex<Option<Outcome>>,
+    outcome: Mutex<Option<TaskOutcome>>,
 }
 
 impl Task {
-    fn lock(&self) -> MutexGuard<'_, Option<Outcome>> {
+    fn lock(&self) -> MutexGuard<'_, Option<TaskOutcome>> {
         self.outcome.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Stores the outcome of the finished task and tells its scope.
-    pub(crate) fn finish(&self, py: Python<'_>, outcome: Outcome) {
+    pub(crate) fn finish(&self, py: Python<'_>, outcome: TaskOutcome) {
         let error = match &outcome {
-            Outcome::Returned(_) => None,
-            Outcome::Raised(exception) => Some(exception.clone_ref(py)),
+            TaskOutcome::Ok(_) | TaskOutcome::Cancelled => None,
+            TaskOutcome::Err(exception) => Some(exception.clone_ref(py)),
         };
         *self.lock() = Some(outcome);
         self.scope.child_finished(error);
@@ -296,10 +296,7 @@ impl Task {
     /// What the task returned, or raises what it raised.
     fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &*self.lock() {
-            Some(Outcome::Returned(value)) => Ok(value.clone_ref(py)),
-            Some(Outcome::Raised(exception)) => Err(PyErr::from_value(
-                exception.clone_ref(py).into_bound(py).into_any(),
-            )),
+            Some(outcome) => outcome.clone_ref(py).into_result(py),
             None => Err(PyRuntimeError::new_err(
                 "porto: Task.result() was called before the task finished; read it after the \
                  scope's `async with` block, which waits for every task spawned into it \
@@ -323,8 +320,9 @@ impl Task {
     fn __repr__(&self) -> &'static str {
         match &*self.lock() {
             None => "<porto.Task running>",
-            Some(Outcome::Returned(_)) => "<porto.Task returned>",
-            Some(Outcome::Raised(_)) => "<porto.Task raised>",
+            Some(TaskOutcome::Ok(_)) => "<porto.Task returned>",
+            Some(TaskOutcome::Err(_)) => "<porto.Task raised>",
+            Some(TaskOutcome::Cancelled) => "<porto.Task cancelled>",
         }
     }
 
@@ -336,9 +334,9 @@ impl Task {
             return Ok(());
         };
         match &*outcome {
-            Some(Outcome::Returned(value)) => visit.call(value),
-            Some(Outcome::Raised(exception)) => visit.call(exception),
-            None => Ok(()),
+            Some(TaskOutcome::Ok(value)) => visit.call(value),
+            Some(TaskOutcome::Err(exception)) => visit.call(exception),
+            Some(TaskOutcome::Cancelled) | None => Ok(()),
         }
     }
 

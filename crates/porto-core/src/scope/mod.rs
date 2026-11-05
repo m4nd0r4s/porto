@@ -21,3 +21,7 @@ mod loom_tests;
 
 pub use check::CancelCache;
 pub use node::{CancelReason, Cancellation, ScopeNode, ScopeState};
+
+/// A counted reference to a scope: what a task holds for the scopes it entered
+/// (`11-task-model-and-trap-protocol.md` §2, `cancel_stack`).
+pub type ScopeRef<E> = sync::Arc<ScopeNode<E>>;

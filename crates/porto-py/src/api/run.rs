@@ -1,7 +1,5 @@
 //! `porto.run(main, *args)`, and the private `_run(coro)` and `_spawn(coro)`.
 
-use std::sync::Arc;
-
 use porto_core::Handle;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
@@ -10,7 +8,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyTuple, PyType};
 
 use crate::driver::lane;
-use crate::driver::pytask::{self, Completion, JoinSlot};
+use crate::driver::pytask::{self, Spawned};
 
 /// Adds the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -54,10 +52,9 @@ fn private_run(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
 
 fn run_main_task(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let py = coro.py();
-    let join = Arc::new(JoinSlot::default());
     let outcome = lane::run(py, |runtime| {
-        pytask::spawn(runtime.handle(), coro, Completion::Join(join.clone()))?;
-        PyResult::Ok(runtime.block_on(lane::main_or_interrupt(join.wait())))
+        let main = pytask::spawn(runtime.handle(), coro, Spawned::Joined)?;
+        PyResult::Ok(runtime.block_on(lane::main_or_interrupt(pytask::join(main))))
     })?;
     outcome.into_result(py)
 }
@@ -75,7 +72,8 @@ fn spawn(coro: Bound<'_, PyAny>) -> PyResult<()> {
         ));
     };
     expect_coroutine(&coro, "_spawn")?;
-    pytask::spawn(&handle, coro, Completion::Detached)
+    pytask::spawn(&handle, coro, Spawned::Detached)?;
+    Ok(())
 }
 
 /// `collections.abc.Coroutine`, for coroutine objects that are not native coroutines (Cython).

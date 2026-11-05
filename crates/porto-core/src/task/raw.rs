@@ -17,7 +17,7 @@ pub struct TaskVTable {
     /// holds RUNNING, which grants exclusive access to the body.
     #[allow(
         dead_code,
-        reason = "type-erased callers (PyTask cancellation, porto-szb.4) arrive later"
+        reason = "type-erased callers (shutdown drain of Python tasks, porto-szb.36) arrive later"
     )]
     pub(crate) drop_future: unsafe fn(NonNull<Header>),
     /// Frees the allocation, dropping whatever the body still owns (future, scheduler handle).
@@ -67,7 +67,7 @@ impl RawTask {
     /// The caller holds RUNNING (exclusive access to the body) and a reference.
     #[allow(
         dead_code,
-        reason = "type-erased callers (PyTask cancellation, porto-szb.4) arrive later"
+        reason = "type-erased callers (shutdown drain of Python tasks, porto-szb.36) arrive later"
     )]
     pub(crate) unsafe fn drop_future(self) {
         // SAFETY: the vtable belongs to this allocation; RUNNING excludes other body access.
