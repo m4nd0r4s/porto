@@ -6,7 +6,8 @@
 //!   a coroutine, so tests reach `am_send` even where the `SEND` opcode does not use it;
 //! - `_take_unnormalized_exception(exc_type, value, traceback)` raises a raw exception triple
 //!   and takes it back through `take_exception`, which normalizes it on 3.11;
-//! - `_count_allocations(fn)` counts every allocation CPython makes while `fn()` runs.
+//! - `_count_allocations(fn)` counts every allocation CPython makes while `fn()` runs;
+//! - the error hooks of [`errors`].
 
 use core::ffi::c_void;
 use core::ptr;
@@ -18,6 +19,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyTraceback, PyType};
 
+pub mod errors;
+
 use crate::Ready;
 use crate::py_compat::{self, Sent, take_exception};
 
@@ -26,7 +29,8 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(make_ready, module)?)?;
     module.add_function(wrap_pyfunction!(send, module)?)?;
     module.add_function(wrap_pyfunction!(take_unnormalized_exception, module)?)?;
-    module.add_function(wrap_pyfunction!(count_allocations, module)?)
+    module.add_function(wrap_pyfunction!(count_allocations, module)?)?;
+    errors::register(module)
 }
 
 /// A `_Ready` holding `value`.

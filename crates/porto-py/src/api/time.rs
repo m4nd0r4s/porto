@@ -4,11 +4,12 @@
 use std::time::Duration;
 
 use porto_core::time::Deadline;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::driver::lane;
 use crate::driver::trap::Trap;
+use crate::errors::NoRuntimeError;
 
 /// Adds the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -43,7 +44,7 @@ fn require_lane(function: &str) -> PyResult<()> {
     if lane::is_active() {
         return Ok(());
     }
-    Err(PyRuntimeError::new_err(format!(
+    Err(NoRuntimeError::new_err(format!(
         "porto: porto.{function}() was called outside porto.run(); porto awaitables only work \
          in tasks of a porto runtime: start the program with porto.run(main) and await it from \
          there"
@@ -60,7 +61,7 @@ fn current_time() -> PyResult<f64> {
 /// The current time on the runtime clock; fails outside a runtime, which owns the clock.
 fn now(function: &str) -> PyResult<Deadline> {
     Deadline::try_now().ok_or_else(|| {
-        PyRuntimeError::new_err(format!(
+        NoRuntimeError::new_err(format!(
             "porto: porto.{function}() was called outside porto.run(); the runtime clock starts \
              with the runtime, so call it from code that porto.run(main) runs (for a clock \
              outside porto, use time.monotonic())"

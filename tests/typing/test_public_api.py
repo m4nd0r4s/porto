@@ -3,6 +3,7 @@
 The ``check_*`` functions are only type-checked; ``test_*`` also run them.
 """
 
+import asyncio
 from typing import assert_type
 
 import porto
@@ -49,6 +50,29 @@ async def check_spawn_checks_the_arguments() -> None:
     async with porto.scope() as s:
         s.spawn(fetch, "a")  # pyright: ignore[reportArgumentType]
         s.spawn(fetch, "a", "443")  # pyright: ignore[reportArgumentType]
+
+
+def check_error_attributes_are_typed() -> None:
+    try:
+        porto.run(total)
+    except porto.IncompleteReadError as error:
+        assert_type(error.partial, bytes)
+        assert_type(error.expected, int | None)
+    except porto.Lagged as error:
+        assert_type(error.skipped, int)
+    except porto.RustPanic as error:
+        assert_type(error.message, str)
+        assert_type(error.location, str | None)
+
+
+def check_errors_are_the_builtins_they_extend() -> None:
+    no_runtime: RuntimeError = porto.NoRuntimeError("porto: no runtime")
+    closed: OSError = porto.ClosedResourceError("porto: closed")
+    end: EOFError = porto.IncompleteReadError(b"")
+    cancelled: asyncio.CancelledError = porto.Cancelled()
+    terminated: SystemExit = porto.Terminated(0)
+    every: list[porto.PortoError] = [porto.Lagged(1), porto.RustPanic("boom"), porto.WouldBlock()]
+    del no_runtime, closed, end, cancelled, terminated, every
 
 
 def test_the_sample_runs() -> None:

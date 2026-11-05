@@ -24,6 +24,7 @@ use crate::driver::pytask::{self, Spawned, TaskOutcome};
 use crate::driver::ready::Ready;
 use crate::driver::step::current_waker;
 use crate::driver::trap::Trap;
+use crate::errors::{InvalidStateError, NoRuntimeError};
 
 /// Adds the classes and functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -117,7 +118,7 @@ impl Scope {
     fn spawn(&self, coro_or_fn: Bound<'_, PyAny>, args: Bound<'_, PyTuple>) -> PyResult<Py<Task>> {
         let py = coro_or_fn.py();
         let Some(handle) = lane::current() else {
-            return Err(PyRuntimeError::new_err(
+            return Err(NoRuntimeError::new_err(
                 "porto: Scope.spawn() must be called from a task running under porto.run(); \
                  start the program with porto.run(main) and open the scope inside main",
             ));
@@ -155,7 +156,7 @@ impl Scope {
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Ready> {
         if !lane::is_active() {
-            return Err(PyRuntimeError::new_err(
+            return Err(NoRuntimeError::new_err(
                 "porto: `async with porto.scope()` only works in tasks of a porto runtime; \
                  start the program with porto.run(main) and open the scope inside main",
             ));
@@ -204,7 +205,7 @@ impl Scope {
             return Ok(None);
         }
         let Some(waker) = current_waker() else {
-            return Err(PyRuntimeError::new_err(
+            return Err(NoRuntimeError::new_err(
                 "porto: a scope's exit must be awaited by a porto task; use \
                  `async with porto.scope()` inside porto.run(main)",
             ));
@@ -297,7 +298,7 @@ impl Task {
     fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &*self.lock() {
             Some(outcome) => outcome.clone_ref(py).into_result(py),
-            None => Err(PyRuntimeError::new_err(
+            None => Err(InvalidStateError::new_err(
                 "porto: Task.result() was called before the task finished; read it after the \
                  scope's `async with` block, which waits for every task spawned into it \
                  (task.done() tells whether it finished)",

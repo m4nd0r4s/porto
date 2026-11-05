@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import porto
 from porto import _core
 
 
@@ -518,6 +519,6 @@ def test_spawn_outside_a_task_raises() -> None:
         pass
 
     coro = child()
-    with pytest.raises(RuntimeError, match="must be called from a task running under _run"):
+    with pytest.raises(porto.NoRuntimeError, match="must be called from a task running under _run"):
         _core._spawn(coro)
     coro.close()

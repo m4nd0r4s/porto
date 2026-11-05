@@ -136,7 +136,9 @@ def test_task_result_before_the_task_finished_raises_and_says_what_to_do() -> No
         async with porto.scope() as s:
             task = s.spawn(double, 21)
             assert not task.done()
-            with pytest.raises(RuntimeError, match=r"before the task finished; read it after"):
+            with pytest.raises(
+                porto.InvalidStateError, match=r"before the task finished; read it after"
+            ):
                 task.result()
         assert task.done()
         return task.result()
@@ -346,16 +348,20 @@ def test_a_scope_can_be_entered_only_once() -> None:
 
 
 def test_sleep_and_checkpoint_outside_run_raise_and_say_what_to_do() -> None:
-    with pytest.raises(RuntimeError, match=r"porto.sleep\(\) was called outside porto.run"):
+    with pytest.raises(porto.NoRuntimeError, match=r"porto.sleep\(\) was called outside porto.run"):
         porto.sleep(1)
-    with pytest.raises(RuntimeError, match=r"porto.checkpoint\(\) was called outside porto.run"):
+    with pytest.raises(
+        porto.NoRuntimeError, match=r"porto.checkpoint\(\) was called outside porto.run"
+    ):
         porto.checkpoint()
 
 
 def test_current_time_outside_run_raises_and_says_what_to_do() -> None:
-    with pytest.raises(RuntimeError, match=r"porto.current_time\(\) was called outside porto.run"):
+    with pytest.raises(
+        porto.NoRuntimeError, match=r"porto.current_time\(\) was called outside porto.run"
+    ):
         porto.current_time()
-    with pytest.raises(RuntimeError, match=r"use time.monotonic\(\)"):
+    with pytest.raises(porto.NoRuntimeError, match=r"use time.monotonic\(\)"):
         porto.monotonic()
 
 

@@ -35,7 +35,7 @@ def current_time() -> float:
     """The runtime clock: seconds since the runtime started (virtual seconds in deterministic
     mode). Monotonic; sleep deadlines are measured on it: ``porto.current_time() + 5``.
 
-    Raises ``RuntimeError`` outside ``porto.run``: the clock belongs to the runtime.
+    Raises ``porto.NoRuntimeError`` outside ``porto.run``: the clock belongs to the runtime.
     """
 
 monotonic = current_time
@@ -74,7 +74,8 @@ class Scope:
         *args: *_Ts,
     ) -> Task[_T]:
         """Starts a child task, in a copy of the current context: a coroutine object, or an
-        async function called with ``args``. Raises ``RuntimeError`` outside the block."""
+        async function called with ``args``. Raises ``RuntimeError`` outside the block
+        (``porto.NoRuntimeError`` outside ``porto.run``)."""
 
     async def __aenter__(self) -> Self: ...
     async def __aexit__(
@@ -95,8 +96,8 @@ class Task(Generic[_T_co]):
         """Whether the task finished (returned or raised)."""
 
     def result(self) -> _T_co:
-        """What the task returned, or raises what it raised; ``RuntimeError`` if it has not
-        finished yet."""
+        """What the task returned, or raises what it raised; ``porto.InvalidStateError`` if it
+        has not finished yet, ``porto.RuntimeClosed`` if its runtime shut down first."""
 
 @final
 class _Trap:
@@ -168,7 +169,7 @@ def _yield_trap() -> _Trap:
 
 def _sleep_trap(delay: float, /) -> _Trap:
     """A trap that resumes the task ``delay`` seconds from now, never earlier. Reads the runtime
-    clock, so it raises ``RuntimeError`` outside ``porto.run``."""
+    clock, so it raises ``porto.NoRuntimeError`` outside ``porto.run``."""
 
 def _make_ready(value: _T_co, /) -> _Ready[_T_co]:
     """Test hook: a ready awaitable holding ``value``."""
@@ -183,3 +184,10 @@ def _take_unnormalized_exception(
 
 def _count_allocations(function: Callable[[], object], /) -> int:
     """Test hook: allocations CPython makes (MEM and OBJ domains) while ``function()`` runs."""
+
+def _raise_rust_error_chain(depth: int, /) -> NoReturn:
+    """Test hook: raises ``PortoError("level 0")`` from a Rust error whose source chain is
+    ``depth`` levels deep, one ``caused by: level N`` note per level."""
+
+def _raise_rust_panic(message: str, /) -> NoReturn:
+    """Test hook: panics in Rust with ``message`` and raises the resulting ``RustPanic``."""
