@@ -5,7 +5,7 @@
 //! the scheduler handle and the body: no output stage and no join-handle waker slot, which a
 //! `RustTask` needs and a PyTask does not. The poll protocol is the `RustTask`'s (see
 //! `harness`): poll start SCHEDULED → RUNNING, `Pending` goes idle or requeues, `Ready` sets
-//! COMPLETE, notifies the scheduler and releases the run reference.
+//! COMPLETE, notifies the scope and the scheduler and releases the run reference.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -23,6 +23,7 @@ use super::state::IdleAction;
 use super::task_ref::TaskRef;
 use super::waker::WakerRef;
 use super::{Notified, Schedule};
+use crate::scope::{TaskEnd, TaskScope};
 
 /// The body of a task that is not a Rust future: it keeps its outcome and its joiners itself.
 ///
@@ -41,6 +42,15 @@ pub trait TaskBody: Send + 'static {
     /// polled again. After a panic the body may be half-way through a step, so this must not
     /// assume a consistent resume state.
     fn cancel(self: Pin<&mut Self>, header: &Header);
+
+    /// The body returned `Ready` in a task spawned into a scope: the failure the scope records
+    /// (C4), or `None` if the body succeeded or its failure does not count (a `Cancelled` from
+    /// a scope that is cancelling it). The scope keeps the payload if it is its error type `E`
+    /// (see [`crate::scope::TaskEnd::Failed`]); any failure cancels the scope. Called once,
+    /// before the task completes, and not after `cancel`.
+    fn take_failure(self: Pin<&mut Self>) -> Option<Box<dyn Any + Send>> {
+        None
+    }
 }
 
 /// Header + scheduler handle + body, in one allocation. `repr(C)` keeps the header first and
@@ -137,8 +147,22 @@ where
     B: TaskBody,
     S: Schedule,
 {
+    new_body_task_in(body, scheduler, flags, None)
+}
+
+/// As [`new_body_task`], for a task spawned into `scope`, which hears of its end.
+pub(crate) fn new_body_task_in<B, S>(
+    body: B,
+    scheduler: S,
+    flags: TaskFlags,
+    scope: Option<TaskScope>,
+) -> (Notified, TaskBodyRef<B>)
+where
+    B: TaskBody,
+    S: Schedule,
+{
     let cell = Box::new(BodyCell {
-        header: Header::new(vtable::<B, S>(), flags, false),
+        header: Header::new(vtable::<B, S>(), flags, false, scope),
         scheduler,
         body: UnsafeCell::new(body),
     });
@@ -204,14 +228,21 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
     let prev = cell.header.state.transition_to_running();
     let polled = panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: we hold RUNNING until the transition after this closure.
-        let body = unsafe { body_mut(cell) };
+        let mut body = unsafe { body_mut(cell) };
         if prev.is_cancel_requested() {
             body.cancel(&cell.header);
-            return Poll::Ready(());
+            return Poll::Ready(Some(TaskEnd::Cancelled));
         }
         // SAFETY: the run reference outlives `waker`, which is not used after the poll.
         let waker = unsafe { WakerRef::new(task) };
-        body.poll(&cell.header, &mut Context::from_waker(&waker))
+        let polled = body
+            .as_mut()
+            .poll(&cell.header, &mut Context::from_waker(&waker));
+        // Only a task in a scope asks its body for a failure (`None` below), outside this panic
+        // guard: a body that returned `Ready` is never cancelled.
+        // SAFETY: we hold RUNNING and nobody else touches the slot.
+        let in_scope = unsafe { cell.header.has_scope() };
+        polled.map(|()| (!in_scope).then_some(TaskEnd::Completed))
     }));
     match polled {
         Ok(Poll::Pending) => match cell.header.state.transition_to_idle() {
@@ -222,7 +253,23 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
             IdleAction::Dealloc => unsafe { task.dealloc() },
         },
         // SAFETY: still RUNNING with the run reference, which `complete` releases.
-        Ok(Poll::Ready(())) => unsafe { complete::<B, S>(task, None) },
+        Ok(Poll::Ready(Some(end))) => unsafe { complete::<B, S>(task, end, None) },
+        // A panic in `take_failure` fails the task without a payload for the scope, and goes
+        // on once the task is released, like a panic in the poll (but the body is not
+        // cancelled: it already finished).
+        Ok(Poll::Ready(None)) => {
+            let failure = panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: still RUNNING.
+                unsafe { body_mut(cell) }.take_failure()
+            }));
+            let (end, unhandled) = match failure {
+                Ok(Some(failure)) => (TaskEnd::Failed(Some(failure)), None),
+                Ok(None) => (TaskEnd::Completed, None),
+                Err(payload) => (TaskEnd::Failed(None), Some(payload)),
+            };
+            // SAFETY: still RUNNING with the run reference, which `complete` releases.
+            unsafe { complete::<B, S>(task, end, unhandled) }
+        }
         // A body that panics completes: it is not polled again, and the panic goes on from
         // here once the task is released. It is cancelled first, so its joiners are released
         // instead of waiting forever; a panic from that cleanup is dropped (the first wins).
@@ -232,26 +279,37 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
                 unsafe { body_mut(cell) }.cancel(&cell.header);
             })));
             // SAFETY: as above.
-            unsafe { complete::<B, S>(task, Some(payload)) }
+            unsafe { complete::<B, S>(task, TaskEnd::Failed(None), Some(payload)) }
         }
     }
 }
 
-/// Poll end with `Ready`: set COMPLETE, notify the scheduler, release the run reference, then
-/// resume `panic` if the body panicked.
+/// Poll end with `Ready`: set COMPLETE, tell the scope the task ended with `end`, notify the
+/// scheduler, release the run reference, then resume `panic` if the body panicked (or else a
+/// panic from the scope's waker).
 ///
 /// # Safety
 /// The caller holds RUNNING and the run reference, which this consumes.
-unsafe fn complete<B: TaskBody, S: Schedule>(task: RawTask, panic: Option<Box<dyn Any + Send>>) {
+unsafe fn complete<B: TaskBody, S: Schedule>(
+    task: RawTask,
+    end: TaskEnd,
+    mut unhandled: Option<Box<dyn Any + Send>>,
+) {
     // SAFETY: the run reference keeps the allocation alive until the `ref_dec` below.
     let cell = unsafe { cell::<B, S>(task.as_ptr()) };
+    // SAFETY: we hold RUNNING and are completing the task.
+    let scope = unsafe { cell.header.take_scope() };
     cell.header.state.transition_to_complete();
+    if let Some(scope) = scope {
+        let notified = panic::catch_unwind(AssertUnwindSafe(|| scope.end(end)));
+        unhandled = unhandled.or(notified.err());
+    }
     cell.scheduler.task_completed(&cell.header);
     if cell.header.state.ref_dec() {
         // SAFETY: the decrement released the last reference.
         unsafe { task.dealloc() };
     }
-    if let Some(payload) = panic {
+    if let Some(payload) = unhandled {
         panic::resume_unwind(payload);
     }
 }
@@ -285,8 +343,19 @@ unsafe fn drop_body<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
 /// # Safety
 /// `ptr` is a `BodyCell<B, S>` whose refcount just reached zero.
 unsafe fn dealloc<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
-    // SAFETY: allocated by `Box` in `new_body_task`, and no reference is left to observe it.
-    drop(unsafe { Box::from_raw(ptr.cast::<BodyCell<B, S>>().as_ptr()) });
+    // SAFETY: allocated by `Box` in `new_body_task_in`, and no reference is left to observe it.
+    let cell = unsafe { Box::from_raw(ptr.cast::<BodyCell<B, S>>().as_ptr()) };
+    // A task that never completed still holds its scope: it ends as freed once what it owns
+    // is dropped. A panic from that drop goes on after the scope is told, which happens outside
+    // the unwind (a second panic there would abort).
+    // SAFETY: we hold the last reference.
+    let scope = unsafe { cell.header.take_scope() };
+    let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(cell))) else {
+        drop(scope);
+        return;
+    };
+    drop(panic::catch_unwind(AssertUnwindSafe(|| drop(scope))));
+    panic::resume_unwind(payload);
 }
 
 /// A body task has no join handle: its joiners wait through the body.

@@ -3,7 +3,7 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use super::{CancelCache, CancelReason, ScopeNode};
+use super::{CancelCache, CancelReason, ScopeNode, TaskEnd, TaskScope};
 
 type Scope = ScopeNode<&'static str>;
 
@@ -250,4 +250,86 @@ fn a_scope_tree_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Scope>();
     assert_send_sync::<Arc<Scope>>();
+}
+
+#[test]
+fn a_task_scope_counts_a_child_until_it_ends() {
+    let scope = Scope::new_root(0);
+    let first = TaskScope::attach(&scope);
+    let second = TaskScope::attach(&scope);
+    assert_eq!(scope.lock_state().live_children, 2);
+    assert_eq!(Arc::strong_count(&scope), 3);
+    first.end(TaskEnd::Completed);
+    assert_eq!(scope.lock_state().live_children, 1);
+    drop(second);
+    assert_eq!(
+        scope.lock_state().live_children,
+        0,
+        "a dropped link ends as freed"
+    );
+    assert_eq!(Arc::strong_count(&scope), 1);
+    assert_eq!(scope.cancel_called(), None);
+}
+
+#[test]
+fn a_failed_child_records_its_error_and_cancels_the_scope_and_its_nested_scopes() {
+    let scope = Scope::new_root(0);
+    let nested = child(&scope);
+    TaskScope::attach(&scope).end(TaskEnd::Failed(Some(Box::new("boom"))));
+    assert_eq!(scope.lock_state().errors, ["boom"]);
+    assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
+    assert!(cancelled(&nested));
+}
+
+#[test]
+fn a_failure_that_is_not_the_scope_error_type_still_cancels() {
+    let scope = Scope::new_root(0);
+    TaskScope::attach(&scope).end(TaskEnd::Failed(Some(Box::new(42_u32))));
+    TaskScope::attach(&scope).end(TaskEnd::Failed(None));
+    assert!(scope.lock_state().errors.is_empty());
+    assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
+}
+
+#[test]
+fn the_first_cancel_reason_wins_over_a_later_child_failure() {
+    let scope = Scope::new_root(0);
+    assert!(scope.cancel(CancelReason::Explicit));
+    TaskScope::attach(&scope).end(TaskEnd::Failed(Some(Box::new("late"))));
+    assert_eq!(scope.cancel_called(), Some(CancelReason::Explicit));
+    assert_eq!(scope.lock_state().errors, ["late"], "still recorded");
+}
+
+#[test]
+fn ends_that_are_not_failures_leave_the_scope_alone() {
+    let scope = Scope::new_root(0);
+    for end in [TaskEnd::Completed, TaskEnd::Cancelled, TaskEnd::Freed] {
+        TaskScope::attach(&scope).end(end);
+    }
+    assert_eq!(scope.lock_state().live_children, 0);
+    assert_eq!(scope.cancel_called(), None);
+    assert!(scope.lock_state().errors.is_empty());
+}
+
+#[test]
+fn task_end_debug_names_the_end() {
+    assert_eq!(format!("{:?}", TaskEnd::Freed), "Freed");
+    assert_eq!(
+        format!("{:?}", TaskEnd::Failed(Some(Box::new(1_u8)))),
+        "Failed(Some(..))"
+    );
+}
+
+#[test]
+fn tasks_spawned_into_a_scope_on_a_runtime_end_in_it() {
+    let rt = crate::Runtime::new();
+    let scope = Scope::new_root(0);
+    let handle = rt.handle();
+    let ok = handle.spawn_in(&scope, async { 1 });
+    let failed = handle.spawn_in(&scope, async { panic!("child failed") });
+    assert_eq!(scope.lock_state().live_children, 2);
+    assert_eq!(rt.block_on(ok).unwrap(), 1);
+    assert!(rt.block_on(failed).unwrap_err().is_panic());
+    assert_eq!(scope.lock_state().live_children, 0);
+    assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
+    assert_eq!(Arc::strong_count(&scope), 1);
 }

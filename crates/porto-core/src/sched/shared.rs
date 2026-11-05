@@ -9,9 +9,10 @@ use std::time::Duration;
 
 use super::lane;
 use super::timers::Timers;
+use crate::scope::{ScopeRef, TaskScope};
 use crate::task::{
     JoinHandle, Notified, Schedule, TaskBody, TaskBodyRef, TaskFlags, new_body_task,
-    new_joinable_task,
+    new_body_task_in, new_joinable_task, new_joinable_task_in,
 };
 use crate::time::{Deadline, RuntimeClock};
 
@@ -99,6 +100,42 @@ impl Handle {
     /// which keeps the outcome and the joiners itself.
     pub fn spawn_body<B: TaskBody>(&self, body: B, flags: TaskFlags) -> TaskBodyRef<B> {
         let (task, body) = new_body_task(body, self.clone(), flags);
+        if let Err(task) = self.schedule_local(task) {
+            self.clone().schedule_remote(task);
+        }
+        body
+    }
+
+    /// Spawns `future` into `scope`, as [`Handle::spawn`]: the scope counts it in
+    /// `live_children` until it ends, and hears how it ended (a panic cancels the scope, C4).
+    pub fn spawn_in<F, E>(&self, scope: &ScopeRef<E>, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+        E: Send + 'static,
+    {
+        let (task, join) =
+            new_joinable_task_in(future, self.clone(), Some(TaskScope::attach(scope)));
+        if let Err(task) = self.schedule_local(task) {
+            self.clone().schedule_remote(task);
+        }
+        join
+    }
+
+    /// Spawns a task running `body` into `scope`, as [`Handle::spawn_body`] and
+    /// [`Handle::spawn_in`]: the scope records what [`TaskBody::take_failure`] returns.
+    pub fn spawn_body_in<B, E>(
+        &self,
+        scope: &ScopeRef<E>,
+        body: B,
+        flags: TaskFlags,
+    ) -> TaskBodyRef<B>
+    where
+        B: TaskBody,
+        E: Send + 'static,
+    {
+        let scope = TaskScope::attach(scope);
+        let (task, body) = new_body_task_in(body, self.clone(), flags, Some(scope));
         if let Err(task) = self.schedule_local(task) {
             self.clone().schedule_remote(task);
         }

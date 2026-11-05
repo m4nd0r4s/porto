@@ -1,6 +1,6 @@
 //! loom models of the task state machine (`11-task-model-and-trap-protocol.md` §3): wake vs
 //! poll end, wake vs completion, abort vs poll, and the join handle (poll and drop) vs
-//! completion.
+//! completion, and a task's end vs its scope's exit wait.
 //!
 //! `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release task`
 
@@ -13,7 +13,8 @@ use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
-use super::{JoinError, JoinHandle, Notified, Schedule, new_joinable_task};
+use super::{JoinError, JoinHandle, Notified, Schedule, new_joinable_task, new_joinable_task_in};
+use crate::scope::{ScopeNode, TaskScope};
 
 /// Never on a lane: every wake lands in a shared queue the model drains.
 #[derive(Clone, Default)]
@@ -321,6 +322,83 @@ fn join_drop_vs_completion() {
             std::sync::Arc::strong_count(&wakes),
             1,
             "the join waker leaked"
+        );
+        assert!(queue.tasks_freed());
+    });
+}
+
+/// The scope's owner in `ScopeExit` (C5): parks until `live_children` is zero.
+fn wait_for_children(scope: &ScopeNode<()>) {
+    loom::future::block_on(poll_fn(|cx| {
+        let mut state = scope.lock_state();
+        if state.live_children == 0 {
+            return Poll::Ready(());
+        }
+        state.exit_waiter = Some(cx.waker().clone());
+        Poll::Pending
+    }));
+}
+
+/// A task in a scope completes on a lane while the scope's owner waits for its children: the
+/// owner is woken once the child ended (never lost, never early), and the task gives the scope
+/// back and is freed.
+#[test]
+fn completion_vs_scope_exit_wait() {
+    loom::model(|| {
+        let scope = ScopeNode::<()>::new_root(0);
+        let queue = Queue::default();
+        let (task, join) = new_joinable_task_in(
+            poll_fn(|_| Poll::Ready(1)),
+            queue.clone(),
+            Some(TaskScope::attach(&scope)),
+        );
+        drop(join);
+        let lane = thread::spawn(move || task.run());
+        wait_for_children(&scope);
+        assert_eq!(scope.lock_state().live_children, 0);
+        lane.join().unwrap();
+        assert_eq!(Arc::strong_count(&scope), 1, "the task released the scope");
+        assert!(queue.tasks_freed());
+    });
+}
+
+/// Two children end on two threads while the owner waits: one completes on a lane, the other
+/// is idle and freed when its last waker is dropped (it never completes). Each ends once, and
+/// the owner is woken by whichever ends last.
+#[test]
+fn completion_and_idle_free_vs_scope_exit_wait() {
+    loom::model(|| {
+        let scope = ScopeNode::<()>::new_root(0);
+        let queue = Queue::default();
+        let (done, done_join) = new_joinable_task_in(
+            poll_fn(|_| Poll::Ready(1)),
+            queue.clone(),
+            Some(TaskScope::attach(&scope)),
+        );
+        let parked: std::sync::Arc<std::sync::Mutex<Option<Waker>>> = Default::default();
+        let slot = std::sync::Arc::clone(&parked);
+        let (idle, idle_join) = new_joinable_task_in(
+            poll_fn(move |cx| {
+                *slot.lock().unwrap() = Some(cx.waker().clone());
+                Poll::<u32>::Pending
+            }),
+            queue.clone(),
+            Some(TaskScope::attach(&scope)),
+        );
+        drop((done_join, idle_join));
+        idle.run();
+        let waker = parked.lock().unwrap().take().unwrap();
+
+        let lane = thread::spawn(move || done.run());
+        let dropper = thread::spawn(move || drop(waker));
+        wait_for_children(&scope);
+        assert_eq!(scope.lock_state().live_children, 0);
+        lane.join().unwrap();
+        dropper.join().unwrap();
+        assert_eq!(
+            Arc::strong_count(&scope),
+            1,
+            "both tasks released the scope"
         );
         assert!(queue.tasks_freed());
     });
