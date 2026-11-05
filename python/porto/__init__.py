@@ -19,6 +19,7 @@ print(porto.run(main))
 ```
 """
 
+from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Scope,
     Task,
@@ -51,6 +52,7 @@ __all__ = [
     "BrokenResourceError",
     "Cancelled",
     "ClosedResourceError",
+    "DeterministicConfig",
     "EndOfChannel",
     "IncompleteReadError",
     "InvalidStateError",
@@ -59,6 +61,7 @@ __all__ = [
     "NoRuntimeError",
     "PortoError",
     "RuntimeClosed",
+    "RuntimeConfig",
     "RustPanic",
     "Scope",
     "Task",

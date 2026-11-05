@@ -4,7 +4,7 @@ The ``check_*`` functions are only type-checked; ``test_*`` also run them.
 """
 
 import asyncio
-from typing import assert_type
+from typing import Literal, assert_type
 
 import porto
 
@@ -46,6 +46,24 @@ def check_wrong_arguments_are_type_errors() -> None:
     porto.run(main)  # pyright: ignore[reportArgumentType]
 
 
+def check_run_takes_a_config_and_overrides() -> None:
+    config = porto.RuntimeConfig(lanes="auto", steal="eager", slow_step_threshold=None)
+    assert_type(config.lanes, int | Literal["auto"])
+    assert_type(config.slow_step_threshold, float | None)
+    assert_type(config.deterministic, porto.DeterministicConfig | None)
+    assert_type(porto.run(total, config=config), int)
+    assert_type(porto.run(total, config=config, coop_budget=64), int)
+    assert_type(porto.run(main, ["a"], lanes=2), list[bytes])
+
+
+def check_config_values_are_typed() -> None:
+    porto.RuntimeConfig(lanes="many")  # pyright: ignore[reportArgumentType]
+    porto.RuntimeConfig(steal="always")  # pyright: ignore[reportArgumentType]
+    porto.RuntimeConfig(4)  # pyright: ignore[reportCallIssue]
+    porto.DeterministicConfig(clock="wall")  # pyright: ignore[reportArgumentType]
+    porto.run(total, config={"lanes": 2})  # pyright: ignore[reportArgumentType]
+
+
 async def check_spawn_checks_the_arguments() -> None:
     async with porto.scope() as s:
         s.spawn(fetch, "a")  # pyright: ignore[reportArgumentType]
@@ -77,3 +95,7 @@ def check_errors_are_the_builtins_they_extend() -> None:
 
 def test_the_sample_runs() -> None:
     assert porto.run(main, ["a", "b"]) == [b"a:443", b"b:443"]
+
+
+def test_the_config_sample_runs() -> None:
+    check_run_takes_a_config_and_overrides()

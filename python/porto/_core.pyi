@@ -11,6 +11,8 @@ from collections.abc import Awaitable, Callable, Coroutine, Generator
 from types import TracebackType
 from typing import Any, Generic, Literal, NoReturn, Self, TypeVar, TypeVarTuple, final, overload
 
+from porto._config import RuntimeConfig
+
 _T = TypeVar("_T")
 _T_co = TypeVar("_T_co", covariant=True)
 _Ts = TypeVarTuple("_Ts")
@@ -19,9 +21,19 @@ __version__: str
 
 # Running
 
-def run(main: Callable[[*_Ts], Awaitable[_T]] | Awaitable[_T], /, *args: *_Ts) -> _T:
+def run(
+    main: Callable[[*_Ts], Awaitable[_T]] | Awaitable[_T],
+    /,
+    *args: *_Ts,
+    config: RuntimeConfig | None = None,
+    **config_overrides: Any,
+) -> _T:
     """Runs ``main(*args)`` (or the awaitable ``main``) as the main task of a new runtime whose
     lane 0 is the calling thread, and returns its result or raises its exception.
+
+    The runtime's settings are ``config_overrides`` (``lanes=4``) over ``config`` over the
+    ``PORTO_*`` environment variables over the defaults; see ``porto.RuntimeConfig``. They are
+    checked before ``main`` is called. Unknown ``PORTO_*`` variables warn.
 
     Ctrl-C raises ``KeyboardInterrupt`` out of it within about 50 ms, also while every task
     sleeps. A ``KeyboardInterrupt`` or ``SystemExit`` raised by a task nobody waits for also
@@ -181,6 +193,12 @@ def _take_unnormalized_exception(
     exc_type: type[BaseException], value: object, traceback: TracebackType | None, /
 ) -> BaseException:
     """Test hook: ``PyErr_Restore`` of the raw triple, then porto's ``take_exception``."""
+
+def _physical_cores() -> int:
+    """The machine's physical core count (logical if unknown)."""
+
+def _auto_lanes(gil_build: bool, cores: int, /) -> int:
+    """What ``lanes="auto"`` resolves to with ``cores`` physical cores."""
 
 def _count_allocations(function: Callable[[], object], /) -> int:
     """Test hook: allocations CPython makes (MEM and OBJ domains) while ``function()`` runs."""

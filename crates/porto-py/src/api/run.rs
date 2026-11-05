@@ -1,12 +1,15 @@
-//! `porto.run(main, *args)`, and the private `_run(coro)` and `_spawn(coro)`.
+//! `porto.run(main, *args, config=None, **overrides)`, and the private `_run(coro)` and
+//! `_spawn(coro)`.
 
 use porto_core::Handle;
+use porto_core::config::RuntimeConfig;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyTuple, PyType};
+use pyo3::types::{PyDict, PyTuple, PyType};
 
+use super::config;
 use crate::driver::lane;
 use crate::driver::pytask::{self, Spawned};
 use crate::errors::NoRuntimeError;
@@ -18,12 +21,19 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(spawn, module)?)
 }
 
-/// `porto.run(main, *args)`: runs `main(*args)` (or the coroutine object `main`) as the main task
-/// of a fresh runtime whose lane 0 is this thread, and returns its result or raises its
-/// exception. Ctrl-C raises `KeyboardInterrupt` out of it, also while every task sleeps.
+/// `porto.run(main, *args, config=None, **overrides)`: runs `main(*args)` (or the coroutine
+/// object `main`) as the main task of a fresh runtime whose lane 0 is this thread, and returns
+/// its result or raises its exception. Ctrl-C raises `KeyboardInterrupt` out of it, also while
+/// every task sleeps. The configuration is resolved first, so an invalid one raises before
+/// `main` is called.
 #[pyfunction]
-#[pyo3(signature = (main, /, *args))]
-fn run(main: Bound<'_, PyAny>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (main, /, *args, config=None, **overrides))]
+fn run(
+    main: Bound<'_, PyAny>,
+    args: Bound<'_, PyTuple>,
+    config: Option<Bound<'_, PyAny>>,
+    overrides: Option<Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
     if Handle::try_current().is_some() {
         return Err(PyRuntimeError::new_err(
             "porto: porto.run() cannot be called from inside a running porto runtime; `await` \
@@ -31,8 +41,9 @@ fn run(main: Bound<'_, PyAny>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> 
              s.spawn(...)`",
         ));
     }
+    let config = config::resolve(main.py(), config.as_ref(), overrides.as_ref())?;
     let coro = coroutine_from(&main, &args, "porto.run")?;
-    run_main_task(coro)
+    run_main_task(&config, coro)
 }
 
 /// Runs `coro` to completion as a task on a fresh single-lane runtime, on this thread, and
@@ -48,12 +59,12 @@ fn private_run(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         ));
     }
     expect_coroutine(&coro, "_run")?;
-    run_main_task(coro)
+    run_main_task(&RuntimeConfig::default(), coro)
 }
 
-fn run_main_task(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+fn run_main_task(config: &RuntimeConfig, coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let py = coro.py();
-    let outcome = lane::run(py, |runtime| {
+    let outcome = lane::run(py, config, |runtime| {
         let main = pytask::spawn(runtime.handle(), coro, Spawned::Joined)?;
         PyResult::Ok(runtime.block_on(lane::main_or_interrupt(pytask::join(main))))
     })?;

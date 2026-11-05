@@ -21,6 +21,8 @@ pyo3 = "0.30"
 pyo3-build-config = "0.30"
 # The epoll/kqueue/IOCP poller under porto-io. No `log`: porto reports through its own channels.
 mio = { version = "1.2.4", default-features = false, features = ["os-poll", "os-ext"] }
+# Physical core count for `lanes="auto"` (12-scheduler-and-lanes.md §7); std only knows logical.
+num_cpus = "1.17"
 # Property and model-based tests (dev only; 52-testing-strategy.md item 1).
 proptest = "1.12"
 
