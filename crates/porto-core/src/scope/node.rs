@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::marker::PhantomPinned;
 use std::ptr;
 use std::sync::PoisonError;
@@ -98,7 +99,28 @@ pub struct ScopeState<E> {
     /// The tasks whose innermost scope this is and that wait in a cancellable wait, by task
     /// key: a cancel that reaches this scope wakes them (C10). See
     /// [`ScopeNode::register_waiter`].
-    waiters: HashMap<usize, Waker>,
+    waiters: HashMap<usize, Waker, BuildHasherDefault<KeyHasher>>,
+}
+
+/// Hashes the task keys of [`ScopeState::waiters`]: addresses, unique and spread already, so a
+/// multiply is enough (and a scope made per request pays for no random hasher state).
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_usize(&mut self, key: usize) {
+        self.0 = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
 }
 
 /// An intrusive list of child scopes: the head here, the links in each child.
@@ -197,7 +219,7 @@ impl<E: Send + 'static> ScopeNode<E> {
                 errors: Vec::new(),
                 exit_waiter: None,
                 child_scopes: ChildList { head: ptr::null() },
-                waiters: HashMap::new(),
+                waiters: HashMap::default(),
             }),
             _not_unique: PhantomPinned,
         }

@@ -18,7 +18,7 @@
 //! Not yet: deadlines and timeouts (C9), shields (C8), names, `start()` (§3), `Task.cancel()` and
 //! awaiting a task (§4), and spawning from other lanes or threads (C10).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use porto_core::scope::{CancelReason, ScopeNode};
@@ -49,7 +49,8 @@ fn scope() -> Scope {
     Scope {
         node: OnceLock::new(),
         closed: AtomicBool::new(false),
-        cancel_request: Mutex::new(None),
+        cancel_requested: AtomicBool::new(false),
+        cancel_reason: Mutex::new(None),
         cancelled_caught: AtomicBool::new(false),
     }
 }
@@ -61,17 +62,14 @@ pub struct Scope {
     node: OnceLock<PyScopeRef>,
     /// Whether its `async with` block exited.
     closed: AtomicBool,
-    /// Set by the first `cancel()`, with its reason. Also how a cancel before the block is
-    /// entered reaches the node: `cancel` reads `node` under this lock, and `__aenter__` reads
-    /// the request under it after setting `node`, so one of them cancels the node.
-    cancel_request: Mutex<Option<CancelRequest>>,
+    /// Set by `cancel()`. Also how a cancel before the block is entered reaches the node:
+    /// `cancel` sets it then reads `node`, `__aenter__` sets `node` then reads it, each with a
+    /// `SeqCst` fence between, so at least one of them sees the other and cancels the node.
+    cancel_requested: AtomicBool,
+    /// The reason the first `cancel()` gave, for the repr.
+    cancel_reason: Mutex<Option<String>>,
     /// Whether the exit absorbed a `Cancelled` this scope caused (C3).
     cancelled_caught: AtomicBool,
-}
-
-/// A `Scope.cancel()` call.
-struct CancelRequest {
-    reason: Option<String>,
 }
 
 /// Where a scope is in its life.
@@ -163,7 +161,8 @@ impl Scope {
             step::exit_cancel_scope(&node);
             return Err(entered_twice());
         }
-        if this.lock_cancel_request().is_some() {
+        fence(Ordering::SeqCst);
+        if this.cancel_requested.load(Ordering::Relaxed) {
             // Cancelled before it was entered.
             node.cancel(CancelReason::Explicit);
         }
@@ -221,14 +220,15 @@ impl Scope {
     /// Safe from any thread. Cancelling again, or a closed scope, does nothing.
     #[pyo3(signature = (reason = None))]
     fn cancel(&self, reason: Option<String>) {
-        let node = {
-            let mut request = self.lock_cancel_request();
-            if request.is_none() {
-                *request = Some(CancelRequest { reason });
+        if !self.cancel_requested.load(Ordering::Acquire) {
+            let mut first = self.lock_cancel_reason();
+            if first.is_none() {
+                *first = reason;
             }
-            self.node.get().cloned()
-        };
-        if let Some(node) = node {
+        }
+        self.cancel_requested.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
+        if let Some(node) = self.node.get() {
             node.cancel(CancelReason::Explicit);
         }
     }
@@ -239,7 +239,7 @@ impl Scope {
         self.node
             .get()
             .is_some_and(|node| node.cancel_called().is_some())
-            || self.lock_cancel_request().is_some()
+            || self.cancel_requested.load(Ordering::Acquire)
     }
 
     /// Whether the exit absorbed a `Cancelled` this scope's cancellation raised (C3).
@@ -275,10 +275,7 @@ impl Scope {
         let Some(node) = self.node.get() else {
             return format!("<porto.Scope {phase}>");
         };
-        let reason = self
-            .lock_cancel_request()
-            .as_ref()
-            .and_then(|request| request.reason.clone());
+        let reason = self.lock_cancel_reason().clone();
         let cancelled = match (node.cancel_called(), reason) {
             (None, _) => String::new(),
             (Some(CancelReason::Explicit), Some(reason)) => format!(", cancelled: {reason:?}"),
@@ -312,8 +309,8 @@ impl Scope {
         }
     }
 
-    fn lock_cancel_request(&self) -> MutexGuard<'_, Option<CancelRequest>> {
-        self.cancel_request
+    fn lock_cancel_reason(&self) -> MutexGuard<'_, Option<String>> {
+        self.cancel_reason
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -340,7 +337,8 @@ impl Scope {
     /// cancelled (C3; one from an enclosing scope's cancellation goes on).
     fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         let py = exc.py();
-        let absorbed = exc.is_instance_of::<Cancelled>()
+        let absorbed = !exc.is_none()
+            && exc.is_instance_of::<Cancelled>()
             && self
                 .node
                 .get()

@@ -564,7 +564,7 @@ mod tests {
         assert!(!stack.exit(&outer), "not the innermost one");
         assert!(stack.exit(&inner));
         assert!(stack.exit(&outer));
-        assert!(std::ptr::eq(&**stack.innermost().unwrap(), &*base));
+        assert_eq!(stack.innermost().unwrap().id(), base.id());
         assert_eq!(stack.depth, 0);
     }
 

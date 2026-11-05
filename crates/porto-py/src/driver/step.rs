@@ -46,7 +46,7 @@
 //! `Scope.__aenter__` and `__aexit__` push and pop scopes on it ([`enter_cancel_scope`],
 //! [`exit_cancel_scope`]) while the loop holds the task.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::ptr;
 use std::task::{Context, Poll, Waker};
 
@@ -79,14 +79,23 @@ struct Running {
     /// Steps and synchronous completions left in this poll (T2).
     budget: Cell<u32>,
     /// The task's cancel stack while its coroutine runs (moved out of the task around each
-    /// step), empty otherwise.
-    stack: RefCell<CancelStack>,
+    /// step), empty otherwise. Reached through [`Running::with_stack`].
+    stack: Cell<CancelStack>,
     /// The task's effective cancellation, cached for the poll: one atomic load per check
     /// while no scope anywhere was cancelled since the last one.
     cache: Cell<CancelCache>,
 }
 
 impl Running {
+    /// Runs `f` on the cancel stack. `f` MUST NOT run Python code, which could reach the stack
+    /// again.
+    fn with_stack<R>(&self, f: impl FnOnce(&mut CancelStack) -> R) -> R {
+        let mut stack = self.stack.take();
+        let result = f(&mut stack);
+        self.stack.set(stack);
+        result
+    }
+
     /// Whether a task whose innermost scope is `scope` is effectively cancelled.
     #[inline]
     fn is_cancelled(&self, scope: Option<&PyScopeNode>) -> bool {
@@ -182,16 +191,16 @@ pub(crate) fn spend_budget() -> bool {
 
 /// The `Cancelled` to raise in the running task, if its effective scope is cancelled.
 fn running_cancellation(py: Python<'_>, running: &Running) -> Option<Py<PyBaseException>> {
-    let stack = running.stack.borrow();
-    let scope = stack.innermost().map(|scope| &**scope);
-    running
-        .is_cancelled(scope)
-        .then(|| scope.map(|scope| cancelled_exception(py, scope)))
-        .flatten()
+    let cancelled = running.with_stack(|stack| {
+        let scope = stack.innermost()?;
+        running.is_cancelled(Some(scope)).then(|| scope.clone())
+    })?;
+    Some(cancelled_exception(py, &cancelled))
 }
 
 /// Enters a new cancel scope in the task running on this thread: `make(parent, owner)` builds
-/// its node, given the task's innermost scope (`None` outside every scope) and the task's id.
+/// its node (no Python code), given the task's innermost scope (`None` outside every scope) and
+/// the task's id.
 /// Returns the node, or `None` (and makes nothing) if no task's coroutine is running here.
 pub(crate) fn enter_cancel_scope(
     make: impl FnOnce(Option<&PyScopeRef>, u64) -> PyScopeRef,
@@ -199,17 +208,18 @@ pub(crate) fn enter_cancel_scope(
     let Some(running) = running() else {
         return Ok(None);
     };
-    let mut stack = running.stack.borrow_mut();
-    let scope = make(stack.innermost(), running.task_id);
-    stack.enter(scope.clone())?;
-    Ok(Some(scope))
+    running.with_stack(|stack| {
+        let scope = make(stack.innermost(), running.task_id);
+        stack.enter(scope.clone())?;
+        Ok(Some(scope))
+    })
 }
 
 /// Exits `scope` in the task running on this thread. Returns `false`, changing nothing, if no
 /// task runs here or `scope` is not its innermost entered scope.
 pub(crate) fn exit_cancel_scope(scope: &PyScopeNode) -> bool {
     running().is_some_and(|running| {
-        scope.owner_task() == running.task_id && running.stack.borrow_mut().exit(scope)
+        scope.owner_task() == running.task_id && running.with_stack(|stack| stack.exit(scope))
     })
 }
 
@@ -270,7 +280,7 @@ pub(super) fn poll(
         // The lane's budget for this poll (`coop_budget`), kept here so a step does not touch a
         // thread local. Rust futures the task awaits draw on the lane's own count.
         budget: Cell::new(coop::remaining().unwrap_or(u32::MAX)),
-        stack: RefCell::new(CancelStack::default()),
+        stack: Cell::new(CancelStack::default()),
         cache: Cell::new(CancelCache::new()),
     };
     let outcome = {
