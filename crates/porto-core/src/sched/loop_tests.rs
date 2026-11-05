@@ -149,9 +149,12 @@ fn self_waking_tasks_do_not_starve_the_injector() {
     let waits = waits.lock().unwrap();
     assert_eq!(waits.len(), rounds);
     let worst = *waits.iter().max().unwrap();
+    // The spec's bound is 2 x GLOBAL_QUEUE_INTERVAL; with one injected task at a time and the
+    // local queue never empty, the loop does better: the next injector-first tick.
     assert!(
-        worst <= 2 * GLOBAL_QUEUE_INTERVAL,
-        "an injected task waited {worst} ticks behind self-waking tasks (limit {}): {waits:?}",
+        worst <= GLOBAL_QUEUE_INTERVAL,
+        "an injected task waited {worst} ticks behind self-waking tasks (limit {GLOBAL_QUEUE_INTERVAL}, \
+         spec bound {}): {waits:?}",
         2 * GLOBAL_QUEUE_INTERVAL
     );
 }
@@ -315,6 +318,7 @@ impl Driver for CountingDriver {
     fn deregister(&self, _id: RegistrationId) -> io::Result<()> {
         Err(io::Error::other("not a real driver"))
     }
+    fn shutdown(&self) {}
     fn turn(&self, timeout: Option<Duration>) -> io::Result<usize> {
         let (lock, condvar) = &*self.state;
         let mut state = lock.lock().unwrap();
@@ -434,4 +438,99 @@ fn readiness_from_the_os_driver_wakes_a_task() {
     }));
     let _writer = writer_thread.join().unwrap();
     driver.deregister(id).unwrap();
+}
+
+#[test]
+fn a_panicking_deferred_work_does_not_lose_the_rest_of_its_batch() {
+    let rt = Runtime::new();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let handle = rt.handle().clone();
+    handle
+        .defer(|| panic!("deferred work panicked"))
+        .unwrap_or_else(|_| panic!("the runtime is alive"));
+    {
+        let ran = ran.clone();
+        handle
+            .defer(move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap_or_else(|_| panic!("the runtime is alive"));
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.run_until_idle()));
+    assert!(outcome.is_err(), "the panic goes on");
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the rest of the batch ran");
+}
+
+#[test]
+fn a_panic_in_deferred_work_at_drop_still_runs_the_rest_and_closes_the_queue() {
+    let rt = Runtime::new();
+    let handle = rt.handle().clone();
+    let ran = Arc::new(AtomicUsize::new(0));
+    handle
+        .defer(|| panic!("deferred work panicked"))
+        .unwrap_or_else(|_| panic!("the runtime is alive"));
+    {
+        let ran = ran.clone();
+        handle
+            .defer(move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap_or_else(|_| panic!("the runtime is alive"));
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(rt)));
+    assert!(outcome.is_err(), "the panic goes on after the shutdown");
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the rest of the batch ran");
+    let late = handle.defer(|| unreachable!("the runtime is gone"));
+    assert!(late.is_err(), "the queue is closed");
+}
+
+// miri cannot run kqueue or epoll.
+#[cfg(all(unix, not(miri)))]
+#[test]
+fn a_task_waiting_on_io_is_freed_when_the_runtime_drops() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    use porto_io::{Direction, MioDriver};
+
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let driver = Arc::new(MioDriver::new().unwrap());
+    let weak = Arc::downgrade(&driver);
+    let rt = Runtime::builder().driver(driver.clone()).build();
+    let (reader, _writer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let id = driver
+        .register(RawSource::new(reader.as_raw_fd()), Interest::READABLE)
+        .unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = Flag(dropped.clone());
+    let task_driver = Arc::downgrade(&driver);
+    drop(driver);
+    let join = rt.handle().spawn(poll_fn(move |cx| {
+        let _flag = &flag;
+        let driver = task_driver.upgrade().expect("the runtime owns the driver");
+        let io = driver.slab().get(id).unwrap();
+        io.poll_readiness(cx, id, Direction::Read).map(|_| ())
+    }));
+    drop(join);
+    rt.run_until_idle();
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "the task waits on the socket"
+    );
+    drop(rt);
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the task was freed at shutdown"
+    );
+    assert!(
+        weak.upgrade().is_none(),
+        "the driver was freed with the runtime"
+    );
 }

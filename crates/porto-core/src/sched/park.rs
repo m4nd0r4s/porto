@@ -16,6 +16,11 @@ use crate::sync::primitives::{AtomicUsize, Mutex, Thread};
 
 /// Wraps every park of a lane thread. Install it with [`Runtime::with_park_hook`].
 ///
+/// A wake that lands just before the lane blocks is kept as the thread's park token, so the
+/// hook MUST NOT call `std::thread::park` itself (directly or through a std channel) before
+/// handing over to `park`: it could consume that token and the lane would sleep through the
+/// wake.
+///
 /// [`Runtime::with_park_hook`]: super::Runtime::with_park_hook
 pub trait ParkHook: Send + 'static {
     /// Called on the lane thread instead of parking it. MUST call `park` once: it blocks until

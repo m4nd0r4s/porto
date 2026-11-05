@@ -13,13 +13,15 @@
 //! runtime has one, else on its thread, never past the earliest timer. There is no LIFO slot
 //! and no stealing yet (M2).
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::park::ParkHook;
-use super::shared::{Handle, Remote, Shared};
+use super::shared::{DeferredWork, Handle, Remote, Shared};
 use crate::sync::primitives::{Thread, park};
 use crate::task::Notified;
 use crate::time::Deadline;
@@ -124,12 +126,13 @@ impl Lane {
         shared.timers.fire_expired(|| shared.clock.now())
     }
 
-    /// Runs the work other threads deferred to this lane. Returns how many ran.
+    /// Runs the work other threads deferred to this lane. Returns how many ran. A panicking
+    /// item does not lose the rest of the batch: every item runs, then the first panic goes on.
     fn run_deferred(&self) -> usize {
         let deferred = self.remote().deferred.take_all();
         let ran = deferred.len();
-        for work in deferred {
-            work();
+        if let Some(payload) = run_each(deferred) {
+            panic::resume_unwind(payload);
         }
         ran
     }
@@ -192,4 +195,15 @@ impl Lane {
             Some(deadline) => shared.clock.park_until(deadline),
         }
     }
+}
+
+/// Runs every item of `batch`, each under its own panic guard, and returns the first panic.
+pub(crate) fn run_each(batch: VecDeque<DeferredWork>) -> Option<Box<dyn Any + Send>> {
+    let mut first = None;
+    for work in batch {
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(work)) {
+            first.get_or_insert(payload);
+        }
+    }
+    first
 }

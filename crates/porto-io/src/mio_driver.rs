@@ -118,6 +118,16 @@ impl Driver for MioDriver {
         removed
     }
 
+    fn shutdown(&self) {
+        // Taken out first: releasing wakes tasks, whose cancellation may deregister sources.
+        let sources = std::mem::take(&mut *self.sources());
+        for (id, raw) in sources {
+            // The poller goes away with the driver; a refused removal changes nothing here.
+            drop(os::deregister(&self.registry, raw));
+            self.slab.release(id);
+        }
+    }
+
     fn turn(&self, timeout: Option<Duration>) -> io::Result<usize> {
         let mut guard = self.poll.lock().unwrap_or_else(PoisonError::into_inner);
         let (poll, events) = &mut *guard;

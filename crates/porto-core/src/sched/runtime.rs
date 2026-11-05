@@ -3,6 +3,7 @@
 use std::fmt;
 use std::future::Future;
 use std::mem;
+use std::panic;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,7 @@ use std::time::Duration;
 use porto_io::Driver;
 
 use super::context::Enter;
-use super::lane::Lane;
+use super::lane::{Lane, run_each};
 use super::park::ParkHook;
 use super::shared::{Handle, Shared};
 use super::timers::Timers;
@@ -75,6 +76,10 @@ impl Builder {
     /// blocking every 61 tasks and before parking, and parks in it (unparks wake it). A
     /// custom [`clock`](Builder::clock) is then only read, not parked on: the driver waits in
     /// wall-clock time.
+    ///
+    /// One runtime per driver: a driver shared by two runtimes serializes their polls and
+    /// delivers one runtime's readiness from the other's thread. The runtime releases the
+    /// driver's registrations ([`Driver::shutdown`]) when it is dropped.
     pub fn driver(mut self, driver: Arc<dyn Driver>) -> Self {
         self.driver = Some(driver);
         self
@@ -217,9 +222,18 @@ impl Drop for Runtime {
         let shared = self.lane.handle.shared.clone();
         // Dropping a queue entry cancels its task and drops its future, whose destructor may
         // wake other tasks; with the injector closed (and no lane entered), those wakes cancel
-        // their task instead of queueing it. Deferred work still runs here, on the lane
-        // thread, until the queue is closed too.
+        // their task instead of queueing it. Deferred work still runs here, on the thread
+        // dropping the runtime (which is the lane's thread unless the runtime was sent), until
+        // the queue is closed too. A panic in deferred work does not stop the shutdown: it goes
+        // on once everything is released (unless this drop is already unwinding).
         let mut remote = shared.inject.close();
+        // Tasks waiting on I/O are only reachable through the driver's slots, and the driver is
+        // kept alive by them (driver -> waker -> task -> handle -> shared -> driver): releasing
+        // the registrations wakes them, which cancels them.
+        if let Some(driver) = &shared.driver {
+            driver.shutdown();
+        }
+        let mut panicked = None;
         loop {
             let local = mem::take(&mut *self.lane.local.borrow_mut());
             let had_timers = shared.timers.drop_all();
@@ -229,13 +243,16 @@ impl Drop for Runtime {
             }
             drop(local);
             drop(remote);
-            for work in deferred {
-                work();
-            }
+            let failed = run_each(deferred);
+            panicked = panicked.or(failed);
             remote = shared.inject.close();
         }
-        for work in shared.lanes[self.lane.index()].deferred.close() {
-            work();
+        let failed = run_each(shared.lanes[self.lane.index()].deferred.close());
+        panicked = panicked.or(failed);
+        if let Some(payload) = panicked
+            && !std::thread::panicking()
+        {
+            panic::resume_unwind(payload);
         }
     }
 }
@@ -262,9 +279,10 @@ impl Wake for RootWaker {
         self.wake_by_ref();
     }
     fn wake_by_ref(self: &Arc<Self>) {
-        // A swap rather than a store, as in the loom model (`sched::loom_tests`), which loom
-        // checks cleanly; with a plain store it reports the waker reading back a stale value
-        // and a lost wakeup. The swap costs the same here.
+        // A swap rather than a store, as in the loom model (`sched::loom_tests`). A plain store
+        // is correct, but loom then lets a later read-modify-write observe an older value and
+        // reports a lost wakeup even for a SeqCst store: a loom artifact. The swap costs the
+        // same here.
         self.woken.swap(true, Ordering::AcqRel);
         self.shared.notify_lane(self.lane);
     }

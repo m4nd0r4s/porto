@@ -42,6 +42,11 @@ pub trait Driver: Send + Sync {
     /// Unblocks [`turn`](Driver::turn) from another thread.
     fn waker(&self) -> &DriverWaker;
 
+    /// Releases every live registration, waking its waiters with [`Ready::CLOSED`]: the runtime
+    /// calls it when it shuts down, so the wakers parked here (which keep their tasks, and
+    /// through them the runtime that owns this driver, alive) are dropped.
+    fn shutdown(&self);
+
     /// Which backend this is.
     fn kind(&self) -> DriverKind;
 }
@@ -224,6 +229,8 @@ mod tests {
         fn deregister(&self, id: RegistrationId) -> io::Result<()> {
             self.slab.release(id).then_some(()).ok_or_else(stale)
         }
+
+        fn shutdown(&self) {}
 
         fn turn(&self, _timeout: Option<Duration>) -> io::Result<usize> {
             let queued = std::mem::take(&mut *self.queued.lock().unwrap());
