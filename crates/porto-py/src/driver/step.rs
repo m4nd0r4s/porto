@@ -219,13 +219,9 @@ pub(crate) fn exit_cancel_scope(scope: &PyScopeNode) -> bool {
 /// cancelled: its message says which cancellation it is.
 fn cancelled_exception(py: Python<'_>, scope: &PyScopeNode) -> Py<PyBaseException> {
     let why = match scope.effective_cancellation().map(|found| found.reason) {
-        Some(CancelReason::Deadline) => {
-            "the deadline of its scope, or of one it is nested in, \
-                                         passed"
-        }
+        Some(CancelReason::Deadline) => "the deadline of its scope, or of one it is in, passed",
         Some(CancelReason::ChildFailed) => {
-            "a task of its scope, or of one it is nested in, \
-                                            failed, which cancels the scope (C4)"
+            "a task of its scope, or of one it is nested in, failed, which cancels the scope (C4)"
         }
         Some(CancelReason::Shutdown) => "the runtime is shutting down",
         _ => "Scope.cancel() was called on its scope or on one it is nested in",

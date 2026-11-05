@@ -149,12 +149,13 @@ def test_C2_the_cancelling_task_runs_on_until_its_next_await() -> None:
     assert events == ["after cancel()", "after the block"]
 
 
-@pytest.mark.parametrize("wait", ["sleep", "join", "notified"])
+@pytest.mark.parametrize("wait", ["sleep", "join", "notified", "lock", "recv", "event"])
 def test_C10_cancel_from_foreign_thread(wait: str) -> None:
-    # A task blocked in a wait is woken by a cancel from a plain thread. Channel receives and
-    # locks wait the same way as the `Notified` probe; their own tests cover them once they
-    # land (porto-szb.47, porto-szb.103).
+    # A task blocked in a wait is woken by a cancel from a plain thread.
     probe = _core._WaitProbe()
+    lock = porto.Lock()
+    event = porto.Event()
+    _sender, receiver = porto.channel[int](1)
     waiting = threading.Event()
     outcome: list[str] = []
 
@@ -168,8 +169,14 @@ def test_C10_cancel_from_foreign_thread(wait: str) -> None:
                 await porto.sleep(3600)
             elif wait == "join":
                 await _core._spawn_joinable(forever()).join()
-            else:
+            elif wait == "notified":
                 await probe.wait()
+            elif wait == "lock":
+                await lock.acquire()
+            elif wait == "recv":
+                await receiver.recv()
+            else:
+                await event.wait()
         except porto.Cancelled:
             outcome.append("cancelled")
             raise
@@ -181,6 +188,7 @@ def test_C10_cancel_from_foreign_thread(wait: str) -> None:
         scope.cancel("from a thread")
 
     async def main() -> None:
+        await lock.acquire()
         async with porto.scope() as s:
             s.spawn(blocked)
             thread = threading.Thread(target=canceller, args=(s,))
@@ -194,6 +202,10 @@ def test_C10_cancel_from_foreign_thread(wait: str) -> None:
     porto.run(main)
     assert time.monotonic() - started < 5
     assert outcome == ["cancelled"]
+    # The cancelled waiter left nothing behind: the lock is still main's alone.
+    assert lock.locked()
+    lock.release()
+    assert not lock.locked()
 
 
 def test_C4_a_failing_child_stops_a_sleeping_sibling_promptly() -> None:
@@ -397,3 +409,35 @@ def test_a_task_waiting_in_a_scope_is_freed_when_the_run_ends() -> None:
 
     _core._run(main())
     assert closed == ["sleeper"]
+
+
+def test_szb105_a_lock_handed_over_just_before_a_cancel_is_never_leaked() -> None:
+    # main releases the lock to the waiting task (a grant in its wait node), then cancels the
+    # scope before that task runs. The wait is over, so the task resumes holding the lock and
+    # gets `Cancelled` at its next await, which its `async with` turns into a release.
+    lock = porto.Lock()
+    events: list[str] = []
+
+    async def holder() -> None:
+        events.append("waiting")
+        try:
+            async with lock:
+                events.append("holding")
+                await porto.checkpoint()
+                events.append("not reached")
+        except porto.Cancelled:
+            events.append("cancelled")
+            raise
+
+    async def main() -> None:
+        await lock.acquire()
+        async with porto.scope() as s:
+            s.spawn(holder)
+            await wait_until(lambda: bool(events))
+            await porto.checkpoint()
+            lock.release()
+            s.cancel()
+        assert not lock.locked()
+
+    porto.run(main)
+    assert events == ["waiting", "holding", "cancelled"]
