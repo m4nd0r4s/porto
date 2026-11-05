@@ -352,6 +352,13 @@ def test_sleep_and_checkpoint_outside_run_raise_and_say_what_to_do() -> None:
         porto.checkpoint()
 
 
+def test_current_time_outside_run_raises_and_says_what_to_do() -> None:
+    with pytest.raises(RuntimeError, match=r"porto.current_time\(\) was called outside porto.run"):
+        porto.current_time()
+    with pytest.raises(RuntimeError, match=r"use time.monotonic\(\)"):
+        porto.monotonic()
+
+
 def test_a_negative_sleep_raises() -> None:
     async def main() -> None:
         await porto.sleep(-1)
@@ -366,6 +373,41 @@ def test_task_is_subscriptable_at_runtime() -> None:
 
 
 # Time
+
+
+def test_monotonic_is_current_time() -> None:
+    assert porto.monotonic is porto.current_time
+    assert _core.monotonic is _core.current_time
+
+
+def test_current_time_counts_from_the_runtime_start_and_never_goes_backwards() -> None:
+    async def main() -> list[float]:
+        readings = [porto.current_time()]
+        for _ in range(1000):
+            readings.append(porto.current_time())
+        await porto.sleep(0.01)
+        readings.append(porto.monotonic())
+        return readings
+
+    first = porto.run(main)
+    assert 0 <= first[0] < 1
+    assert first == sorted(first)
+    assert first[-1] - first[0] >= 0.01
+    time.sleep(0.02)
+    # A new run has a new clock: it starts at zero again.
+    second = porto.run(main)
+    assert second[0] < first[-1]
+
+
+def test_sleep_deadlines_are_on_the_runtime_clock() -> None:
+    async def main() -> None:
+        trap = _core._sleep_trap(0.01)
+        assert trap.deadline is not None
+        assert porto.current_time() <= trap.deadline <= porto.current_time() + 0.01
+        await trap
+        assert porto.current_time() >= trap.deadline
+
+    porto.run(main)
 
 
 def test_sleeps_wake_in_deadline_order_never_early() -> None:

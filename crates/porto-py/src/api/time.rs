@@ -1,4 +1,5 @@
-//! The runtime clock and the trap constructors behind `porto.sleep` and `porto.checkpoint`.
+//! The runtime clock (`porto.current_time`, alias `porto.monotonic`) and the trap constructors
+//! behind `porto.sleep` and `porto.checkpoint`.
 
 use std::time::Duration;
 
@@ -13,7 +14,9 @@ use crate::driver::trap::Trap;
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(checkpoint, module)?)?;
     module.add_function(wrap_pyfunction!(sleep, module)?)?;
-    module.add_function(wrap_pyfunction!(monotonic, module)?)?;
+    module.add_function(wrap_pyfunction!(current_time, module)?)?;
+    // The same function object, so `porto.monotonic is porto.current_time`.
+    module.add("monotonic", module.getattr("current_time")?)?;
     module.add_function(wrap_pyfunction!(yield_trap, module)?)?;
     module.add_function(wrap_pyfunction!(sleep_trap, module)?)
 }
@@ -41,14 +44,28 @@ fn require_lane(function: &str) -> PyResult<()> {
         return Ok(());
     }
     Err(PyRuntimeError::new_err(format!(
-        "porto: porto.{function}() was called outside porto.run(); porto awaitables only work          in tasks of a porto runtime: start the program with porto.run(main) and await it from          there"
+        "porto: porto.{function}() was called outside porto.run(); porto awaitables only work \
+         in tasks of a porto runtime: start the program with porto.run(main) and await it from \
+         there"
     )))
 }
 
-/// The runtime clock, in seconds since its origin: what sleep deadlines are measured on.
-#[pyfunction(name = "_monotonic")]
-fn monotonic() -> f64 {
-    Deadline::now().as_secs_f64()
+/// `porto.current_time()`: the runtime clock, in seconds since the runtime started (virtual
+/// seconds in deterministic mode). Sleep deadlines are measured on it.
+#[pyfunction]
+fn current_time() -> PyResult<f64> {
+    Ok(now("current_time")?.as_secs_f64())
+}
+
+/// The current time on the runtime clock; fails outside a runtime, which owns the clock.
+fn now(function: &str) -> PyResult<Deadline> {
+    Deadline::try_now().ok_or_else(|| {
+        PyRuntimeError::new_err(format!(
+            "porto: porto.{function}() was called outside porto.run(); the runtime clock starts \
+             with the runtime, so call it from code that porto.run(main) runs (for a clock \
+             outside porto, use time.monotonic())"
+        ))
+    })
 }
 
 /// A trap that yields to the scheduler once: `await _yield_trap()` is `porto.checkpoint()`.
@@ -68,7 +85,9 @@ fn sleep_trap(delay: f64) -> PyResult<Trap> {
              just yield to other tasks"
         )));
     }
+    let now = now("sleep")?;
     // Only an overflow is left: a delay too long for the clock never ends.
-    let deadline = Duration::try_from_secs_f64(delay).map_or(Deadline::NEVER, Deadline::after);
+    let deadline = Duration::try_from_secs_f64(delay)
+        .map_or(Deadline::NEVER, |delay| now.saturating_add(delay));
     Ok(Trap::sleep_until(deadline))
 }

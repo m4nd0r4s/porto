@@ -10,8 +10,8 @@ mod tests;
 
 use std::future::Future;
 
-pub use lane::Runtime;
-pub(crate) use lane::register_timer;
+pub use lane::{Builder, Runtime};
+pub(crate) use lane::{current_time, register_timer};
 pub use park::ParkHook;
 pub use shared::Handle;
 

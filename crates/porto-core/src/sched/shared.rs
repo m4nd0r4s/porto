@@ -8,6 +8,7 @@ use std::thread::Thread;
 
 use super::lane;
 use crate::task::{Notified, Schedule, new_task};
+use crate::time::{Deadline, RuntimeClock};
 
 /// A cloneable, `Send + Sync` handle to a runtime: spawns tasks onto it from any thread.
 #[derive(Clone)]
@@ -18,6 +19,8 @@ pub struct Handle {
 /// The part of a lane other threads can reach.
 pub(crate) struct Shared {
     inbox: Mutex<Inbox>,
+    /// The runtime clock: every deadline of this runtime is on it.
+    pub(crate) clock: RuntimeClock,
 }
 
 /// Tasks woken or spawned off the lane thread (`12-scheduler-and-lanes.md` §4 "remote
@@ -42,12 +45,18 @@ impl Shared {
 }
 
 impl Handle {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(clock: RuntimeClock) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inbox: Mutex::new(Inbox::default()),
+                clock,
             }),
         }
+    }
+
+    /// The current time on this runtime's clock, from any thread.
+    pub fn now(&self) -> Deadline {
+        self.shared.clock.now()
     }
 
     /// Spawns `future` as a new task. From inside this runtime's `block_on` it goes on the

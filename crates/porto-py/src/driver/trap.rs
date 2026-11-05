@@ -191,7 +191,7 @@ impl Trap {
         }
     }
 
-    /// For a sleep, when it ends, in seconds on the runtime clock (`_monotonic()`).
+    /// For a sleep, when it ends, in seconds on the runtime clock (`porto.current_time()`).
     #[getter(deadline)]
     fn py_deadline(&self) -> Option<f64> {
         match self.kind() {

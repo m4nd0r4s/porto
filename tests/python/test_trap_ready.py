@@ -8,7 +8,7 @@ import sys
 import types
 from collections.abc import Callable, Coroutine, Generator
 from itertools import repeat
-from typing import Any
+from typing import Any, TypeVar
 
 import pytest
 
@@ -35,19 +35,34 @@ def no_traps(trap: _core._Trap) -> object:
     raise AssertionError(f"the coroutine suspended on {trap!r}")
 
 
+_T = TypeVar("_T")
+
+
+def in_a_runtime(function: Callable[[], _T]) -> _T:
+    """Calls ``function`` from a task of a fresh runtime: sleep traps read its clock."""
+
+    async def main() -> _T:
+        return function()
+
+    return _core._run(main())
+
+
 def test_the_driver_receives_the_trap_with_its_payload() -> None:
-    before = _core._monotonic()
-    trap = _core._sleep_trap(1.5)
+    def check() -> None:
+        before = _core.current_time()
+        trap = _core._sleep_trap(1.5)
 
-    async def main() -> object:
-        return await trap
+        async def main() -> object:
+            return await trap
 
-    coro = main()
-    assert coro.send(None) is trap
-    assert trap.kind == "sleep"
-    assert trap.deadline is not None
-    assert before + 1.5 <= trap.deadline <= _core._monotonic() + 1.5
-    coro.close()
+        coro = main()
+        assert coro.send(None) is trap
+        assert trap.kind == "sleep"
+        assert trap.deadline is not None
+        assert before + 1.5 <= trap.deadline <= _core.current_time() + 1.5
+        coro.close()
+
+    in_a_runtime(check)
 
 
 def test_a_yield_trap_has_no_deadline() -> None:
@@ -63,10 +78,18 @@ def test_a_sleep_trap_rejects_a_negative_or_nan_delay(delay: float) -> None:
         _core._sleep_trap(delay)
 
 
+def test_a_sleep_trap_outside_a_runtime_raises_and_says_what_to_do() -> None:
+    with pytest.raises(RuntimeError, match=r"porto.sleep\(\) was called outside porto.run"):
+        _core._sleep_trap(1)
+
+
 def test_an_infinite_sleep_trap_never_ends() -> None:
-    trap = _core._sleep_trap(float("inf"))
-    assert trap.deadline is not None
-    assert trap.deadline > _core._monotonic() + 100 * 365 * 24 * 3600
+    def check() -> None:
+        trap = _core._sleep_trap(float("inf"))
+        assert trap.deadline is not None
+        assert trap.deadline > _core.current_time() + 100 * 365 * 24 * 3600
+
+    in_a_runtime(check)
 
 
 def test_a_trap_in_a_nested_chain_evaluates_to_the_value_the_driver_sends() -> None:

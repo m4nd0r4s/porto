@@ -57,7 +57,13 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if Deadline::now() >= self.deadline {
+        let Some(now) = Deadline::try_now() else {
+            panic!(
+                "porto_core::time::Sleep polled outside a runtime: await it from a task or \
+                 inside Runtime::block_on"
+            );
+        };
+        if now >= self.deadline {
             return Poll::Ready(());
         }
         // Polled again before the deadline: keep the registered entry unless the future moved

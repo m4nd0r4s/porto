@@ -40,14 +40,15 @@ impl Timers {
         self.heap.borrow().peek().map(|entry| entry.deadline)
     }
 
-    /// Wakes every timer whose deadline has passed, earliest first. Returns how many fired.
+    /// Wakes every timer whose deadline has passed on the runtime clock, earliest first.
+    /// Returns how many fired.
     ///
-    /// Reads the clock only when a timer is registered.
-    pub(crate) fn fire_expired(&self) -> usize {
+    /// Reads the clock (`now`) only when a timer is registered.
+    pub(crate) fn fire_expired(&self, now: impl FnOnce() -> Deadline) -> usize {
         if self.heap.borrow().is_empty() {
             return 0;
         }
-        let now = Deadline::now();
+        let now = now();
         let mut fired = 0;
         loop {
             let entry = {

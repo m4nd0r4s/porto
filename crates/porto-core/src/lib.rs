@@ -17,4 +17,4 @@ pub mod sched;
 pub mod task;
 pub mod time;
 
-pub use sched::{Handle, ParkHook, Runtime, spawn};
+pub use sched::{Builder, Handle, ParkHook, Runtime, spawn};
