@@ -307,3 +307,34 @@ fn notify_blocking_notified_on_a_lane_is_an_error() {
         .unwrap_err();
     assert_eq!(error.operation(), "Notify.blocking_notified");
 }
+
+#[test]
+fn the_node_api_waits_like_the_futures_and_passes_a_notify_one_on() {
+    let event = Event::new();
+    let notify = Notify::new();
+    let a = pin!(super::WaitNode::new(0));
+    let b = pin!(super::WaitNode::new(0));
+    let (b_wakes, b_waker) = counting_waker();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut b_cx = Context::from_waker(&b_waker);
+    // SAFETY: the nodes are pinned, used from this thread only, and idle when dropped.
+    unsafe {
+        assert!(event.poll_wait_node(a.as_ref(), &mut cx).is_pending());
+        event.set();
+        assert!(event.poll_wait_node(a.as_ref(), &mut cx).is_ready());
+
+        assert!(notify.poll_notified_node(a.as_ref(), &mut cx).is_pending());
+        assert!(
+            notify
+                .poll_notified_node(b.as_ref(), &mut b_cx)
+                .is_pending()
+        );
+        notify.notify_one(); // grants `a`
+        notify.cancel_notified_node(a.as_ref()); // which passes it to `b`
+        assert_eq!(b_wakes.count(), 1);
+        assert!(notify.poll_notified_node(b.as_ref(), &mut b_cx).is_ready());
+    }
+    assert!(!notify.try_notified(), "the wake was passed on, not stored");
+    notify.notify_one();
+    assert!(notify.try_notified());
+}

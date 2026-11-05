@@ -21,6 +21,8 @@ print(porto.run(main))
 
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
+    Event,
+    Notify,
     Scope,
     Task,
     __version__,
@@ -54,11 +56,13 @@ __all__ = [
     "ClosedResourceError",
     "DeterministicConfig",
     "EndOfChannel",
+    "Event",
     "IncompleteReadError",
     "InvalidStateError",
     "Lagged",
     "LimitOverrunError",
     "NoRuntimeError",
+    "Notify",
     "PortoError",
     "RuntimeClosed",
     "RuntimeConfig",

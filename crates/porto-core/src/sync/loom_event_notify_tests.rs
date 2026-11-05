@@ -12,7 +12,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use loom::sync::Arc;
 use loom::thread;
 
-use super::{Event, Notify};
+use super::{Event, Notify, WaitNode};
 
 /// Counts its wakes. Plain std atomics: it is only read after every thread joined.
 #[derive(Default)]
@@ -156,6 +156,48 @@ fn notify_all_vs_cancel_stores_no_permit() {
         assert_eq!(b_wakes.count(), 1);
         assert!(poll_once(b.as_mut(), &b_waker).is_ready());
         assert!(!has_permit(&notify));
+    });
+}
+
+/// A `notify_one` on one thread races with a `try_notified` on another and a waiter linking
+/// its node (the Python task's path) on a third: the one notification is delivered exactly
+/// once, as the waiter's grant, the `try_notified`, or the permit left stored.
+#[test]
+fn notify_one_is_delivered_once_to_node_try_or_permit() {
+    loom::model(|| {
+        let notify = Arc::new(Notify::new());
+        let notifier = spawn_with(&notify, Notify::notify_one);
+        let taker = {
+            let notify = notify.clone();
+            thread::spawn(move || notify.try_notified())
+        };
+        let node = Box::pin(WaitNode::new(0));
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: the node is pinned, used with this notify only, and resolved or cancelled
+        // below before it is dropped.
+        let first = unsafe { notify.poll_notified_node(node.as_ref(), &mut cx) };
+        notifier.join().unwrap();
+        let took = taker.join().unwrap();
+
+        let granted = if first.is_ready() {
+            true
+        } else if wakes.count() == 1 {
+            // SAFETY: as above.
+            assert!(unsafe { notify.poll_notified_node(node.as_ref(), &mut cx) }.is_ready());
+            true
+        } else {
+            // SAFETY: as above.
+            unsafe { notify.cancel_notified_node(node.as_ref()) };
+            false
+        };
+        let stored = notify.try_notified();
+        assert_eq!(
+            usize::from(granted) + usize::from(took) + usize::from(stored),
+            1,
+            "one notify_one, one delivery"
+        );
+        assert!(!node.is_pending());
     });
 }
 

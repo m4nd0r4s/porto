@@ -1,6 +1,6 @@
 # 16 — Synchronization Primitives & Channels
 
-All primitives are implemented in Rust (`porto-core::sync`) and are **thread-safe**. They may be shared across lanes and used from Rust tasks. From non-runtime threads, they are used via `blocking_*` methods, which are never allowed on lane threads (they raise `RuntimeError`).
+All primitives are implemented in Rust (`porto-core::sync`) and are **thread-safe**. They may be shared across lanes and used from Rust tasks. From non-runtime threads, they are used via `blocking_*` methods, which are never allowed on lane threads (they raise `RuntimeError`). A `blocking_*` wait runs with the thread detached from Python and does not check for signals: Ctrl-C does not interrupt it (the `KeyboardInterrupt` is raised once the wait is over).
 
 Waiting tasks use intrusive `WaitNode`s embedded in the task (PyTask: `wait_node`; RustTask: inside the future). Queues are FIFO (fair) unless stated otherwise.
 
@@ -13,12 +13,14 @@ Waiting tasks use intrusive `WaitNode`s embedded in the task (PyTask: `wait_node
 | `porto.RwLock()` | `sync::RwLock` | writer-preferring |
 | `porto.Semaphore(n)` | `sync::Semaphore` | `acquire(k=1)`, `release(k=1)`, `async with`, `available` |
 | `porto.CapacityLimiter(n)` | Semaphore + owner tracking | AnyIO-compatible; per-task borrow |
-| `porto.Event()` | `sync::Event` | `set()`, `is_set()`, `await wait()`. Not clearable (Trio semantics); for clearable events use `watch` |
-| `porto.Notify()` | `sync::Notify` | `notify_one()` (stores a permit if nobody waits), `notify_all()`, `await notified()` |
+| `porto.Event()` | `sync::Event` | `set()`, `is_set()`, `await wait()`, `blocking_wait()`. Not clearable (Trio semantics); for clearable events use `watch` |
+| `porto.Notify()` | `sync::Notify` | `notify_one()` (stores a permit if nobody waits), `notify_all()`, `await notified()`, `blocking_notified()` |
 | `porto.Condition(lock=None)` | | `wait()`, `wait_for(pred)`, `notify(n)`, `notify_all()` |
 | `porto.Barrier(n)` | | `await wait() -> bool` (True for the leader) |
 
 Cancellation: a cancelled waiter is removed from the queue. If a cancelled waiter had **already been granted** the lock or permit (a race between grant and cancel), it passes the grant on to the next waiter. This invariant is tested with loom.
+
+Awaiting: `wait()`, `notified()` and `acquire()` return lazy awaitables; nothing is taken until they are awaited, so one created and never awaited holds no lock and consumes no permit. A grant is taken only in the step that resumes the coroutine with it: a wait that completes at once but finds the task's budget spent (T2) yields first and takes the grant afterwards, never the other way round. A task closed or cancelled at any suspension point therefore never holds a grant it did not observe.
 
 ## 2. Channels
 

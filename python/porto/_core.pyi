@@ -1,7 +1,7 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint``, ``current_time``, ``monotonic`` and ``__version__``
+``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -112,6 +112,62 @@ class Task(Generic[_T_co]):
         """What the task returned, or raises what it raised; ``porto.InvalidStateError`` if it
         has not finished yet, ``porto.RuntimeClosed`` if its runtime shut down first."""
 
+# Synchronization (16-sync-primitives-and-channels.md §1)
+
+@final
+class Event:
+    """A flag that starts unset and, once ``set()``, stays set: every waiter, current and
+    future, is released. Not clearable (Trio semantics). Thread-safe."""
+
+    def __init__(self) -> None: ...
+    def set(self) -> None:
+        """Sets the event and wakes every task waiting for it. Setting it again does nothing."""
+
+    def is_set(self) -> bool:
+        """Whether the event is set."""
+
+    def wait(self) -> _SyncWait:
+        """Completes once the event is set; without suspending if it already is.
+
+        Nothing happens until it is awaited; ``await`` it inside ``porto.run``.
+        """
+
+    def blocking_wait(self) -> None:
+        """Blocks the calling thread until the event is set. Only from threads that do not run
+        porto: raises ``RuntimeError`` on a lane thread.
+
+        The wait does not check for signals: Ctrl-C does not interrupt it, and the
+        ``KeyboardInterrupt`` is raised once it is over."""
+
+@final
+class Notify:
+    """A wake-up signal between tasks. ``notify_one()`` wakes the longest waiting task, or
+    stores one permit for the next ``notified()``; ``notify_all()`` wakes the tasks waiting
+    now and stores nothing. A task woken by ``notify_one()`` that is cancelled before it ran
+    passes the wake on. Thread-safe."""
+
+    def __init__(self) -> None: ...
+    def notify_one(self) -> None:
+        """Wakes the task that has waited longest, or stores a permit (at most one)."""
+
+    def notify_all(self) -> None:
+        """Wakes every task waiting now. Stores no permit."""
+
+    def notified(self) -> _SyncWait:
+        """Completes when notified: at once if a permit is stored (consuming it), otherwise on
+        a ``notify_one()`` or ``notify_all()`` made after the ``await`` started.
+
+        Nothing happens until it is awaited: one that is never awaited consumes no permit. A
+        task closed or cancelled before it observed the wake passes it on.
+        """
+
+    def blocking_notified(self) -> None:
+        """Blocks the calling thread until notified. Only from threads that do not run porto:
+        raises ``RuntimeError`` on a lane thread.
+
+        The wait does not check for signals: Ctrl-C does not interrupt it, and the
+        ``KeyboardInterrupt`` is raised once it is over."""
+
 @final
 class _Trap:
     """A request to the driver. Awaiting it yields the trap, then returns what the driver sends.
@@ -131,6 +187,31 @@ class _Trap:
 
     def __await__(self) -> Generator[_Trap, object, object]: ...
     def __iter__(self) -> Generator[_Trap, object, object]: ...
+    def __next__(self) -> _Trap: ...
+    def send(self, value: object, /) -> _Trap: ...
+    @overload
+    def throw(
+        self, typ: BaseException, val: None = None, tb: TracebackType | None = None, /
+    ) -> NoReturn: ...
+    @overload
+    def throw(
+        self,
+        typ: type[BaseException],
+        val: object = None,
+        tb: TracebackType | None = None,
+        /,
+    ) -> NoReturn: ...
+    def close(self) -> None: ...
+
+@final
+class _SyncWait:
+    """The awaitable a sync primitive's wait returns (``Event.wait()``, ``Notify.notified()``).
+
+    Lazy: it tries the primitive when awaited, and only then. Await it once.
+    """
+
+    def __await__(self) -> Generator[_Trap, object]: ...
+    def __iter__(self) -> Generator[_Trap, object]: ...
     def __next__(self) -> _Trap: ...
     def send(self, value: object, /) -> _Trap: ...
     @overload

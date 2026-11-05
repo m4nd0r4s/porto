@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use super::primitives::AtomicBool;
-use super::{BlockingOnLane, Locked, Wait, WaitQueue, WaitState, blocking_wait};
+use super::{BlockingOnLane, Locked, Wait, WaitNode, WaitQueue, WaitState, blocking_wait};
 
 /// A flag that starts unset and, once [`set`](Event::set), stays set: every waiter, current
 /// and future, is released.
@@ -85,6 +85,25 @@ impl Event {
         EventWait {
             wait: self.queue.wait(0, is_set_locked as Acquire),
         }
+    }
+
+    /// [`Event::wait`] with a caller-owned node, for a waiter that embeds its [`WaitNode`] (a
+    /// Python task): `Ready` once the event is set, otherwise queues `node`.
+    ///
+    /// # Safety
+    /// [`WaitQueue::poll_wait`]'s contract, with this event as the queue.
+    pub unsafe fn poll_wait_node(&self, node: Pin<&WaitNode>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.poll_wait(node, cx, is_set_locked) }
+    }
+
+    /// Stops `node`'s [`Event::poll_wait_node`] wait (an unobserved wake is dropped).
+    ///
+    /// # Safety
+    /// [`WaitQueue::cancel`]'s contract, with this event as the queue.
+    pub unsafe fn cancel_wait_node(&self, node: Pin<&WaitNode>) {
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.cancel(node) }
     }
 
     /// [`Event::wait`] for a thread that does not run a porto lane: blocks the thread until the

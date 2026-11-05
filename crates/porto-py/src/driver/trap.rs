@@ -149,6 +149,15 @@ impl Trap {
         }
     }
 
+    /// A trap that a native awaitable yields to the driver itself, instead of awaiting it: it
+    /// is past its first resume, so the driver can take it. The awaitable keeps its own state
+    /// and never resumes the trap.
+    pub(crate) fn suspended(kind: TrapKind) -> Self {
+        let trap = Self::new(kind);
+        trap.state.store(SUSPENDED, Ordering::Relaxed);
+        trap
+    }
+
     /// A trap that yields to the scheduler once (`porto.checkpoint`).
     pub fn yield_now() -> Self {
         Self::new(TrapKind::Yield)

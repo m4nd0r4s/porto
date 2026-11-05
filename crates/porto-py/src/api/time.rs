@@ -40,7 +40,7 @@ fn sleep(seconds: f64) -> PyResult<Trap> {
 }
 
 /// Fails unless a porto task is running on this thread: porto awaitables only work there.
-fn require_lane(function: &str) -> PyResult<()> {
+pub(crate) fn require_lane(function: &str) -> PyResult<()> {
     if lane::is_active() {
         return Ok(());
     }

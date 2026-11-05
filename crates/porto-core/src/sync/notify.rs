@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::{BlockingOnLane, Locked, Wait, WaitQueue, WaitState, blocking_wait};
+use super::{BlockingOnLane, Locked, Wait, WaitNode, WaitQueue, WaitState, blocking_wait};
 
 /// A wake-up signal between tasks.
 ///
@@ -91,6 +91,36 @@ impl Notify {
         Notified {
             wait: self.queue.wait(0, take_permit as Acquire),
         }
+    }
+
+    /// Consumes a stored permit without waiting; `false` if none is stored.
+    pub fn try_notified(&self) -> bool {
+        take_permit(&mut self.queue.lock())
+    }
+
+    /// [`Notify::notified`] with a caller-owned node, for a waiter that embeds its
+    /// [`WaitNode`] (a Python task): `Ready` once notified (or at once with a stored permit,
+    /// on the node's first poll), otherwise queues `node`.
+    ///
+    /// # Safety
+    /// [`WaitQueue::poll_wait`]'s contract, with this notify as the queue.
+    pub unsafe fn poll_notified_node(
+        &self,
+        node: Pin<&WaitNode>,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.poll_wait(node, cx, take_permit) }
+    }
+
+    /// Stops `node`'s [`Notify::poll_notified_node`] wait: a `notify_one` wake it has not
+    /// observed goes to the next waiter, or becomes the stored permit.
+    ///
+    /// # Safety
+    /// [`WaitQueue::cancel`]'s contract, with this notify as the queue.
+    pub unsafe fn cancel_notified_node(&self, node: Pin<&WaitNode>) {
+        // SAFETY: the caller's contract.
+        unsafe { self.queue.cancel(node) }
     }
 
     /// [`Notify::notified`] for a thread that does not run a porto lane: blocks the thread
