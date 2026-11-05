@@ -14,6 +14,7 @@
 //! ```
 
 pub mod sched;
+pub mod scope;
 pub mod task;
 pub mod time;
 

@@ -10,3 +10,14 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[target."cfg(loom)".dev-dependencies]
+loom = "0.7.2"
+
+# The cancel check's fast path (15-structured-concurrency-and-cancellation.md §1.2).
+[[bench]]
+name = "scope_cancel_check"
+harness = false

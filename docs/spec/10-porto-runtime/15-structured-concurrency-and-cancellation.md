@@ -19,14 +19,16 @@ struct ScopeNode {
     id: u64,
     parent: Option<Arc<ScopeNode>>,
     owner_task: TaskId,            // the task whose `async with` created it
-    state: Mutex<ScopeState>,      // children list, cancel reason, deadline, shield, counters
+    state: Mutex<ScopeState>,      // children list, deadline, counters
+    status: AtomicU8,              // cancel_called and shield, written under `state`, read lock-free
     cancel_epoch: AtomicU64,       // bumped on cancel; tasks compare to detect new cancels quickly
     deadline_timer: TimerEntry,
 }
 struct ScopeState {
-    cancel_called: Option<CancelReason>,  // Explicit | Deadline | Parent | ChildFailed | Shutdown
+    // cancel_called: Option<CancelReason> (Explicit | Deadline | Parent | ChildFailed | Shutdown)
+    // and shield: bool are logically here, but live packed in ScopeNode::status so the walk
+    // (§1.2) takes no lock. The first cancel reason wins.
     deadline: Option<Instant>,
-    shield: bool,
     live_children: u32,                   // tasks spawned into this scope, not complete
     child_scopes: IntrusiveList<ScopeNode>, // nested scopes (for propagation)
     errors: Vec<PyObj>,                   // failures collected (ExceptionGroup at exit)
@@ -39,7 +41,7 @@ A task is **effectively cancelled** if walking from its innermost entered scope 
 
 Tasks spawned into scope S start with S as their base scope. The walk continues through S's ancestors.
 
-Optimization: each task caches `(scope_ptr, cancel_epoch_snapshot)`. The global `cancel_generation: AtomicU64` is bumped on any cancel. The walk happens only if the generation changed since the last check, which makes the common case O(1).
+Optimization: each task caches `(scope_id, cancel_epoch_snapshot)` and the walk's result. The cache compares scope ids, not pointers, because a freed scope's address can be reused by a new one. The global `cancel_generation: AtomicU64` is bumped on any cancel or shield change. A cancel bumps the `cancel_epoch` of the scope and of every descendant its cancellation reaches, stopping at shielded scopes. Changing a shield does the same from that scope. The check costs one atomic load when the generation is unchanged. When it moved, the check compares the scope's epoch with the snapshot, and the walk runs only if the epoch changed too.
 
 ## 2. Semantics (normative)
 
