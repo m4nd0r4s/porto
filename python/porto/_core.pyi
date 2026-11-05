@@ -249,7 +249,8 @@ class Sender(Generic[_T_contra]):
         """Another sender on the same channel. A clone of a closed sender is closed."""
 
     def close(self) -> None:
-        """Closes this sender; other clones are unaffected. Closing twice does nothing."""
+        """Closes this sender; other clones are unaffected. Sends already waiting
+        through it raise ``porto.ClosedResourceError``. Closing twice does nothing."""
 
     def is_closed(self) -> bool:
         """Whether sends through this sender fail: it was closed, or every receiver is gone."""
@@ -298,7 +299,8 @@ class Receiver(Generic[_T_co]):
         """Another receiver on the same channel. A clone of a closed receiver is closed."""
 
     def close(self) -> None:
-        """Closes this receiver; other clones are unaffected. Closing twice does nothing."""
+        """Closes this receiver; other clones are unaffected. Receives already waiting
+        through it raise ``porto.ClosedResourceError``. Closing twice does nothing."""
 
     def __aiter__(self) -> Self: ...
     def __anext__(self) -> Awaitable[_T_co]:

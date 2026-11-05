@@ -79,10 +79,14 @@ impl<T> Receiver<T> {
         received
     }
 
-    /// Closes this receiver, as dropping it would. Receives through it end from now on;
-    /// other clones are unaffected. Closing twice does nothing.
+    /// Closes this receiver, as dropping it would. Receives through it end from now on,
+    /// including ones already waiting; other clones are unaffected. Closing twice does
+    /// nothing.
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
+            // A task parked through this handle (on any thread) must see the close; see the
+            // channel module docs.
+            self.chan.wake_all_receivers();
             self.chan.close_receiver();
         }
     }
@@ -154,7 +158,11 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.close();
+        // Nothing waits through a handle being dropped (waits borrow it), so only the count
+        // closes.
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.chan.close_receiver();
+        }
     }
 }
 
@@ -215,8 +223,9 @@ impl<T> Future for RecvFuture<'_, T> {
             // channel's `recv_waiters`, which the borrowed receiver keeps alive, and `Drop`
             // cancels a pending wait.
             let poll = unsafe {
-                chan.recv_waiters
-                    .poll_wait(node, cx, |waiters| chan.pop_or_queue(waiters, &mut value))
+                chan.recv_waiters.poll_wait(node, cx, |waiters| {
+                    this.receiver.is_handle_closed() || chan.pop_or_queue(waiters, &mut value)
+                })
             };
             match (poll, value) {
                 // Popped under the lock: wake a sender now that the lock is released.
@@ -225,7 +234,7 @@ impl<T> Future for RecvFuture<'_, T> {
                     this.done = true;
                     return Poll::Ready(Ok(value));
                 }
-                // The channel ended under the lock: the retry reports it.
+                // The channel ended, or this handle closed, under the lock: the retry reports it.
                 (Poll::Ready(()), None) => {}
                 (Poll::Pending, _) => return Poll::Pending,
             }

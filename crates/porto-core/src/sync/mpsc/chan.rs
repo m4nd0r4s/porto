@@ -26,6 +26,10 @@
 //!
 //! Closing never relies on hints: the last sender (or receiver) to close always locks the
 //! other side's list and wakes every waiter, and waiters check the counts under that lock.
+//! Closing one handle also wakes every waiter on its own side's list: a waiter parked through
+//! that handle sees the handle's closed flag (also read under the lock) and gives up, and the
+//! others retry. Waking them all rather than the closed handle's own waiters keeps a wake the
+//! closed handle's waiter took, but will not act on, from being lost.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -303,13 +307,27 @@ impl<T> Chan<T> {
         open_if_any(&self.receivers)
     }
 
+    /// Wakes every sender waiting for room, so one queued on a handle that was just closed
+    /// sees the close. The others retry and queue again. Waiters read the handle's closed
+    /// flag under this lock, so one that locks after this sees the flag set.
+    pub(super) fn wake_all_senders(&self) {
+        let mut waiters = self.send_waiters.lock();
+        waiters.grant_all();
+        self.send_hint.store(0, Ordering::Relaxed);
+    }
+
+    /// As `wake_all_senders`, for receivers waiting for a value.
+    pub(super) fn wake_all_receivers(&self) {
+        let mut waiters = self.recv_waiters.lock();
+        waiters.grant_all();
+        self.recv_hint.store(0, Ordering::Relaxed);
+    }
+
     /// Closes one sender handle. The last one ends the channel: every waiting receiver wakes,
     /// drains what is left and then sees the end.
     pub(super) fn close_sender(&self) {
         if self.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut waiters = self.recv_waiters.lock();
-            waiters.grant_all();
-            self.recv_hint.store(0, Ordering::Relaxed);
+            self.wake_all_receivers();
         }
     }
 
@@ -317,11 +335,7 @@ impl<T> Chan<T> {
     /// drops the buffered values nobody can receive any more.
     pub(super) fn close_receiver(&self) {
         if self.receivers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            {
-                let mut waiters = self.send_waiters.lock();
-                waiters.grant_all();
-                self.send_hint.store(0, Ordering::Relaxed);
-            }
+            self.wake_all_senders();
             // Dropped outside any lock: a value's drop may run arbitrary code. A send that
             // races with the close may still land a value; it drains it
             // (`drain_if_receivers_closed`, whose fence pairs with this one).

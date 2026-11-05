@@ -58,10 +58,14 @@ impl<T> Sender<T> {
         self.chan.try_send(value)
     }
 
-    /// Closes this sender, as dropping it would. Sends through it fail from now on; other
-    /// clones are unaffected. Closing twice does nothing.
+    /// Closes this sender, as dropping it would. Sends through it fail from now on,
+    /// including ones already waiting; other clones are unaffected. Closing twice does
+    /// nothing.
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
+            // A task parked through this handle (on any thread) must see the close; see the
+            // channel module docs.
+            self.chan.wake_all_senders();
             self.chan.close_sender();
         }
     }
@@ -138,7 +142,11 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.close();
+        // Nothing waits through a handle being dropped (waits borrow it), so only the count
+        // closes.
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.chan.close_sender();
+        }
     }
 }
 
@@ -193,8 +201,9 @@ impl<T> Future for SendFuture<'_, T> {
             // channel's `send_waiters`, which the borrowed sender keeps alive, and `Drop`
             // cancels a pending wait.
             let poll = unsafe {
-                chan.send_waiters
-                    .poll_wait(node, cx, |waiters| chan.push_or_queue(waiters, &mut value))
+                chan.send_waiters.poll_wait(node, cx, |waiters| {
+                    this.sender.is_handle_closed() || chan.push_or_queue(waiters, &mut value)
+                })
             };
             match (poll, value.is_some()) {
                 // Pushed under the lock: wake a receiver now that the lock is released.
@@ -203,7 +212,7 @@ impl<T> Future for SendFuture<'_, T> {
                     chan.wake_receiver();
                     return Poll::Ready(Ok(()));
                 }
-                // The channel closed under the lock: the retry reports it.
+                // The channel, or this handle, closed under the lock: the retry reports it.
                 (Poll::Ready(()), true) => {}
                 (Poll::Pending, _) => {
                     this.value = value;

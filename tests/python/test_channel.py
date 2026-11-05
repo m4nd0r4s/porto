@@ -603,3 +603,161 @@ def test_blocking_calls_report_the_end_and_a_closed_handle() -> None:
     del rx2
     with pytest.raises(porto.BrokenResourceError):
         tx2.blocking_send(1)
+
+
+# Closing a handle that a task or thread is waiting on
+
+
+def run_or_fail_on_hang(coro: Coroutine[Any, Any, Any], seconds: float = 10.0) -> Any:
+    """Runs ``coro`` on a daemon thread, so a wait that never wakes fails the test instead of
+    hanging the suite."""
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["result"] = run(coro)
+        except BaseException as error:  # re-raised on the test thread
+            outcome["error"] = error
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "a wait never woke"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
+
+
+@pytest.mark.parametrize("how", ["recv", "async for"])
+def test_closing_a_receiver_wakes_a_task_waiting_on_it(how: str) -> None:
+    _tx, rx = porto.channel[int](1)  # the sender stays open: only the receiver closes
+    outcome: list[str] = []
+
+    async def consume() -> None:
+        try:
+            if how == "recv":
+                await rx.recv()
+            else:
+                async for _ in rx:
+                    pass
+            outcome.append("returned")
+        except porto.ClosedResourceError:
+            outcome.append("closed")
+
+    async def main() -> None:
+        _core._spawn(consume())
+        for _ in range(5):
+            await checkpoint()
+        rx.close()
+        await wait_until(lambda: bool(outcome))
+
+    run_or_fail_on_hang(main())
+    assert outcome == ["closed"]
+
+
+def test_closing_a_sender_wakes_a_task_waiting_to_send_on_it() -> None:
+    tx, rx = porto.channel[int](1)
+    tx.try_send(0)
+    outcome: list[str] = []
+
+    async def produce() -> None:
+        try:
+            await tx.send(1)
+            outcome.append("sent")
+        except porto.ClosedResourceError:
+            outcome.append("closed")
+
+    async def main() -> None:
+        _core._spawn(produce())
+        for _ in range(5):
+            await checkpoint()
+        tx.close()
+        await wait_until(lambda: bool(outcome))
+
+    run_or_fail_on_hang(main())
+    assert outcome == ["closed"]
+    assert rx.try_recv() == 0
+
+
+def test_closing_a_handle_wakes_a_blocking_call_on_another_thread() -> None:
+    tx, _rx = porto.channel[int](1)
+    tx.try_send(0)
+    _tx2, rx2 = porto.channel[int](1)
+    errors: list[type[BaseException]] = []
+
+    def blocked(call: Callable[[], object]) -> None:
+        try:
+            call()
+        except porto.ClosedResourceError as error:
+            errors.append(type(error))
+
+    threads = [
+        threading.Thread(target=blocked, args=(lambda: tx.blocking_send(1),), daemon=True),
+        threading.Thread(target=blocked, args=(rx2.blocking_recv,), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    # Closing before the threads wait is fine too: they then see the closed handle at once.
+    for _ in range(20):
+        threading.Event().wait(0.01)
+    tx.close()
+    rx2.close()
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive(), "a blocking call never woke after its handle closed"
+    assert errors == [porto.ClosedResourceError] * 2
+
+
+def test_a_closed_receiver_passes_on_the_value_it_was_woken_for() -> None:
+    tx, rx = porto.channel[int](1)
+    rx2 = rx.clone()
+    outcomes: dict[str, object] = {}
+
+    async def receive(name: str, receiver: porto.Receiver[int]) -> None:
+        try:
+            outcomes[name] = await receiver.recv()
+        except porto.ClosedResourceError:
+            outcomes[name] = "closed"
+
+    async def main() -> None:
+        _core._spawn(receive("closed handle", rx))
+        for _ in range(3):
+            await checkpoint()
+        _core._spawn(receive("other", rx2))
+        for _ in range(3):
+            await checkpoint()
+        tx.try_send(1)  # wakes the first waiter, on rx ...
+        rx.close()  # ... whose handle closes before it runs
+        await wait_until(lambda: len(outcomes) == 2)
+
+    run_or_fail_on_hang(main())
+    assert outcomes == {"closed handle": "closed", "other": 1}
+
+
+def test_a_closed_sender_passes_on_the_room_it_was_woken_for() -> None:
+    tx, rx = porto.channel[int](1)
+    tx2 = tx.clone()
+    tx.try_send(0)
+    outcomes: dict[str, object] = {}
+
+    async def send(name: str, sender: porto.Sender[int], value: int) -> None:
+        try:
+            await sender.send(value)
+            outcomes[name] = "sent"
+        except porto.ClosedResourceError:
+            outcomes[name] = "closed"
+
+    async def main() -> None:
+        _core._spawn(send("closed handle", tx, 1))
+        for _ in range(3):
+            await checkpoint()
+        _core._spawn(send("other", tx2, 2))
+        for _ in range(3):
+            await checkpoint()
+        assert rx.try_recv() == 0  # wakes the first waiter, on tx ...
+        tx.close()  # ... whose handle closes before it runs
+        await wait_until(lambda: len(outcomes) == 2)
+
+    run_or_fail_on_hang(main())
+    assert outcomes == {"closed handle": "closed", "other": "sent"}
+    assert rx.try_recv() == 2

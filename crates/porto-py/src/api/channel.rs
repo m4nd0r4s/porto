@@ -151,7 +151,10 @@ impl Sender {
     #[pyo3(signature = (value, /))]
     fn blocking_send(&self, py: Python<'_>, value: PyObj) -> PyResult<()> {
         let tx = &self.side.0;
-        // The unsent value comes back out of `detach`, so it is dropped attached.
+        // The unsent value comes back out of `detach`, so it is dropped attached. A send that
+        // lands as the last receiver closes drops what is buffered inside `detach`
+        // (`drain_if_receivers_closed`): pyo3 defers those decrefs to its reference pool,
+        // applied the next time a thread attaches.
         match py.detach(|| blocking_wait("Sender.blocking_send", tx.send(value))) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(send_closed_error(tx)),
@@ -342,8 +345,9 @@ pub(super) fn empty_error() -> PyErr {
 pub(super) fn send_closed_error(tx: &mpsc::Sender<PyObj>) -> PyErr {
     if tx.is_handle_closed() {
         ClosedResourceError::new_err(
-            "porto: this sender was closed, so it cannot send any more; send through a clone \
-             that is still open, or close the sender only once sending is done",
+            "porto: this sender was closed (or cloned from a sender that was closed), so it \
+             cannot send any more; send through a clone that is still open, or close the \
+             sender only once sending is done",
         )
     } else {
         BrokenResourceError::new_err(
@@ -358,8 +362,9 @@ pub(super) fn send_closed_error(tx: &mpsc::Sender<PyObj>) -> PyErr {
 pub(super) fn recv_closed_error(rx: &mpsc::Receiver<PyObj>) -> PyErr {
     if rx.is_handle_closed() {
         ClosedResourceError::new_err(
-            "porto: this receiver was closed, so it cannot receive any more; receive through a \
-             clone that is still open, or close the receiver only once receiving is done",
+            "porto: this receiver was closed (or cloned from a receiver that was closed), so \
+             it cannot receive any more; receive through a clone that is still open, or close \
+             the receiver only once receiving is done",
         )
     } else {
         EndOfChannel::new_err(
