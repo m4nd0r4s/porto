@@ -4,56 +4,101 @@
 //! throws into it, and dispatches on what it yields, until the coroutine finishes or has to
 //! wait:
 //!
-//! - a `_Trap` (exact type) is taken and its [`TrapKind`] handled: `Yield` requeues the task at
-//!   the back of the local queue, `Sleep` arms the task's embedded timer, `Park` waits for a
-//!   wake that the trap's maker arranged through [`current_waker`];
+//! - a `_Trap` (exact type) is taken and its request becomes the task's [`Pending`] wait:
+//!   `Yield` and `YieldThen` requeue the task at the back of the local queue, `Sleep` arms the
+//!   task's embedded timer (a deadline already passed is a yield), `Park` waits for a wake that
+//!   the trap's maker arranged through [`current_waker`], and every other kind is polled at
+//!   once: a wait that is already over continues the loop without a scheduler round trip;
 //! - `None` (a bare `yield` in a generator-based coroutine) is a yield;
 //! - anything else is an error thrown back into the coroutine, at the `await` that yielded it.
 //!
-//! The coroutine's `contextvars.Context` is entered for the whole poll, and the task's waker is
-//! reachable through [`current_waker`] while it runs.
+//! The coroutine's `contextvars.Context` is entered for the whole poll. While it runs, the
+//! task's waker is reachable through [`current_waker`] and its budget through
+//! [`checkpoint_if_needed`] (T2).
+//!
+//! A woken task whose wait is still not over is where a cancellation is delivered: the wait is
+//! abandoned (T3, `wait.rs`) and the exception thrown in. Until scopes deliver cancellation
+//! (porto-szb.36, `scopes::effective_cancel`), the one source is [`lane::take_interrupt`].
 
 use std::cell::Cell;
 use std::ptr;
 use std::task::{Context, Poll, Waker};
 
 use porto_core::task::Header;
-use porto_core::time::Deadline;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::{ffi, intern};
 
-use super::pytask::{COOP_BUDGET, Pending, PyTask, Resume, TaskOutcome};
+use super::lane;
+use super::pending::{Kind, Pending};
+use super::pytask::{COOP_BUDGET, PyTask, Resume, TaskOutcome};
+use super::ready::Ready;
 use super::trap::{Trap, TrapKind};
 use crate::py_compat::{Sent, names, send, take_exception};
 
 thread_local! {
-    /// The waker of the task this lane is polling, null between polls.
-    static CURRENT_WAKER: Cell<*const Waker> = const { Cell::new(ptr::null()) };
+    /// The task this lane is polling, null between polls.
+    static RUNNING: Cell<*const Running> = const { Cell::new(ptr::null()) };
+}
+
+/// What `RUNNING` publishes of the polled task: its waker and its budget. Lives in `poll`'s
+/// frame, which outlives the publication (see `RunningTask`).
+struct Running {
+    waker: *const Waker,
+    /// Steps and synchronous completions left in this poll (T2).
+    budget: Cell<u8>,
+}
+
+/// The task running on this thread, if a task is running.
+fn running<'a>() -> Option<&'a Running> {
+    let running = RUNNING.get();
+    // SAFETY: non-null only while `poll` runs on this thread, which owns the `Running` for
+    // that whole time (see `RunningTask`); it is only ever shared.
+    (!running.is_null()).then(|| unsafe { &*running })
 }
 
 /// A clone of the waker of the task running on this thread, if a task is running: what native
 /// code called from a coroutine registers before handing it a [`TrapKind::Park`] trap.
 pub(crate) fn current_waker() -> Option<Waker> {
-    let waker = CURRENT_WAKER.get();
-    // SAFETY: non-null only while `poll` runs on this thread, which borrows the waker for that
-    // whole time (see `RunningWaker`).
-    (!waker.is_null()).then(|| unsafe { &*waker }.clone())
+    // SAFETY: `poll` borrows the waker for as long as it publishes it.
+    running().map(|running| unsafe { &*running.waker }.clone())
 }
 
-/// Publishes the polled task's waker in `CURRENT_WAKER` until dropped.
-struct RunningWaker(*const Waker);
+/// Publishes the polled task in `RUNNING` until dropped.
+struct RunningTask(*const Running);
 
-impl RunningWaker {
-    fn set(waker: &Waker) -> Self {
-        Self(CURRENT_WAKER.replace(waker))
+impl RunningTask {
+    fn set(running: &Running) -> Self {
+        Self(RUNNING.replace(running))
     }
 }
 
-impl Drop for RunningWaker {
+impl Drop for RunningTask {
     fn drop(&mut self) {
-        CURRENT_WAKER.set(self.0);
+        RUNNING.set(self.0);
     }
+}
+
+/// T2: what a Porto awaitable that completed synchronously with `value` returns instead of a
+/// plain ready awaitable (spec 11 §5.3).
+///
+/// It counts against the running task's budget, so a loop of synchronous completions cannot
+/// starve the lane: when the budget runs out, the result comes back as a `Yield` trap that
+/// resumes the task with `value` after the other ready tasks ran (`Pending::YieldThen`).
+/// Otherwise, and outside a porto task (a manual driver, the asyncio facade), it is a `_Ready`.
+///
+/// It will also raise `Cancelled` when the task's effective scope is cancelled and this
+/// checkpoint has not delivered it yet: cancel delivery (porto-szb.36) hooks in here.
+pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    if let Some(running) = running() {
+        let budget = &running.budget;
+        let left = budget.get().saturating_sub(1);
+        budget.set(left);
+        if left == 0 {
+            return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any());
+        }
+    }
+    Ok(Py::new(py, Ready::new(value))?.into_any())
 }
 
 /// Polls `task`: steps its coroutine until it finishes (`Ready`) or waits (`Pending`).
@@ -79,9 +124,16 @@ pub(super) fn poll(
             return Poll::Ready(());
         }
     };
-    let _waker = RunningWaker::set(cx.waker());
-    task.budget = COOP_BUDGET;
-    let outcome = step_until_wait(task, &coro, cx);
+    let running = Running {
+        waker: cx.waker(),
+        budget: Cell::new(COOP_BUDGET),
+    };
+    let outcome = {
+        // Published only while the coroutine steps: Python code that `complete` runs (a
+        // `Task.finish`, an unraisable hook) must not see the finished task as running.
+        let _running = RunningTask::set(&running);
+        step_until_wait(task, &coro, &running.budget, cx)
+    };
     task.coro = Some(coro.unbind());
     match outcome {
         Some(outcome) => {
@@ -96,55 +148,66 @@ pub(super) fn poll(
 fn step_until_wait(
     task: &mut PyTask,
     coro: &Bound<'_, PyAny>,
+    budget: &Cell<u8>,
     cx: &mut Context<'_>,
 ) -> Option<TaskOutcome> {
+    let py = coro.py();
     loop {
-        match task.take_pending() {
-            // A yielded task was requeued; a parked one is only polled after a wake: whoever
-            // woke it ended the wait.
-            Pending::None | Pending::Yield | Pending::Park => {}
-            Pending::Sleep(deadline) => {
-                // SAFETY: the timer is embedded in this task, which its lane polls with the
-                // task's own waker.
-                if unsafe { task.timer().poll(cx) }.is_pending() {
-                    task.set_pending(Pending::Sleep(deadline));
-                    return None;
+        if task.is_waiting() {
+            match task.poll_pending(py, cx) {
+                // `None` keeps a resume set before the wait (a throw delayed by the budget).
+                Poll::Ready(Resume::None) => {}
+                Poll::Ready(resume) => task.set_resume(resume),
+                Poll::Pending => {
+                    // Still waiting, unless an interrupt is due (`None`: the task waits).
+                    let exception = lane::take_interrupt(cx.waker())?;
+                    task.abandon_wait();
+                    task.set_resume(Resume::Throw(exception));
                 }
             }
-            Pending::YieldThen(value) => task.set_resume(Resume::Value(value)),
-            Pending::AsyncioFuture(_) => {
-                unreachable!("asyncio futures are not awaited yet (the compatibility layer)")
-            }
         }
-        if task.budget == 0 {
-            // Out of budget with a step to go (a throw after an unsupported await): let the
-            // other tasks run first.
+        if budget.get() == 0 {
+            // Out of budget with a step to go (a throw after an unsupported await, a wait that
+            // was over at once): let the other tasks run first.
             yield_now(task, cx);
             return None;
         }
-        task.budget -= 1;
+        budget.set(budget.get() - 1);
         task.stats.steps = task.stats.steps.wrapping_add(1);
-        let yielded = match resume(coro, task.take_resume(coro.py())) {
+        let yielded = match resume(coro, task.take_resume(py)) {
             Stepped::Finished(outcome) => return Some(outcome),
             Stepped::Yielded(yielded) => yielded,
         };
-        match dispatch(&yielded) {
-            Next::Yield => {
+        match dispatch(task, &yielded) {
+            // The hot path of a switch: no payload to pack.
+            Next::Wait(Pending::Yield) => {
                 yield_now(task, cx);
                 return None;
             }
-            Next::Sleep(deadline) => {
-                task.set_pending(Pending::Sleep(deadline));
-                // SAFETY: as above.
-                if unsafe { task.timer().poll(cx) }.is_ready() {
-                    // A deadline that already passed is still a schedule point (spec 11 §4).
-                    yield_now(task, cx);
+            Next::Wait(pending) => {
+                let kind = pending.kind();
+                task.set_pending(pending);
+                match kind {
+                    Kind::Yield | Kind::YieldThen => {
+                        cx.waker().wake_by_ref();
+                        return None;
+                    }
+                    Kind::Sleep => {
+                        // SAFETY: the timer is embedded in this task, which its lane polls with
+                        // the task's own waker.
+                        if unsafe { task.timer().poll(cx) }.is_ready() {
+                            // A deadline that already passed is still a schedule point (spec 11
+                            // §4): the timer is disarmed, so the wait becomes a yield.
+                            task.release_wait();
+                            yield_now(task, cx);
+                        }
+                        return None;
+                    }
+                    Kind::Park => return None,
+                    // Polled at the top of the loop: a wait that is already over continues
+                    // without a round trip through the scheduler.
+                    _ => {}
                 }
-                return None;
-            }
-            Next::Park => {
-                task.set_pending(Pending::Park);
-                return None;
             }
             Next::Throw(error) => task.set_resume(Resume::Throw(error.unbind())),
         }
@@ -211,34 +274,38 @@ fn thrown_outcome(raised: Bound<'_, PyBaseException>) -> TaskOutcome {
 
 /// What the driver does with a yielded object.
 enum Next<'py> {
-    Yield,
-    Sleep(Deadline),
-    Park,
+    /// Wait for this.
+    Wait(Pending),
     /// Throw this error into the coroutine and step again.
     Throw(Bound<'py, PyBaseException>),
 }
 
-fn dispatch<'py>(yielded: &Bound<'py, PyAny>) -> Next<'py> {
+fn dispatch<'py>(task: &PyTask, yielded: &Bound<'py, PyAny>) -> Next<'py> {
     let py = yielded.py();
     if let Ok(trap) = yielded.cast_exact::<Trap>() {
         return match trap.get().take() {
-            Some(TrapKind::Yield) => Next::Yield,
-            Some(TrapKind::Sleep { deadline }) => Next::Sleep(deadline),
-            Some(TrapKind::Park) => Next::Park,
-            None => Next::Throw(
-                PyRuntimeError::new_err(
-                    "porto: a trap reached the driver without being awaited (or twice); \
-                     `await` porto awaitables, do not `yield` them",
-                )
-                .into_value(py)
-                .into_bound(py),
-            ),
+            Some(Pending::Join(target)) if task.is_same_task(target.body()) => {
+                Next::Throw(error(py, SELF_JOIN))
+            }
+            Some(pending) => Next::Wait(pending),
+            None => Next::Throw(error(py, TRAP_NOT_AWAITED)),
         };
     }
     if yielded.is_none() {
-        return Next::Yield;
+        return Next::Wait(Pending::Yield);
     }
     Next::Throw(unsupported_awaitable(yielded))
+}
+
+const TRAP_NOT_AWAITED: &str = "porto: a trap reached the driver without being awaited (or \
+                                twice); `await` porto awaitables, do not `yield` them";
+const SELF_JOIN: &str = "porto: a task awaited itself, which would wait forever; await the \
+                         task from another task";
+
+fn error<'py>(py: Python<'py>, message: &'static str) -> Bound<'py, PyBaseException> {
+    PyRuntimeError::new_err(message)
+        .into_value(py)
+        .into_bound(py)
 }
 
 /// The `TypeError` thrown into a coroutine that awaited something porto cannot wait for.

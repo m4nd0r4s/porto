@@ -11,11 +11,12 @@
 //! The body is 64 bytes plus the two nodes it embeds for its one wait at a time: a
 //! [`TaskTimer`] (56 B) and a [`WaitNode`] (48 B), 168 bytes in all (192 allowed). To fit, the
 //! small enums are stored as a one-byte kind next to a one-word payload, and read back through
-//! [`PyTask::take_resume`], [`PyTask::pending`] and [`PyTask::outcome`]:
+//! [`PyTask::take_resume`], [`PyTask::poll_pending`] (`wait.rs`) and [`PyTask::outcome`]:
 //!
 //! - `slot` holds the [`Resume`] payload while the task runs and the [`TaskOutcome`] payload
 //!   once it finished (the two never coexist);
-//! - `pending_object` holds the [`Pending`] payload; a sleep's deadline lives in the timer;
+//! - `pending_payload` holds the [`Pending`](super::pending::Pending) payload (`pending.rs`):
+//!   one word, for every kind;
 //! - the cancel stack is its innermost scope plus a depth, see [`PyTask::cancel_scopes`].
 
 use std::future::Future;
@@ -28,18 +29,20 @@ use porto_core::Handle;
 use porto_core::scope::{ScopeNode, ScopeRef};
 use porto_core::sync::{JoinWaiters, WaitNode};
 use porto_core::task::{Header, TaskBody, TaskBodyRef, TaskFlags};
-use porto_core::time::{Deadline, TaskTimer};
+use porto_core::time::TaskTimer;
 use pyo3::exceptions::{PyBaseException, PyException, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use super::pending::{Kind, Payload};
 use super::{lane, step};
 use crate::api::scope::Task;
 use crate::errors::RuntimeClosed;
 use crate::py_compat::take_exception;
 
-/// The cooperative budget: steps a task runs per poll before it yields to the lane
-/// (12-scheduler-and-lanes.md §1, `coop_budget`).
+/// The cooperative budget: steps and synchronous completions a task runs per poll before it
+/// yields to the lane (12-scheduler-and-lanes.md §1, `coop_budget`). It is counted in the
+/// poll's frame, not in the body (`step.rs`), so `checkpoint_if_needed` reaches it.
 pub(super) const COOP_BUDGET: u8 = 128;
 
 /// The scope type of the cancel stack: scopes collect Python exceptions.
@@ -54,8 +57,9 @@ pub(crate) struct PyTask {
     /// The payload of [`Resume`] (while running) or [`TaskOutcome`] (once finished), by
     /// `slot_kind`. Written by the lane only; joiners read it once `join` is closed.
     slot: Option<Py<PyAny>>,
-    /// The payload of [`Pending`], by `pending_kind`.
-    pending_object: Option<Py<PyAny>>,
+    /// The payload of [`Pending`](super::pending::Pending), by `pending_kind`. Owned: released
+    /// by `wait.rs`.
+    pub(super) pending_payload: Payload,
     /// The innermost cancel scope this task entered, if any (see [`PyTask::cancel_scopes`]).
     cancel_scope: Option<PyScopeRef>,
     /// Who waits for the task to finish. Closed once the outcome is in `slot`.
@@ -63,20 +67,14 @@ pub(crate) struct PyTask {
     /// The `porto.Task` wrapper, created lazily: only `Scope.spawn` makes one so far.
     py_handle: Option<Py<Task>>,
     pub(super) stats: TaskStats,
-    /// Steps left in the current poll before the task yields.
-    pub(super) budget: u8,
     slot_kind: SlotKind,
-    pending_kind: PendingKind,
+    pub(super) pending_kind: Kind,
     /// How many cancel scopes this task entered and has not exited.
     cancel_depth: u8,
     /// The entry of a `Sleep` wait.
     timer: TaskTimer,
-    /// The node of a wait on a sync primitive or on another task (porto-szb.94, szb.5).
-    #[allow(
-        dead_code,
-        reason = "Notified and Join waits use it (porto-szb.94, porto-szb.5)"
-    )]
-    wait_node: WaitNode,
+    /// The node of a `Notified` or `Join` wait.
+    pub(super) wait_node: WaitNode,
     /// Nodes in it are pointed at: the body never moves (it is pinned in the task).
     _pinned: PhantomPinned,
 }
@@ -113,27 +111,6 @@ pub(crate) enum Resume {
     Value(Py<PyAny>),
     /// Throw this exception in.
     Throw(Py<PyBaseException>),
-}
-
-/// What a task waits for between two steps (spec 11 §5.2): the trap kinds so far, plus
-/// `AsyncioFuture` and `YieldThen`. Later trap kinds (`Notified`, `Join`, `ScopeExit`, `Io`,
-/// `Future`) carry one pointer each, so they fit the same one-word payload.
-pub(crate) enum Pending {
-    /// Nothing: step right away.
-    None,
-    /// The task yielded: it was requeued, so the next poll resumes it.
-    Yield,
-    /// The task sleeps until the deadline, through its embedded timer.
-    Sleep(Deadline),
-    /// The task waits for a wake arranged by the maker of a `Park` trap.
-    Park,
-    /// The task waits for an asyncio future (the asyncio compatibility layer, §22).
-    #[allow(dead_code, reason = "made by the asyncio compatibility layer (§22)")]
-    AsyncioFuture(Py<PyAny>),
-    /// The task yields once, then resumes with this value (spec 11 T2: a synchronous result
-    /// with the budget exhausted).
-    #[allow(dead_code, reason = "made by checkpoint_if_needed (porto-szb.36)")]
-    YieldThen(Py<PyAny>),
 }
 
 /// How a task ended (spec 11 §2).
@@ -186,18 +163,6 @@ enum SlotKind {
     Cancelled,
 }
 
-/// The variant stored in `pending_kind` (with `pending_object`, or the timer for `Sleep`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-enum PendingKind {
-    None,
-    Yield,
-    Sleep,
-    Park,
-    AsyncioFuture,
-    YieldThen,
-}
-
 /// Who learns how a task ended.
 pub(crate) enum Spawned {
     /// Nobody waits for it (`_spawn`). An `Exception` goes to `sys.unraisablehook`; any other
@@ -233,14 +198,13 @@ pub(crate) fn spawn(
         coro: Some(coro.unbind()),
         context,
         slot: None,
-        pending_object: None,
+        pending_payload: Payload::EMPTY,
         cancel_scope: None,
         join: JoinWaiters::new(),
         py_handle,
         stats: TaskStats::default(),
-        budget: COOP_BUDGET,
         slot_kind: SlotKind::ResumeNone,
-        pending_kind: PendingKind::None,
+        pending_kind: Kind::None,
         cancel_depth: 0,
         timer: TaskTimer::new(),
         wait_node: WaitNode::new(0),
@@ -274,42 +238,18 @@ impl PyTask {
         self.slot = payload;
     }
 
-    /// What the task waits for; leaves `Pending::None` in its place.
-    pub(super) fn take_pending(&mut self) -> Pending {
-        let kind = std::mem::replace(&mut self.pending_kind, PendingKind::None);
-        let object = self.pending_object.take();
-        let object = || object.expect("a pending kind with a payload has one");
-        match kind {
-            PendingKind::None => Pending::None,
-            PendingKind::Yield => Pending::Yield,
-            PendingKind::Sleep => Pending::Sleep(self.timer.deadline()),
-            PendingKind::Park => Pending::Park,
-            PendingKind::AsyncioFuture => Pending::AsyncioFuture(object()),
-            PendingKind::YieldThen => Pending::YieldThen(object()),
-        }
-    }
-
-    pub(super) fn set_pending(&mut self, pending: Pending) {
-        let (kind, object) = match pending {
-            Pending::None => (PendingKind::None, None),
-            Pending::Yield => (PendingKind::Yield, None),
-            Pending::Sleep(deadline) => {
-                self.timer().reset(deadline);
-                (PendingKind::Sleep, None)
-            }
-            Pending::Park => (PendingKind::Park, None),
-            Pending::AsyncioFuture(future) => (PendingKind::AsyncioFuture, Some(future)),
-            Pending::YieldThen(value) => (PendingKind::YieldThen, Some(value)),
-        };
-        self.pending_kind = kind;
-        self.pending_object = object;
-    }
-
     /// The embedded timer, for a `Sleep` wait.
     pub(super) fn timer(&mut self) -> Pin<&mut TaskTimer> {
         // SAFETY: a `&mut PyTask` only ever comes from the pinned body (`TaskBody::poll`), and
         // the timer is never moved out of it.
         unsafe { Pin::new_unchecked(&mut self.timer) }
+    }
+
+    /// The embedded wait node, for a `Notified` or `Join` wait. Only ever reached through `&`
+    /// (`WaitQueue::poll_wait`'s contract: granters read it concurrently).
+    pub(super) fn wait_node(&self) -> Pin<&WaitNode> {
+        // SAFETY: as for the timer: the node never moves out of the pinned body.
+        unsafe { Pin::new_unchecked(&self.wait_node) }
     }
 
     /// The scopes this task entered, innermost first (spec 11 §2, `cancel_stack`).
@@ -411,8 +351,12 @@ impl PyTask {
             }
         }
         drop(coro);
-        self.pending_kind = PendingKind::None;
-        self.pending_object = None;
+        // Nothing is pending once the coroutine finished; give the wait up if it was left
+        // half-way (a failed context enter). On the lane (only `step::poll` completes a task),
+        // so a sleep's timer is unlinked too instead of keeping the task until its deadline.
+        self.abandon_wait();
+        // An interrupt filed for this task and never delivered goes with it.
+        lane::forget_interrupt(header);
         let (kind, payload) = match outcome {
             TaskOutcome::Ok(value) => (SlotKind::Ok, Some(value)),
             TaskOutcome::Err(exception) => (SlotKind::Err, Some(exception.into_any())),
@@ -446,17 +390,23 @@ impl TaskBody for PyTask {
     fn cancel(self: Pin<&mut Self>, _header: &Header) {
         // SAFETY: nothing is moved out; the timer and the wait node stay in place.
         let this = unsafe { self.get_unchecked_mut() };
-        // A timer still linked holds a waker, so it keeps the task alive until the wheel
-        // unlinks it (it fires, or the runtime drops every timer): nothing to undo here, and
-        // nothing that needs the lane. Dropping the coroutine closes it; off a Python thread (a
-        // wake after shutdown), pyo3 defers that to the next attached one.
+        // Unregisters the wait (T3) with what works off the lane (see `release_wait`).
+        // Dropping the coroutine closes it; off a Python thread (a wake after shutdown), pyo3
+        // defers that to the next attached one.
+        this.release_wait();
         drop(this.coro.take());
         drop(this.py_handle.take());
-        this.pending_kind = PendingKind::None;
-        this.pending_object = None;
         this.slot_kind = SlotKind::Cancelled;
         this.slot = None;
         this.join.close();
+    }
+}
+
+impl Drop for PyTask {
+    fn drop(&mut self) {
+        // A wait whose waker the task owns cannot be linked here (the link would keep the task
+        // alive); this releases what the payload owns.
+        self.release_wait();
     }
 }
 

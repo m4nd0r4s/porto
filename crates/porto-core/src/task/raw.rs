@@ -31,6 +31,9 @@ pub struct TaskVTable {
     pub(crate) drop_join_handle: unsafe fn(NonNull<Header>),
     /// The concrete future's type name, for introspection alongside the task id.
     pub(crate) type_name: fn() -> &'static str,
+    /// Where a [`TaskBody`](super::TaskBody) sits in the allocation, so a
+    /// [`TaskBodyRef`](super::TaskBodyRef) is one word; 0 for a `RustTask`, which has none.
+    pub(crate) body_offset: usize,
 }
 
 /// A non-owning pointer to a task. Copying it does not touch the refcount.

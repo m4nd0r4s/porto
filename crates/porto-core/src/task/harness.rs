@@ -130,6 +130,7 @@ where
         try_read_output: try_read_output::<F, S>,
         drop_join_handle: drop_join_handle::<F, S>,
         type_name: std::any::type_name::<F>,
+        body_offset: 0,
     }
 }
 

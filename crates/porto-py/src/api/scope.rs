@@ -22,7 +22,7 @@ use super::run::coroutine_from;
 use crate::driver::lane;
 use crate::driver::pytask::{self, Spawned, TaskOutcome};
 use crate::driver::ready::Ready;
-use crate::driver::step::current_waker;
+use crate::driver::step::{checkpoint_if_needed, current_waker};
 use crate::driver::trap::Trap;
 use crate::errors::{InvalidStateError, NoRuntimeError};
 
@@ -154,7 +154,7 @@ impl Scope {
         Ok(task)
     }
 
-    fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Ready> {
+    fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
         if !lane::is_active() {
             return Err(NoRuntimeError::new_err(
                 "porto: `async with porto.scope()` only works in tasks of a porto runtime; \
@@ -170,7 +170,8 @@ impl Scope {
         }
         state.phase = Phase::Open;
         drop(state);
-        Ok(Ready::new(slf.clone().into_any().unbind()))
+        // T2: entering completes synchronously.
+        checkpoint_if_needed(slf.py(), slf.clone().into_any().unbind())
     }
 
     #[pyo3(signature = (_exc_type, exc, _traceback, /))]
@@ -181,17 +182,18 @@ impl Scope {
         _traceback: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
-        let done = Bound::new(py, Ready::new(py.None()))?.into_any();
         // The owner is being closed (its runtime is shutting down): it cannot wait any more, its
-        // children are dropped with the runtime, and `GeneratorExit` must go through.
+        // children are dropped with the runtime, and `GeneratorExit` must go through, so the
+        // exit must not yield (no checkpoint).
         if exc.is_instance_of::<PyGeneratorExit>() {
             let errors = slf.get().close();
             drop(errors);
-            return Ok(done);
+            return Ok(Bound::new(py, Ready::new(py.None()))?.into_any());
         }
         if slf.get().shared.lock().live == 0 {
             slf.get().finish(exc)?;
-            return Ok(done);
+            // T2: no child to wait for, so the exit completes synchronously.
+            return Ok(checkpoint_if_needed(py, py.None())?.into_bound(py));
         }
         FINISH_SCOPE
             .import(py, "porto._bridge", "finish_scope")?

@@ -9,7 +9,8 @@
 //!
 //! The lane also keeps what belongs to one run and must not outlive it: the wakers of tasks
 //! waiting for a scope's children (held here, not by the scope, so a task waiting on a scope it
-//! owns is not a reference cycle), and an error that stops the run (see [`fail`]).
+//! owns is not a reference cycle), an error that stops the run (see [`fail`]), and the
+//! interrupts filed for waiting tasks (see [`interrupt`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use porto_core::config::RuntimeConfig;
+use porto_core::task::Header;
 use porto_core::time::{Deadline, sleep_until};
 use porto_core::{Handle, ParkHook, Runtime};
 use pyo3::exceptions::PyBaseException;
@@ -43,6 +45,8 @@ thread_local! {
 struct LaneState {
     /// The tasks waiting for a scope's children, by scope key.
     scope_waiters: HashMap<usize, Waker>,
+    /// Exceptions to throw into tasks at their next wait that is not over, by task key.
+    interrupts: HashMap<usize, Py<PyBaseException>>,
     /// An exception that stops the run, raised out of `porto.run` in place of main's outcome.
     failure: Option<Py<PyBaseException>>,
     /// The waker of the `block_on` future, to deliver `failure` right away.
@@ -53,7 +57,8 @@ struct LaneState {
 /// `timer_resolution`), on this (attached) thread. The runtime
 /// is dropped before returning, still attached, so the tasks it frees release their Python
 /// objects directly. Tasks still waiting on a scope are freed after it (their coroutines are
-/// closed).
+/// closed). A task still waiting on a join or a sync primitive is kept alive by the waker that
+/// wait holds and is not freed until the wait is woken (porto-szb.100: shutdown cancels it).
 pub(crate) fn run<T>(
     _attached: Python<'_>,
     config: &RuntimeConfig,
@@ -102,6 +107,49 @@ pub(crate) fn wake_scope_waiter(scope: usize) {
     if let Some(waker) = LANE.with_borrow_mut(|lane| lane.scope_waiters.remove(&scope)) {
         waker.wake();
     }
+}
+
+/// The key of the task a waker wakes: its data pointer, the task's header for porto-core's
+/// task wakers.
+fn task_key(waker: &Waker) -> usize {
+    waker.data().addr()
+}
+
+/// Throws `exception` into the task `waker` wakes, at the `await` it is waiting in, and wakes
+/// it. The wait is given up first (T3, `wait.rs`). A task that is not waiting gets it at its
+/// next wait that is not over at once. A later interrupt of the same task replaces this one.
+///
+/// This is how a cancellation reaches a waiting task until scopes deliver it (porto-szb.36:
+/// `Scope.cancel` wakes the task, and its poll finds `effective_cancel` instead of this
+/// entry). The private `_interrupt` test hook files them.
+pub(crate) fn interrupt(waker: &Waker, exception: Py<PyBaseException>) {
+    let previous = LANE.with_borrow_mut(|lane| lane.interrupts.insert(task_key(waker), exception));
+    drop(previous);
+    waker.wake_by_ref();
+}
+
+/// Drops the interrupt filed for the task with this header, if any: a task that completes before
+/// a wait received it must not keep the exception (and its traceback) alive, nor pass it to a
+/// later task allocated at the same address.
+pub(crate) fn forget_interrupt(header: &Header) {
+    let key = core::ptr::from_ref(header).addr();
+    let forgotten = LANE.with_borrow_mut(|lane| {
+        if lane.interrupts.is_empty() {
+            return None;
+        }
+        lane.interrupts.remove(&key)
+    });
+    drop(forgotten);
+}
+
+/// Takes the interrupt filed for the task `waker` wakes, if any.
+pub(crate) fn take_interrupt(waker: &Waker) -> Option<Py<PyBaseException>> {
+    LANE.with_borrow_mut(|lane| {
+        if lane.interrupts.is_empty() {
+            return None;
+        }
+        lane.interrupts.remove(&task_key(waker))
+    })
 }
 
 /// Stops the run: `porto.run` raises `exception` instead of returning main's outcome. Used for

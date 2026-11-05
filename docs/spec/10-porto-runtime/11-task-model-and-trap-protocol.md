@@ -55,7 +55,8 @@ A PyTask has no output stage and no join-handle waker slot (a RustTask has both)
 The fields above are logical. The layout packs them so the body is 64 B without its two embedded nodes (168 B with them on 64-bit targets: `TaskTimer` 56 B, `WaitNode` 48 B):
 
 - `resume` and `result` share one payload word with a one-byte kind: the resume value exists only while the task runs, the outcome only once it finished.
-- `pending` is a one-byte kind plus one payload word (a Python object; later kinds carry one pointer each). A `Sleep`'s deadline lives in the timer.
+- `pending` is a one-byte kind plus one payload word, for every kind: a Python object (`YieldThen`, `AsyncioFuture`), a deadline (`Sleep`, also armed in the timer), or one pointer. Pointers to trait objects keep their vtable in the allocation (a thin box for `Future` and `Io`, a thin `Arc` for the primitive a `Notified` waits on), and a `TaskBodyRef` is one word because the body offset sits in the task vtable. The `_Trap` object stores its request the same way, so it stays two words.
+- `budget` lives in the poll's frame, not in the body: it is reset at every poll anyway, and `checkpoint_if_needed` (T2) reaches it there, through the lane's record of the running task.
 - `cancel_stack` is the innermost entered scope plus a one-byte depth. Scopes a task enters nest (each one's parent is the scope the task was in), so the rest of the stack is that scope's first `depth - 1` ancestors; scopes exit in reverse order.
 - `join` is one word: the head of an intrusive list of `WaitNode`s, a spin-lock bit and a CLOSED bit. Completion stores the outcome, then closes the list (waking every waiter); a waiter reads the outcome only after its wait returned ready.
 - `stats` counts steps. The timing fields need a clock read per step, too slow for the hot path; they come with the task registry (§23), behind its switch.
@@ -170,7 +171,14 @@ pub enum TrapKind {
 }
 ```
 
-The `Pending` variants mirror `TrapKind` plus `AsyncioFuture(PyObj)` and `YieldThen(Box<Pending>)`.
+The `Pending` variants mirror `TrapKind` plus `AsyncioFuture(PyObj)` and `YieldThen`. Two kinds complete the set in the implementation:
+
+- `YieldThen(value)`: a `Yield` that resumes with `value`, which is how T2 stashes a synchronous result when the budget runs out (`_Trap.kind` shows `"yield"`). It holds the value itself, not a boxed `Pending`.
+- `Park`: wait for a wake the trap's maker arranged (the M0 scope exit). It goes away once scopes wait through `ScopeExit`.
+
+`Io` is packed as one pointer to the operation, which owns its registration reference, interest and op state (13-io-driver.md §5). The operation is a future: polling it attempts the op, and dropping it unregisters its waker.
+
+A woken task whose wait is not over yet is where cancellation is delivered (§4 step 2 for a task that cannot step): the wait is abandoned under T3 and the exception thrown in. A wait that is already over wins: its result is delivered, and the cancellation waits for the next wait.
 
 ### 5.3 Rules
 - **T1** Every Porto awaitable MUST either complete synchronously or yield exactly one Trap.

@@ -119,7 +119,9 @@ class _Trap:
     """
 
     @property
-    def kind(self) -> Literal["yield", "sleep", "park"]:
+    def kind(
+        self,
+    ) -> Literal["yield", "sleep", "park", "notified", "io", "join", "scope_exit", "future"]:
         """What the trap asks the driver for."""
 
     @property
@@ -209,3 +211,50 @@ def _raise_rust_error_chain(depth: int, /) -> NoReturn:
 
 def _raise_rust_panic(message: str, /) -> NoReturn:
     """Test hook: panics in Rust with ``message`` and raises the resulting ``RustPanic``."""
+
+@final
+class _WaitProbe:
+    """Test hook: a bare wait queue. ``wait()`` is a ``Notified`` trap on it."""
+
+    def __init__(self) -> None: ...
+    def wait(self) -> _Trap:
+        """A trap that waits until a notify grants the awaiting task's wait node."""
+
+    def notify_all(self) -> int:
+        """Wakes every task waiting now; returns how many."""
+
+    def notify_one(self) -> bool:
+        """Grants the longest waiting task; returns whether one was waiting."""
+
+    @property
+    def waiting(self) -> int:
+        """How many tasks are queued."""
+
+@final
+class _JoinTarget(Generic[_T_co]):
+    """Test hook: a task spawned by ``_spawn_joinable``."""
+
+    def join(self) -> Awaitable[_T_co]:
+        """A ``Join`` trap: evaluates to the task's result, or raises its exception."""
+
+    @property
+    def done(self) -> bool:
+        """Whether the task finished."""
+
+@final
+class _TaskToken:
+    """Test hook: the task that called ``_current_task_token``."""
+
+def _spawn_joinable(coro: Coroutine[Any, Any, _T], /) -> _JoinTarget[_T]:
+    """Test hook: starts ``coro`` as a task on the running runtime, to join with ``join()``."""
+
+def _checkpoint_if_needed(value: _T, /) -> Awaitable[_T]:
+    """Test hook: what a synchronous completion returns (T2): a ``_Ready``, or a yield trap that
+    resumes with ``value`` once the running task's budget is spent."""
+
+def _current_task_token() -> _TaskToken:
+    """Test hook: a token for the running task; ``RuntimeError`` outside a porto task."""
+
+def _interrupt(token: _TaskToken, exception: BaseException, /) -> None:
+    """Test hook: throws ``exception`` into the task at the await it waits in, giving its wait
+    up first (T3), or at its next wait that is not over at once."""
