@@ -6,7 +6,7 @@
 //!
 //! M0 spike: the task core ([`task`]), a single-lane executor ([`sched`]) and its timers
 //! ([`time`]). M1 adds the wait queue the sync primitives build on ([`sync`]) and the runtime
-//! configuration ([`config`]).
+//! configuration ([`config`]) and the cooperative budget ([`coop`]).
 //!
 //! ```
 //! let rt = porto_core::Runtime::new();
@@ -15,6 +15,7 @@
 //! ```
 
 pub mod config;
+pub mod coop;
 pub mod sched;
 pub mod scope;
 pub mod sync;

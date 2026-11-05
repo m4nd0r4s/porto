@@ -104,9 +104,9 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 
 ## 10. Cooperative budget
 - Reset to `coop_budget` at each `poll`.
-- Every ready-fast-path await and every trap resolution decrements it.
+- Every ready-fast-path await and every step of a Python task (the resume after a trap resolved, or a throw) decrements it.
 - At 0: the next checkpoint yields (`Pending::YieldThen`), and the task is pushed to the **back** of the local queue (not the LIFO slot).
-- Rust futures use `porto_core::coop::poll_proceed(cx)` like Tokio.
+- Rust futures use `porto_core::coop::poll_proceed(cx)` like Tokio: the lane runs each task poll under `coop::budget(coop_budget, ..)`, and `poll_proceed` returns `Pending` (waking the task) once it is spent; the unit is given back unless the operation made progress. A Python task copies the budget into its poll's frame (`coop::remaining()`), so a step touches no thread local; Rust futures it awaits draw on the lane's count separately.
 
 ## 11. Shutdown of the scheduler
 1. `Shared.shutdown = true`.

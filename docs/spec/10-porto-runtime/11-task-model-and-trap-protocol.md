@@ -179,7 +179,7 @@ A woken task whose wait is not over yet is where cancellation is delivered (§4 
 
 ### 5.3 Rules
 - **T1** Every Porto awaitable MUST either complete synchronously or yield exactly one Trap.
-- **T2** Synchronous completion MUST call `checkpoint_if_needed()`. It raises `Cancelled` if the effective scope is cancelled and the cancel was not yet delivered to this checkpoint. It also decrements the budget. When the budget hits 0, it converts the completion into `Trap::Yield` with the result stashed (`Pending::YieldThen(Ready(v))`).
+- **T2** Synchronous completion MUST call `checkpoint_if_needed()`. It raises `Cancelled` if the effective scope is cancelled and the cancel was not yet delivered to this checkpoint. It also spends a unit of the budget. When the budget is already spent, it converts the completion into `Trap::Yield` with the result stashed (`Pending::YieldThen(Ready(v))`). Every step spends a unit too (a throw included), so the step that resumes a `YieldThen` spends the first unit of the next poll, and a loop of synchronous completions yields every `coop_budget` awaits.
 - **T3** Traps are cancel-safe: dropping a pending trap (on cancellation) MUST unregister wakers and must not lose data. For I/O ops, the op is re-attempted only after readiness, so data is never consumed by a cancelled op.
 - **T4** A trap yielded by a coroutine **not** running inside a Porto task (e.g., awaited inside an asyncio Task on the facade) is handled by the facade (§22): the Trap implements `_asyncio_future_blocking` via a slow path.
 

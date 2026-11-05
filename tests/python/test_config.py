@@ -412,3 +412,11 @@ def test_dev_mode_turns_debug_on() -> None:
             check=True,
         ).stdout.strip()
         assert output == expected
+
+
+def test_run_refuses_a_coop_budget_the_runtime_cannot_hold() -> None:
+    async def main() -> None:
+        pass
+
+    with pytest.raises(ValueError, match="coop_budget must be at most 4294967295"):
+        porto.run(main, coop_budget=2**32)

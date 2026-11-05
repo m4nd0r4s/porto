@@ -1,8 +1,9 @@
 //! Test hooks for the trap kinds that no public API makes yet (11-task-model §5.2, §5.3):
 //!
 //! - `_WaitProbe`: a bare wait queue; `probe.wait()` is a `Notified` trap on it;
-//! - `_spawn_joinable(coro)` spawns a task and returns a `_JoinTarget`, whose `join()` is a
-//!   `Join` trap (the Python `Task` gets `await` with porto-szb.8);
+//! - `_spawn_joinable(coro, context=None)` spawns a task and returns a `_JoinTarget`, whose
+//!   `join()` is a `Join` trap (the Python `Task` gets `await` with porto-szb.8) and whose
+//!   `steps` counts the coroutine resumes (the step loop's round trips are tested with it);
 //! - `_checkpoint_if_needed(value)`: what a synchronous completion returns (T2);
 //! - `_current_task_token()` and `_interrupt(token, exc)`: throw `exc` into a waiting task,
 //!   which gives its wait up first (T3), as cancellation will (porto-szb.36).
@@ -13,7 +14,8 @@ use std::task::{Context, Poll, Waker};
 
 use porto_core::sync::{Locked, WaitNode, WaitQueue, WaitState};
 use porto_core::task::TaskBodyRef;
-use pyo3::exceptions::{PyBaseException, PyRuntimeError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError};
+use pyo3::ffi;
 use pyo3::prelude::*;
 
 use crate::driver::pytask::{self, PyTask, Spawned};
@@ -114,20 +116,51 @@ impl JoinTarget {
     fn done(&self) -> bool {
         self.task.is_complete()
     }
+
+    /// How many times the driver resumed the task's coroutine (`send` or `throw`) so far. Read
+    /// it from another task of the same run.
+    #[getter]
+    fn steps(&self) -> PyResult<u32> {
+        if !lane::is_active() || step::is_running(self.task.header()) {
+            return Err(PyRuntimeError::new_err(
+                "porto: _JoinTarget.steps must be read from another task of the run the target \
+                 belongs to",
+            ));
+        }
+        // SAFETY: on the target's lane (single-lane run) and not inside its poll; the reference
+        // keeps the body alive.
+        Ok(unsafe { PyTask::steps(self.task.body()) })
+    }
 }
 
 /// Starts `coro` as a task on the running runtime and returns a handle to join it. Nothing
-/// reports its exception but a join.
+/// reports its exception but a join. The task runs in a copy of the current context, or in
+/// `context` itself if given (so a test can hand it a context that is already entered).
 #[pyfunction(name = "_spawn_joinable")]
-#[pyo3(signature = (coro, /))]
-fn spawn_joinable(coro: Bound<'_, PyAny>) -> PyResult<JoinTarget> {
+#[pyo3(signature = (coro, /, context = None))]
+fn spawn_joinable(
+    coro: Bound<'_, PyAny>,
+    context: Option<Bound<'_, PyAny>>,
+) -> PyResult<JoinTarget> {
     let Some(handle) = lane::current() else {
         return Err(PyRuntimeError::new_err(
             "porto: _spawn_joinable() must be called from a task running under _run(); start \
              the runtime with _run(main()) and spawn from inside main",
         ));
     };
-    let task = pytask::spawn(&handle, coro, Spawned::Joined)?;
+    let task = match context {
+        Some(context) => {
+            // SAFETY: attached (we hold a `Bound`); `context` is live.
+            if unsafe { ffi::PyContext_CheckExact(context.as_ptr()) } == 0 {
+                return Err(PyTypeError::new_err(
+                    "_spawn_joinable: context must be a contextvars.Context; pass \
+                     contextvars.copy_context() or leave it out",
+                ));
+            }
+            pytask::spawn_in_context(&handle, coro, context.unbind(), Spawned::Joined)
+        }
+        None => pytask::spawn(&handle, coro, Spawned::Joined)?,
+    };
     Ok(JoinTarget { task })
 }
 

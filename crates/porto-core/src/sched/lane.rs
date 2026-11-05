@@ -9,6 +9,9 @@
 //!   tasks that keep waking themselves on the lane cannot starve wakes from other threads;
 //! - otherwise the local queue, then a batch from the injector.
 //!
+//! Each task poll starts with a fresh cooperative budget (`crate::coop`): a task that spends it
+//! wakes itself, which puts it at the back of the local queue.
+//!
 //! With nothing to run the lane does maintenance once more, then parks: in the driver if the
 //! runtime has one, else on its thread, never past the earliest timer. There is no LIFO slot
 //! and no stealing yet (M2).
@@ -30,6 +33,8 @@ use crate::time::Deadline;
 pub(crate) const EVENT_INTERVAL: u32 = 61;
 /// Ticks between two injector-first picks (`global_queue_interval`).
 pub(crate) const GLOBAL_QUEUE_INTERVAL: u32 = 31;
+/// The cooperative budget of a task poll unless the builder sets one (`coop_budget`).
+pub(crate) const DEFAULT_COOP_BUDGET: u32 = 128;
 /// The most tasks one injector pop moves to the local queue (half the local capacity of §2).
 const INJECT_BATCH: usize = 128;
 
@@ -41,17 +46,31 @@ pub(crate) struct Lane {
     pub(crate) local: RefCell<VecDeque<Notified>>,
     tick: Cell<u32>,
     park_hook: Option<Box<dyn ParkHook>>,
+    /// The budget each task poll starts with (`crate::coop`).
+    coop_budget: u32,
 }
 
 impl Lane {
-    pub(crate) fn new(index: usize, handle: Handle, park_hook: Option<Box<dyn ParkHook>>) -> Self {
+    pub(crate) fn new(
+        index: usize,
+        handle: Handle,
+        park_hook: Option<Box<dyn ParkHook>>,
+        coop_budget: u32,
+    ) -> Self {
         Self {
             index,
             handle,
             local: RefCell::new(VecDeque::with_capacity(256)),
             tick: Cell::new(0),
             park_hook,
+            coop_budget,
         }
+    }
+
+    /// Runs `poll` (one task poll, or the `block_on` future's) with a fresh cooperative budget.
+    #[inline]
+    pub(crate) fn with_budget<R>(&self, poll: impl FnOnce() -> R) -> R {
+        crate::coop::budget(self.coop_budget, poll)
     }
 
     pub(crate) fn index(&self) -> usize {
@@ -92,7 +111,7 @@ impl Lane {
         let Some(task) = self.next_task(tick) else {
             return false;
         };
-        task.run();
+        self.with_budget(|| task.run());
         true
     }
 

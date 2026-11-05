@@ -41,11 +41,6 @@ use crate::api::scope::Task;
 use crate::errors::{Cancelled, RuntimeClosed};
 use crate::py_compat::take_exception;
 
-/// The cooperative budget: steps and synchronous completions a task runs per poll before it
-/// yields to the lane (12-scheduler-and-lanes.md §1, `coop_budget`). It is counted in the
-/// poll's frame, not in the body (`step.rs`), so `checkpoint_if_needed` reaches it.
-pub(super) const COOP_BUDGET: u8 = 128;
-
 /// The scope type of the cancel stack: scopes collect Python exceptions.
 pub(crate) type PyScopeRef = ScopeRef<Py<PyBaseException>>;
 
@@ -200,6 +195,17 @@ pub(crate) fn spawn(
     }
     // SAFETY: a new, non-null reference, which the `Bound` takes over.
     let context = unsafe { Bound::from_owned_ptr(py, context) }.unbind();
+    Ok(spawn_in_context(handle, coro, context, spawned))
+}
+
+/// [`spawn`] in `context` itself, not a copy: every step of the task enters it. `context` MUST
+/// be a `contextvars.Context`.
+pub(crate) fn spawn_in_context(
+    handle: &Handle,
+    coro: Bound<'_, PyAny>,
+    context: Py<PyAny>,
+    spawned: Spawned,
+) -> TaskBodyRef<PyTask> {
     let (flags, py_handle, scope) = match spawned {
         Spawned::Detached => (TaskFlags::PYTHON | TaskFlags::DETACHED_DROP, None, None),
         Spawned::Joined => (TaskFlags::PYTHON, None, None),
@@ -223,11 +229,11 @@ pub(crate) fn spawn(
         _pinned: PhantomPinned,
     };
     let Some(scope) = scope else {
-        return Ok(handle.spawn_body(body, flags));
+        return handle.spawn_body(body, flags);
     };
     // The base scope: the walk of its effective cancellation starts there (spec 15 §1.2).
     body.cancel_scope = Some(scope.clone());
-    Ok(handle.spawn_body_in(&scope, body, flags))
+    handle.spawn_body_in(&scope, body, flags)
 }
 
 impl PyTask {
@@ -336,6 +342,16 @@ impl PyTask {
             SlotKind::Cancelled => Some(TaskOutcome::Cancelled),
             _ => None,
         }
+    }
+
+    /// The steps the task ran so far (`TaskStats::steps`).
+    ///
+    /// # Safety
+    /// `task` points at a live body that is not being polled (read from its lane, between its
+    /// polls).
+    pub(crate) unsafe fn steps(task: NonNull<Self>) -> u32 {
+        // SAFETY: the caller's contract; the field is read alone, not through a `&PyTask`.
+        unsafe { (*task.as_ptr()).stats.steps }
     }
 
     /// The task's joiners.
