@@ -29,6 +29,8 @@ struct Shared {
 }
 ```
 
+**M1 (single lane).** The structure above is the M2 target. M1 builds it with one lane and without stealers: the local queue is a `VecDeque` with no capacity limit and no LIFO slot; `Shared` holds the injector (a mutex-protected FIFO whose length is mirrored in an atomic, so an empty check takes no lock, as in Tokio), one `Remote` slot per lane (its parking word and its deferred-work queue), the timers and the driver. `deferred_decref` is a lane's deferred-work queue: `Handle::defer(f)` runs `f` on lane 0 at its next maintenance tick, unparking it. Remote wakes go to the injector and notify lane 0. M2 notifies an idle lane from the idle set instead, and adds the per-lane inbox of §4. `event_interval` and `global_queue_interval` are fixed at 61 and 31 until `RuntimeConfig` passes them in.
+
 ## 3. Main loop (per lane)
 
 ```
@@ -98,6 +100,7 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 - There is exactly one driver per runtime (§13). At most one parked lane at a time **owns the driver** (`driver_lock: TryLock`). It blocks in `epoll_wait` with a timeout equal to the next timer deadline. Other parked lanes block on their futex.
 - On `unpark(lane)`: if that lane owns the driver, wake the driver via its waker (eventfd/kqueue user event). Otherwise, wake the futex.
 - Maintenance (`event_interval`) polls the driver non-blocking (timeout 0) if no lane is currently blocked in it.
+- No wake is lost between a lane deciding to park and a wake from another thread. Each lane has a parking word, EMPTY, PARKED or NOTIFIED (Tokio's parker). A waker publishes its work, then swaps the word to NOTIFIED, and unparks the lane (thread or driver waker) only if the word was PARKED. The lane moves EMPTY to PARKED with a compare-exchange before it blocks. If it finds NOTIFIED instead, it consumes it with a swap (never a store, which could erase a second waker's notification) and looks at its queues again. A loom model covers this (`sched::loom_tests`).
 
 ## 10. Cooperative budget
 - Reset to `coop_budget` at each `poll`.
