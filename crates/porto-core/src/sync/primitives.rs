@@ -5,12 +5,12 @@
 #[cfg(all(loom, test))]
 pub(crate) use loom::cell::UnsafeCell;
 #[cfg(all(loom, test))]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, fence};
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, fence};
 #[cfg(all(loom, test))]
 pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, fence};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, fence};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
 

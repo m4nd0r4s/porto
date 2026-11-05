@@ -26,13 +26,13 @@ use std::task::{Context, Poll, Waker};
 use super::primitives::{AtomicU8, Mutex, MutexGuard, UnsafeCell};
 
 /// Not in a queue, no grant pending.
-const IDLE: u8 = 0;
+pub(super) const IDLE: u8 = 0;
 /// Linked into a queue, waiting for a grant.
-const WAITING: u8 = 1;
+pub(super) const WAITING: u8 = 1;
 /// Unlinked by [`Locked::grant_front`]; the owner has not observed the grant yet.
 const GRANTED: u8 = 2;
 /// Unlinked by [`Locked::grant_all`]; the owner has not observed the wake yet.
-const WOKEN: u8 = 3;
+pub(super) const WOKEN: u8 = 3;
 
 /// Whether `state` is a grant the owner has not observed yet.
 fn is_granted(state: u8) -> bool {
@@ -59,18 +59,18 @@ pub trait WaitState: Sized {
 /// [`Wait`] upholds this on its own; code using the low-level [`WaitQueue::poll_wait`] calls
 /// [`WaitQueue::cancel`] first.
 pub struct WaitNode {
-    state: AtomicU8,
+    pub(super) state: AtomicU8,
     /// Set by the owner at creation; the primitive's meaning (permits wanted, reader/writer).
     token: usize,
     /// Guarded by the lock of the queue the node is in.
-    links: UnsafeCell<Links>,
+    pub(super) links: UnsafeCell<Links>,
     _pinned: PhantomPinned,
 }
 
-struct Links {
-    prev: *const WaitNode,
-    next: *const WaitNode,
-    waker: Option<Waker>,
+pub(super) struct Links {
+    pub(super) prev: *const WaitNode,
+    pub(super) next: *const WaitNode,
+    pub(super) waker: Option<Waker>,
 }
 
 // SAFETY: `links` is only accessed under the queue lock and `state` is atomic. The owner-side

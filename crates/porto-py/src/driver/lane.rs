@@ -24,7 +24,7 @@ use pyo3::exceptions::PyBaseException;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use super::pytask::Outcome;
+use super::pytask::TaskOutcome;
 use crate::py_compat::take_exception;
 
 /// How often the lane checks for signals (Ctrl-C) while it waits for `main`: the longest a
@@ -114,7 +114,7 @@ pub(crate) fn fail(exception: Py<PyBaseException>) {
 /// Waits for `main`, the outcome of the run's main task, and meanwhile delivers what stops the
 /// run early: a signal handler that raises (`KeyboardInterrupt` on Ctrl-C), checked every
 /// [`SIGNAL_CHECK_INTERVAL`], and a [`fail`]ure. MUST be polled by the lane's `block_on`.
-pub(crate) async fn main_or_interrupt(main: impl Future<Output = Outcome>) -> Outcome {
+pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -> TaskOutcome {
     let mut main = pin!(main);
     let mut ticker = pin!(sleep_until(Deadline::after(SIGNAL_CHECK_INTERVAL)));
     poll_fn(|cx| {
@@ -126,7 +126,7 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = Outcome>) -> Ou
             lane.failure.take()
         });
         if let Some(exception) = failure {
-            return Poll::Ready(Outcome::Raised(exception));
+            return Poll::Ready(TaskOutcome::Err(exception));
         }
         while ticker.as_mut().poll(cx).is_ready() {
             // SAFETY: the lane's `block_on` polls this future with the thread state attached
@@ -134,7 +134,7 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = Outcome>) -> Ou
             if unsafe { ffi::PyErr_CheckSignals() } < 0 {
                 // SAFETY: attached, see above.
                 let py = unsafe { Python::assume_attached() };
-                return Poll::Ready(Outcome::Raised(take_exception(py).unbind()));
+                return Poll::Ready(TaskOutcome::Err(take_exception(py).unbind()));
             }
             ticker
                 .as_mut()

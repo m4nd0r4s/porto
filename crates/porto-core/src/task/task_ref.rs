@@ -36,6 +36,12 @@ impl TaskRef {
         task
     }
 
+    /// The task's pointer, with the provenance of the whole allocation; the count is not
+    /// touched.
+    pub(crate) fn raw(&self) -> RawTask {
+        self.0
+    }
+
     /// The task's id.
     pub fn id(&self) -> u64 {
         self.header().id()

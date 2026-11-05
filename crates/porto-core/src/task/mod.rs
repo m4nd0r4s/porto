@@ -8,6 +8,7 @@
 //!
 //! The loom models run with `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release task`.
 
+mod body;
 mod flags;
 mod harness;
 mod header;
@@ -25,6 +26,9 @@ mod tests;
 mod join_tests;
 
 #[cfg(all(test, not(loom)))]
+mod body_tests;
+
+#[cfg(all(test, not(loom)))]
 mod proptests;
 
 #[cfg(all(test, loom))]
@@ -33,12 +37,14 @@ mod loom_tests;
 use std::fmt;
 use std::mem;
 
+pub use body::{TaskBody, TaskBodyRef};
 pub use flags::TaskFlags;
 pub use header::{Header, RegistryNode, ScopeNode};
 pub use join::{JoinError, JoinHandle};
 pub use raw::TaskVTable;
 pub use task_ref::TaskRef;
 
+pub(crate) use body::new_body_task;
 pub(crate) use harness::new_joinable_task;
 #[cfg(all(test, not(loom)))]
 pub(crate) use harness::new_task;
