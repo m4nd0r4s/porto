@@ -18,7 +18,7 @@ pub use driver::trap::Trap;
 pub use py_compat::interned;
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,
-/// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`), the trap protocol's
+/// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`, `Lock`), the trap protocol's
 /// awaitables (`_Trap`, `_Ready`), the step driver's private
 /// entry points (`_run`, `_spawn`, the trap constructors) and test hooks.
 ///

@@ -1,0 +1,131 @@
+//! `porto.Lock`: an async lock with fair FIFO handoff.
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use porto_core::sync::{Mutex, MutexGuard, WaitNode};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+
+use super::blocking;
+use crate::api::time::require_lane;
+use crate::driver::step::checkpoint_if_needed;
+use crate::driver::thin::{WaitSource, Waitable};
+use crate::driver::trap::{Trap, TrapKind};
+
+/// The lock: a `Mutex<()>` held without guards, since a Python holder is not a Rust scope.
+struct LockSource(Mutex<()>);
+
+// SAFETY: forwards to the mutex's node API, whose contract is `WaitSource`'s. A ready poll
+// means the waiting task holds the lock.
+unsafe impl WaitSource for LockSource {
+    unsafe fn poll_wait(&self, node: Pin<&WaitNode>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the caller's contract.
+        unsafe { self.0.poll_lock_node(node, cx) }
+    }
+
+    unsafe fn cancel(&self, node: Pin<&WaitNode>) {
+        // SAFETY: the caller's contract.
+        unsafe { self.0.cancel_lock_node(node) }
+    }
+}
+
+impl LockSource {
+    /// Takes the lock if it is free; the holder releases it with [`LockSource::unlock`].
+    fn try_lock(&self) -> bool {
+        self.0.try_lock().map(MutexGuard::leak).is_some()
+    }
+
+    /// Releases the lock, handing it to the first waiter; `false` if it was not locked.
+    fn unlock(&self) -> bool {
+        // SAFETY: the value is `()`: no reference to it outlives the lock.
+        unsafe { self.0.force_unlock() }
+    }
+}
+
+/// `porto.Lock()`: an async lock. Fair: waiters get it in arrival order, and `release()`
+/// hands it straight to the first one. Not reentrant: acquiring it again from the task that
+/// holds it waits forever.
+#[pyclass(frozen, module = "porto", name = "Lock")]
+pub(super) struct Lock {
+    lock: Arc<Waitable<LockSource>>,
+}
+
+#[pymethods]
+impl Lock {
+    #[new]
+    fn new() -> Self {
+        Self {
+            lock: Waitable::new(LockSource(Mutex::new(()))),
+        }
+    }
+
+    /// An awaitable that completes once the task holds the lock: without suspending if it is
+    /// free. Cancelling the wait never leaks the lock.
+    fn acquire(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        require_lane("Lock.acquire")?;
+        if self.lock.try_lock() {
+            return checkpoint_if_needed(py, py.None()).inspect_err(|_| {
+                // Not delivered: the task does not hold the lock.
+                self.lock.unlock();
+            });
+        }
+        Ok(Py::new(py, Trap::new(TrapKind::Notified(self.lock.target())))?.into_any())
+    }
+
+    /// Takes the lock if it is free right now; returns whether it did. Never waits.
+    fn try_acquire(&self) -> bool {
+        self.lock.try_lock()
+    }
+
+    /// Releases the lock, handing it to the task that has waited longest. Raises
+    /// `RuntimeError` if the lock is not held.
+    fn release(&self) -> PyResult<()> {
+        if self.lock.unlock() {
+            return Ok(());
+        }
+        Err(PyRuntimeError::new_err(
+            "porto: Lock.release() was called on a lock that is not held; release a lock once \
+             per acquire (`async with lock:` does it for you)",
+        ))
+    }
+
+    /// Whether the lock is held (or being handed to a waiter).
+    fn locked(&self) -> bool {
+        self.lock.0.is_locked()
+    }
+
+    /// Blocks the calling thread until it holds the lock; release it with `release()`. Only
+    /// for threads that do not run porto: on a lane thread it raises `RuntimeError`.
+    fn blocking_acquire(&self, py: Python<'_>) -> PyResult<()> {
+        blocking(py, "Lock.blocking_acquire", || {
+            self.lock.0.blocking_lock().map(MutexGuard::leak)
+        })
+    }
+
+    fn __aenter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.acquire(py)
+    }
+
+    #[pyo3(signature = (_exc_type, _exc, _traceback, /))]
+    fn __aexit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        self.release()?;
+        // After the release: a checkpoint here (T2) never holds the lock.
+        checkpoint_if_needed(py, py.None())
+    }
+
+    fn __repr__(&self) -> &'static str {
+        if self.lock.0.is_locked() {
+            "<porto.Lock locked>"
+        } else {
+            "<porto.Lock unlocked>"
+        }
+    }
+}

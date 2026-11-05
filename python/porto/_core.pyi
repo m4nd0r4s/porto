@@ -1,7 +1,7 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify`` and ``__version__``
+``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -167,6 +167,43 @@ class Notify:
 
         The wait does not check for signals: Ctrl-C does not interrupt it, and the
         ``KeyboardInterrupt`` is raised once it is over."""
+
+@final
+class Lock:
+    """An async lock: ``async with lock:``. Fair: waiters get it in arrival order, and
+    ``release()`` hands it straight to the first one. **Not reentrant**: acquiring it again
+    from the task that holds it waits forever. A waiter that is cancelled never leaks it.
+    Thread-safe."""
+
+    def __init__(self) -> None: ...
+    def acquire(self) -> Awaitable[None]:
+        """Completes once the task holds the lock; without suspending if it is free.
+
+        Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``.
+        """
+
+    def try_acquire(self) -> bool:
+        """Takes the lock if it is free right now; returns whether it did."""
+
+    def release(self) -> None:
+        """Releases the lock, handing it to the longest waiting task. ``RuntimeError`` if the
+        lock is not held."""
+
+    def locked(self) -> bool:
+        """Whether the lock is held (or being handed to a waiter)."""
+
+    def blocking_acquire(self) -> None:
+        """Blocks the calling thread until it holds the lock; ``release()`` releases it. Only
+        from threads that do not run porto: raises ``RuntimeError`` on a lane thread."""
+
+    def __aenter__(self) -> Awaitable[None]: ...
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
 
 @final
 class _Trap:

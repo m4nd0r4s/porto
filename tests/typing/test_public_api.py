@@ -94,13 +94,28 @@ def check_errors_are_the_builtins_they_extend() -> None:
 
 
 async def sync_primitives() -> int:
-    event, notify = porto.Event(), porto.Notify()
+    event, notify, lock = porto.Event(), porto.Notify(), porto.Lock()
     event.set()
     assert_type(event.is_set(), bool)
     await event.wait()
     notify.notify_one()
     await notify.notified()
-    return 1
+    assert_type(lock.try_acquire(), bool)
+    lock.release()
+    async with lock:
+        assert_type(lock.locked(), bool)
+    counter = porto.Mutex[int](0)
+    async with counter as guard:
+        assert_type(guard, porto.MutexGuard[int])
+        assert_type(guard.value, int)
+        guard.set(guard.value + 1)
+    async with counter as guard:
+        return guard.value
+
+
+async def check_a_mutex_guard_checks_the_value_type() -> None:
+    async with porto.Mutex[int](0) as guard:
+        guard.set("one")  # pyright: ignore[reportArgumentType]
 
 
 def test_the_sample_runs() -> None:

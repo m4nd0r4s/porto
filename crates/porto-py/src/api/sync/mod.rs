@@ -1,5 +1,5 @@
-//! The synchronization primitives (16-sync-primitives-and-channels.md §1): `porto.Event` and
-//! `porto.Notify`.
+//! The synchronization primitives (16-sync-primitives-and-channels.md §1): `porto.Event`,
+//! `porto.Notify` and `porto.Lock` (whose `porto.Mutex[T]` is in `porto._sync`).
 //!
 //! Each wraps the `porto_core::sync` primitive in a [`Waitable`](crate::driver::thin::Waitable)
 //! and waits through a lazy `_SyncWait` awaitable (`wait_op`): an `await` that has to wait is
@@ -14,6 +14,7 @@
 //! interrupt it: the `KeyboardInterrupt` is raised once the wait is over.
 
 mod event;
+mod lock;
 mod wait_op;
 
 use porto_core::sync::BlockingOnLane;
@@ -29,7 +30,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Right after `add_class`, before anything can see the type (see `async_slots`).
     async_slots::install_am_send::<wait_op::SyncWait>(module.py(), wait_op::sync_wait_am_send)?;
     module.add_class::<event::Event>()?;
-    module.add_class::<event::Notify>()
+    module.add_class::<event::Notify>()?;
+    module.add_class::<lock::Lock>()
 }
 
 /// Runs a `blocking_*` wait with the thread detached from Python, after refusing a porto lane
