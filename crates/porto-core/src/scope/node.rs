@@ -105,8 +105,11 @@ pub struct ScopeState<E> {
     /// The tasks whose innermost scope this is and that wait in a cancellable wait, by task
     /// key: a cancel that reaches this scope wakes them (C10). See
     /// [`ScopeNode::register_waiter`].
-    waiters: HashMap<usize, Waker, BuildHasherDefault<KeyHasher>>,
+    /// Boxed on the first registration: most scopes never have a waiting task in them.
+    waiters: Option<Box<Waiters>>,
 }
+
+type Waiters = HashMap<usize, Waker, BuildHasherDefault<KeyHasher>>;
 
 /// Hashes the task keys of [`ScopeState::waiters`]: addresses, unique and spread already, so a
 /// multiply is enough (and a scope made per request pays for no random hasher state).
@@ -177,7 +180,7 @@ impl<E> ScopeState<E> {
 
     /// How many tasks are registered as waiting in this scope.
     pub fn waiter_count(&self) -> usize {
-        self.waiters.len()
+        self.waiters.as_ref().map_or(0, |waiters| waiters.len())
     }
 }
 
@@ -226,7 +229,7 @@ impl<E: Send + 'static> ScopeNode<E> {
                 errors: Vec::new(),
                 exit_waiter: None,
                 child_scopes: ChildList { head: ptr::null() },
-                waiters: HashMap::default(),
+                waiters: None,
             }),
             _not_unique: PhantomPinned,
         }
@@ -316,8 +319,8 @@ impl<E> ScopeNode<E> {
     /// locks are taken under it (parent before child, the tree's order).
     fn bump_subtree(&self, state: &ScopeState<E>, mut wake: Option<&mut Vec<Waker>>) {
         self.cancel_epoch.fetch_add(1, Ordering::Release);
-        if let Some(wake) = wake.as_deref_mut() {
-            wake.extend(state.waiters.values().cloned());
+        if let (Some(wake), Some(waiters)) = (wake.as_deref_mut(), &state.waiters) {
+            wake.extend(waiters.values().cloned());
         }
         let mut child = state.child_scopes.head;
         // SAFETY: this scope's lock is held, so no child can unlink itself (it takes that lock
@@ -345,9 +348,10 @@ impl<E> ScopeNode<E> {
     /// the cancel bumps only after it woke nobody here.
     pub fn register_waiter(&self, key: usize, waker: &Waker) -> bool {
         let mut state = self.lock_state();
-        let stale = match state.waiters.get(&key) {
+        let waiters = state.waiters.get_or_insert_default();
+        let stale = match waiters.get(&key) {
             Some(filed) if filed.will_wake(waker) => None,
-            _ => state.waiters.insert(key, waker.clone()),
+            _ => waiters.insert(key, waker.clone()),
         };
         drop(state);
         // Dropped after the unlock: dropping a waker can free its task, which locks the scope.
@@ -358,7 +362,10 @@ impl<E> ScopeNode<E> {
     /// Forgets the waker [`ScopeNode::register_waiter`] filed under `key`, if any.
     pub fn unregister_waiter(&self, key: usize) {
         let mut state = self.lock_state();
-        let filed = state.waiters.remove(&key);
+        let filed = state
+            .waiters
+            .as_mut()
+            .and_then(|waiters| waiters.remove(&key));
         drop(state);
         drop(filed);
     }
@@ -425,7 +432,7 @@ impl<E> Drop for ScopeNode<E> {
             "a child scope outlived its parent, but children hold their parent alive"
         );
         debug_assert!(
-            self.lock_state().waiters.is_empty(),
+            self.lock_state().waiter_count() == 0,
             "a waiter outlived its scope, but waiting tasks hold their scope alive"
         );
         let Some(parent) = &self.parent else {

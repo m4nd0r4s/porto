@@ -18,7 +18,7 @@
 //! Not yet: deadlines and timeouts (C9), shields (C8), names, `start()` (§3), `Task.cancel()` and
 //! awaiting a task (§4), and spawning from other lanes or threads (C10).
 
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use porto_core::scope::{CancelReason, ScopeNode};
@@ -48,10 +48,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 fn scope() -> Scope {
     Scope {
         node: OnceLock::new(),
-        closed: AtomicBool::new(false),
-        cancel_requested: AtomicBool::new(false),
-        cancel_reason: Mutex::new(None),
-        cancelled_caught: AtomicBool::new(false),
+        flags: AtomicU8::new(0),
+        cancel_reason: OnceLock::new(),
     }
 }
 
@@ -60,16 +58,26 @@ fn scope() -> Scope {
 pub struct Scope {
     /// The scope's node in the tree, set when the block is entered.
     node: OnceLock<PyScopeRef>,
-    /// Whether its `async with` block exited.
-    closed: AtomicBool,
-    /// Set by `cancel()`. Also how a cancel before the block is entered reaches the node:
-    /// `cancel` sets it then reads `node`, `__aenter__` sets `node` then reads it, each with a
-    /// `SeqCst` fence between, so at least one of them sees the other and cancels the node.
-    cancel_requested: AtomicBool,
-    /// The reason the first `cancel()` gave, for the repr.
-    cancel_reason: Mutex<Option<String>>,
-    /// Whether the exit absorbed a `Cancelled` this scope caused (C3).
-    cancelled_caught: AtomicBool,
+    /// [`ScopeFlags`]. A cancel before the block is entered reaches the node through them:
+    /// `cancel` sets `CANCEL_REQUESTED` and `__aenter__` sets `ENTERED` (after `node`), both
+    /// with one read-modify-write, so the later one sees the other and cancels the node.
+    flags: AtomicU8,
+    /// The reason the first `cancel()` gave, if any, for the repr.
+    cancel_reason: OnceLock<String>,
+}
+
+/// The bits of `Scope::flags`.
+struct ScopeFlags;
+
+impl ScopeFlags {
+    /// `node` is set: the block was entered.
+    const ENTERED: u8 = 1;
+    /// Its `async with` block exited.
+    const CLOSED: u8 = 2;
+    /// `cancel()` was called.
+    const CANCEL_REQUESTED: u8 = 4;
+    /// The exit absorbed a `Cancelled` this scope caused (C3).
+    const CANCELLED_CAUGHT: u8 = 8;
 }
 
 /// Where a scope is in its life.
@@ -161,8 +169,8 @@ impl Scope {
             step::exit_cancel_scope(&node);
             return Err(entered_twice());
         }
-        fence(Ordering::SeqCst);
-        if this.cancel_requested.load(Ordering::Relaxed) {
+        let flags = this.flags.fetch_or(ScopeFlags::ENTERED, Ordering::AcqRel);
+        if flags & ScopeFlags::CANCEL_REQUESTED != 0 {
             // Cancelled before it was entered.
             node.cancel(CancelReason::Explicit);
         }
@@ -220,15 +228,17 @@ impl Scope {
     /// Safe from any thread. Cancelling again, or a closed scope, does nothing.
     #[pyo3(signature = (reason = None))]
     fn cancel(&self, reason: Option<String>) {
-        if !self.cancel_requested.load(Ordering::Acquire) {
-            let mut first = self.lock_cancel_reason();
-            if first.is_none() {
-                *first = reason;
-            }
+        let flags = self
+            .flags
+            .fetch_or(ScopeFlags::CANCEL_REQUESTED, Ordering::AcqRel);
+        if flags & ScopeFlags::CANCEL_REQUESTED == 0
+            && let Some(reason) = reason
+        {
+            let _first = self.cancel_reason.set(reason);
         }
-        self.cancel_requested.store(true, Ordering::Release);
-        fence(Ordering::SeqCst);
-        if let Some(node) = self.node.get() {
+        if flags & ScopeFlags::ENTERED != 0
+            && let Some(node) = self.node.get()
+        {
             node.cancel(CancelReason::Explicit);
         }
     }
@@ -239,13 +249,13 @@ impl Scope {
         self.node
             .get()
             .is_some_and(|node| node.cancel_called().is_some())
-            || self.cancel_requested.load(Ordering::Acquire)
+            || self.has(ScopeFlags::CANCEL_REQUESTED)
     }
 
     /// Whether the exit absorbed a `Cancelled` this scope's cancellation raised (C3).
     #[getter]
     fn cancelled_caught(&self) -> bool {
-        self.cancelled_caught.load(Ordering::Acquire)
+        self.has(ScopeFlags::CANCELLED_CAUGHT)
     }
 
     /// While children run: a `ScopeExit` trap to await, which resumes the awaiting task once
@@ -275,7 +285,7 @@ impl Scope {
         let Some(node) = self.node.get() else {
             return format!("<porto.Scope {phase}>");
         };
-        let reason = self.lock_cancel_reason().clone();
+        let reason = self.cancel_reason.get();
         let cancelled = match (node.cancel_called(), reason) {
             (None, _) => String::new(),
             (Some(CancelReason::Explicit), Some(reason)) => format!(", cancelled: {reason:?}"),
@@ -300,7 +310,7 @@ impl Scope {
 
 impl Scope {
     fn phase(&self) -> Phase {
-        if self.closed.load(Ordering::Acquire) {
+        if self.has(ScopeFlags::CLOSED) {
             Phase::Closed
         } else if self.node.get().is_some() {
             Phase::Open
@@ -309,10 +319,8 @@ impl Scope {
         }
     }
 
-    fn lock_cancel_reason(&self) -> MutexGuard<'_, Option<String>> {
-        self.cancel_reason
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn has(&self, flag: u8) -> bool {
+        self.flags.load(Ordering::Acquire) & flag != 0
     }
 
     /// Children spawned and not ended.
@@ -324,7 +332,7 @@ impl Scope {
 
     /// Closes the scope and returns the children's failures.
     fn close(&self) -> Vec<Py<PyBaseException>> {
-        self.closed.store(true, Ordering::Release);
+        self.flags.fetch_or(ScopeFlags::CLOSED, Ordering::AcqRel);
         let Some(node) = self.node.get() else {
             return Vec::new();
         };
@@ -344,7 +352,8 @@ impl Scope {
                 .get()
                 .is_some_and(|node| node.cancel_called().is_some());
         if absorbed {
-            self.cancelled_caught.store(true, Ordering::Release);
+            self.flags
+                .fetch_or(ScopeFlags::CANCELLED_CAUGHT, Ordering::AcqRel);
         }
         let errors = self.close();
         if errors.is_empty() {
