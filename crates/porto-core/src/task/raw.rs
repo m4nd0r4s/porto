@@ -4,17 +4,27 @@ use std::ptr::NonNull;
 
 use super::header::Header;
 
-/// Operations that depend on the concrete future and scheduler types.
+/// Operations that depend on the concrete task type (`11-task-model-and-trap-protocol.md` §1).
 ///
 /// Every function takes a pointer to the task's [`Header`], which is the first field of the
-/// `repr(C)` allocation, so the implementation casts it back to the concrete cell.
-pub struct Vtable {
+/// `repr(C)` allocation, so the implementation casts it back to the concrete cell. One static
+/// vtable exists per task type; the header points at it.
+pub struct TaskVTable {
     /// Polls the task once. Consumes the reference its run queue owned.
     pub(crate) poll: unsafe fn(NonNull<Header>),
+    /// Drops the task's future (or coroutine) in place, keeping the allocation. The caller
+    /// holds RUNNING, which grants exclusive access to the body.
+    #[allow(
+        dead_code,
+        reason = "type-erased callers (cancellation, porto-szb.2) arrive later"
+    )]
+    pub(crate) drop_future: unsafe fn(NonNull<Header>),
+    /// Frees the allocation, dropping whatever the body still owns (future, scheduler handle).
+    pub(crate) dealloc: unsafe fn(NonNull<Header>),
     /// Hands the task to its scheduler. Consumes one reference, which the queue now owns.
     pub(crate) schedule: unsafe fn(NonNull<Header>),
-    /// Drops the future (if still present) and the scheduler handle, and frees the memory.
-    pub(crate) dealloc: unsafe fn(NonNull<Header>),
+    /// The concrete future's type name, for introspection alongside the task id.
+    pub(crate) type_name: fn() -> &'static str,
 }
 
 /// A non-owning pointer to a task. Copying it does not touch the refcount.
@@ -45,6 +55,17 @@ impl RawTask {
     pub(crate) unsafe fn poll(self) {
         // SAFETY: the vtable belongs to this allocation and the caller hands over a reference.
         unsafe { (self.header().vtable.poll)(self.ptr) }
+    }
+
+    /// # Safety
+    /// The caller holds RUNNING (exclusive access to the body) and a reference.
+    #[allow(
+        dead_code,
+        reason = "type-erased callers (cancellation, porto-szb.2) arrive later"
+    )]
+    pub(crate) unsafe fn drop_future(self) {
+        // SAFETY: the vtable belongs to this allocation; RUNNING excludes other body access.
+        unsafe { (self.header().vtable.drop_future)(self.ptr) }
     }
 
     /// # Safety

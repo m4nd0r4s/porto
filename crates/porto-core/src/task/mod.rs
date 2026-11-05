@@ -1,14 +1,17 @@
 //! Tasks: a refcounted heap allocation with a [`Header`] first, polled through a vtable.
 //!
 //! See `11-task-model-and-trap-protocol.md` §1 and §3. A task is referenced by run-queue
-//! entries ([`Notified`]) and by [`Waker`](std::task::Waker)s; the last reference to go
-//! frees it. Wakes schedule an idle task exactly once; a wake while the task runs makes the
-//! lane requeue it when the poll returns; a wake after completion does nothing.
+//! entries ([`Notified`]), [`TaskRef`]s and [`Waker`](std::task::Waker)s, all of which count in
+//! the header's state word; the last reference to go frees it. Wakes schedule an idle task
+//! exactly once; a wake while the task runs makes the lane requeue it when the poll returns; a
+//! wake after completion does nothing.
 
+mod flags;
 mod harness;
 mod header;
 mod raw;
 pub mod state;
+mod task_ref;
 mod waker;
 
 #[cfg(test)]
@@ -16,11 +19,12 @@ mod tests;
 
 use std::fmt;
 
-pub use header::{Header, RegistryNode};
-pub use raw::Vtable;
+pub use flags::TaskFlags;
+pub use header::{Header, RegistryNode, ScopeNode};
+pub use raw::TaskVTable;
+pub use task_ref::TaskRef;
 
 pub(crate) use harness::new_task;
-use raw::RawTask;
 
 /// Where a woken task goes. Implemented by a cheap, cloneable scheduler handle that is stored
 /// inside every task it spawned.
@@ -44,47 +48,38 @@ pub unsafe trait Schedule: Clone + Send + Sync + 'static {
 }
 
 /// A run-queue entry: owns one reference to a task in the SCHEDULED state.
-pub struct Notified(RawTask);
-
-// SAFETY: tasks are built only from `Send` futures and `Send + Sync` schedulers, and every
-// shared field of the header is atomic or only touched by the lane holding RUNNING.
-unsafe impl Send for Notified {}
+pub struct Notified(TaskRef);
 
 impl Notified {
     /// Polls the task once on the current thread, consuming this queue entry.
     ///
     /// A panic in the future completes the task, frees what it owns, and is then resumed here.
     pub fn run(self) {
-        let task = self.0;
-        std::mem::forget(self);
-        // SAFETY: the forgotten `Notified` owned a reference to a SCHEDULED task, which the
-        // poll takes over.
+        let Notified(task) = self;
+        let task = task.into_raw();
+        // SAFETY: the queue entry owned a reference to a SCHEDULED task, which the poll takes
+        // over.
         unsafe { task.poll() }
     }
 
     /// The task's id.
     pub fn id(&self) -> u64 {
-        self.0.header().id()
+        self.0.id()
     }
 
     /// The task's header.
     pub fn header(&self) -> &Header {
         self.0.header()
     }
-}
 
-impl Drop for Notified {
-    fn drop(&mut self) {
-        // SAFETY: a `Notified` owns exactly one reference.
-        unsafe { self.0.drop_reference() }
+    /// A new counted reference to the task, independent of this queue entry.
+    pub fn task_ref(&self) -> TaskRef {
+        self.0.clone()
     }
 }
 
 impl fmt::Debug for Notified {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Notified")
-            .field("id", &self.id())
-            .field("state", &self.header().state())
-            .finish()
+        f.debug_tuple("Notified").field(&self.0).finish()
     }
 }

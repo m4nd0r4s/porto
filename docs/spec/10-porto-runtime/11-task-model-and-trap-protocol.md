@@ -8,9 +8,9 @@ This file is the heart of Porto. Implement it first and benchmark it (milestone 
 #[repr(C)]
 pub struct Header {
     state: AtomicU32,            // see §3
-    vtable: &'static TaskVTable, // poll, drop, dealloc, schedule, id hooks
     owner_lane: AtomicU16,       // last lane that ran it (soft affinity)
-    flags: u16,                  // PIN, PYTHON, DETACHED_DROP, ...
+    flags: u16,                  // PIN, PYTHON, DETACHED_DROP, ...; fixed at spawn
+    vtable: &'static TaskVTable, // poll, drop, dealloc, schedule, type-name hooks
     id: u64,                     // monotonically increasing, never reused
     scope: *const ScopeNode,     // spawning scope (strong ref held by body)
     queue_next: UnsafeCell<*const Header>, // intrusive run-queue link (injector)
@@ -19,6 +19,8 @@ pub struct Header {
 ```
 - **RustTask<F: Future>**: Header + `F` + output slot + join waker. Polled via `Future::poll`.
 - **PyTask**: Header + PyTask body (§2). Its `poll` implementation performs **steps** (§4).
+
+The two 16-bit fields sit in the padding after `state`, so the header is 56 B on 64-bit targets (vtable first would pad it to 64 B).
 
 Target (ADR-034): `size_of::<Header>() <= 64` including the registry node, `size_of::<PyTaskBody>() <= 192` including the embedded timer entry and wait node (excluding the Python coroutine).
 
