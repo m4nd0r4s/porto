@@ -28,8 +28,6 @@ pub(crate) enum Pending {
     YieldThen(Py<PyAny>),
     /// Until the runtime clock reaches the deadline, through the task's embedded timer.
     Sleep(Deadline),
-    /// Until any wake, which the trap's maker arranged (a scope waiting for its children).
-    Park,
     /// Until a sync primitive grants the task's embedded wait node.
     Notified(WaitTarget),
     /// Until an I/O operation succeeds, re-attempted on readiness (spec 13 §5).
@@ -57,7 +55,6 @@ pub(crate) enum Kind {
     Yield,
     YieldThen,
     Sleep,
-    Park,
     Notified,
     Io,
     Join,
@@ -69,7 +66,7 @@ pub(crate) enum Kind {
 impl Kind {
     /// Whether the payload of this kind owns something (a reference, a box) to release.
     pub(crate) fn owns_payload(self) -> bool {
-        !matches!(self, Self::None | Self::Yield | Self::Sleep | Self::Park)
+        !matches!(self, Self::None | Self::Yield | Self::Sleep)
     }
 
     /// The name `_Trap.kind` shows.
@@ -78,7 +75,6 @@ impl Kind {
             Self::None => "none",
             Self::Yield | Self::YieldThen => "yield",
             Self::Sleep => "sleep",
-            Self::Park => "park",
             Self::Notified => "notified",
             Self::Io => "io",
             Self::Join => "join",
@@ -123,7 +119,6 @@ impl Pending {
             Self::Yield => Kind::Yield,
             Self::YieldThen(_) => Kind::YieldThen,
             Self::Sleep(_) => Kind::Sleep,
-            Self::Park => Kind::Park,
             Self::Notified(_) => Kind::Notified,
             Self::Io(_) => Kind::Io,
             Self::Join(_) => Kind::Join,
@@ -142,7 +137,6 @@ impl Pending {
             Self::Yield => (Kind::Yield, empty),
             Self::YieldThen(value) => (Kind::YieldThen, object(value)),
             Self::Sleep(deadline) => (Kind::Sleep, Payload { deadline }),
-            Self::Park => (Kind::Park, empty),
             Self::Notified(wait) => (
                 Kind::Notified,
                 Payload {
@@ -192,7 +186,6 @@ impl Pending {
                 Kind::Yield => Self::Yield,
                 Kind::YieldThen => Self::YieldThen(read(&payload.object)),
                 Kind::Sleep => Self::Sleep(payload.deadline),
-                Kind::Park => Self::Park,
                 Kind::Notified => Self::Notified(read(&payload.wait)),
                 Kind::Io => Self::Io(read(&payload.io)),
                 Kind::Join => Self::Join(read(&payload.join)),

@@ -7,10 +7,10 @@
 //! Detaching around parks lets other Python threads run, and on free-threaded builds lets a
 //! stop-the-world GC proceed.
 //!
-//! The lane also keeps what belongs to one run and must not outlive it: the wakers of tasks
-//! waiting for a scope's children (held here, not by the scope, so a task waiting on a scope it
-//! owns is not a reference cycle), an error that stops the run (see [`fail`]), and the
-//! interrupts filed for waiting tasks (see [`interrupt`]).
+//! The lane also keeps what belongs to one run and must not outlive it: an error that stops the
+//! run (see [`fail`]), the interrupts filed for waiting tasks (see [`interrupt`]), and the
+//! wakers of tasks whose wait would otherwise keep them alive forever once the run ends (see
+//! [`keep_linked_wait`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -43,8 +43,8 @@ thread_local! {
 
 #[derive(Default)]
 struct LaneState {
-    /// The tasks waiting for a scope's children, by scope key.
-    scope_waiters: HashMap<usize, Waker>,
+    /// The wakers of the tasks in a linked wait, by the key `keep_linked_wait` got.
+    linked_waits: HashMap<usize, Waker>,
     /// Exceptions to throw into tasks at their next wait that is not over, by task key.
     interrupts: HashMap<usize, Py<PyBaseException>>,
     /// An exception that stops the run, raised out of `porto.run` in place of main's outcome.
@@ -56,9 +56,9 @@ struct LaneState {
 /// Runs `body` with a fresh single-lane Python runtime configured by `config` (of which it uses
 /// `timer_resolution`), on this (attached) thread. The runtime
 /// is dropped before returning, still attached, so the tasks it frees release their Python
-/// objects directly. Tasks still waiting on a scope are freed after it (their coroutines are
-/// closed). A task still waiting on a join or a sync primitive is kept alive by the waker that
-/// wait holds and is not freed until the wait is woken (porto-szb.100: shutdown cancels it).
+/// objects directly. Then every task still in a linked wait (a join, a sync primitive, a scope
+/// exit) is cancelled: its wait is given up and its coroutine closed (spec 11 §3.2), so no task
+/// of the run outlives it.
 pub(crate) fn run<T>(
     _attached: Python<'_>,
     config: &RuntimeConfig,
@@ -73,6 +73,7 @@ pub(crate) fn run<T>(
         body(&runtime)
     };
     drop(runtime);
+    cancel_linked_waits();
     // Taken out first: dropping a waker may free its task and close its coroutine, which runs
     // Python code that may reach the lane state again.
     let state = LANE.take();
@@ -95,17 +96,40 @@ pub(crate) fn current() -> Option<Handle> {
     }
 }
 
-/// Wakes `waker` once the scope keyed `scope` calls [`wake_scope_waiter`]. Replaces an earlier
-/// registration for the same scope.
-pub(crate) fn register_scope_waiter(scope: usize, waker: Waker) {
-    let previous = LANE.with_borrow_mut(|lane| lane.scope_waiters.insert(scope, waker));
+/// Keeps `waker`, the waker of the task keyed `key`, until [`forget_linked_wait`]: the task
+/// waits on something that holds its waker while the task holds it (a join, a sync primitive,
+/// a scope exit), a cycle nothing outside it may ever end. If the run ends first, the lane
+/// wakes the waker, which cancels the task ([`run`]).
+pub(crate) fn keep_linked_wait(key: usize, waker: &Waker) {
+    let previous = LANE.with_borrow_mut(|lane| lane.linked_waits.insert(key, waker.clone()));
     drop(previous);
 }
 
-/// Wakes the task waiting for the scope keyed `scope`, if one is.
-pub(crate) fn wake_scope_waiter(scope: usize) {
-    if let Some(waker) = LANE.with_borrow_mut(|lane| lane.scope_waiters.remove(&scope)) {
-        waker.wake();
+/// Stops keeping the waker of the task keyed `key`: its wait ended.
+///
+/// Safe from any thread: a task cancelled off its lane (a wake after shutdown) finds nothing
+/// to forget there, also while that thread's locals are being destroyed.
+pub(crate) fn forget_linked_wait(key: usize) {
+    let kept = LANE
+        .try_with(|lane| lane.borrow_mut().linked_waits.remove(&key))
+        .ok()
+        .flatten();
+    // Dropped after the borrow: the last reference to a task frees it, which runs Python code.
+    drop(kept);
+}
+
+/// Cancels every task still in a linked wait, once the runtime is gone: a wake after shutdown
+/// cancels its task, which gives the wait up (T3) and closes the coroutine. A cancelled task
+/// may release others (the target of its join), which then are freed too.
+fn cancel_linked_waits() {
+    loop {
+        let waiting = LANE.with_borrow_mut(|lane| std::mem::take(&mut lane.linked_waits));
+        if waiting.is_empty() {
+            return;
+        }
+        for waker in waiting.into_values() {
+            waker.wake();
+        }
     }
 }
 

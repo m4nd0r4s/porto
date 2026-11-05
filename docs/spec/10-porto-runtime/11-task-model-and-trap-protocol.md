@@ -171,10 +171,7 @@ pub enum TrapKind {
 }
 ```
 
-The `Pending` variants mirror `TrapKind` plus `AsyncioFuture(PyObj)` and `YieldThen`. Two kinds complete the set in the implementation:
-
-- `YieldThen(value)`: a `Yield` that resumes with `value`, which is how T2 stashes a synchronous result when the budget runs out (`_Trap.kind` shows `"yield"`). It holds the value itself, not a boxed `Pending`.
-- `Park`: wait for a wake the trap's maker arranged (the M0 scope exit). It goes away once scopes wait through `ScopeExit`.
+The `Pending` variants mirror `TrapKind` plus `AsyncioFuture(PyObj)` and `YieldThen`. `YieldThen(value)` completes the set in the implementation: a `Yield` that resumes with `value`, which is how T2 stashes a synchronous result when the budget runs out (`_Trap.kind` shows `"yield"`). It holds the value itself, not a boxed `Pending`.
 
 `Io` is packed as one pointer to the operation, which owns its registration reference, interest and op state (13-io-driver.md §5). The operation is a future: polling it attempts the op, and dropping it unregisters its waker.
 

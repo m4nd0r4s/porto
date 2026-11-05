@@ -19,6 +19,7 @@
 //!   one word, for every kind;
 //! - the cancel stack is its innermost scope plus a depth, see [`PyTask::cancel_scopes`].
 
+use std::any::Any;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
@@ -37,7 +38,7 @@ use pyo3::prelude::*;
 use super::pending::{Kind, Payload};
 use super::{lane, step};
 use crate::api::scope::Task;
-use crate::errors::RuntimeClosed;
+use crate::errors::{Cancelled, RuntimeClosed};
 use crate::py_compat::take_exception;
 
 /// The cooperative budget: steps and synchronous completions a task runs per poll before it
@@ -60,7 +61,8 @@ pub(crate) struct PyTask {
     /// The payload of [`Pending`](super::pending::Pending), by `pending_kind`. Owned: released
     /// by `wait.rs`.
     pub(super) pending_payload: Payload,
-    /// The innermost cancel scope this task entered, if any (see [`PyTask::cancel_scopes`]).
+    /// The innermost scope the task is in: the last one it entered, else the scope it was
+    /// spawned into, its base scope (spec 15 §1.2). See [`PyTask::cancel_scopes`].
     cancel_scope: Option<PyScopeRef>,
     /// Who waits for the task to finish. Closed once the outcome is in `slot`.
     join: JoinWaiters,
@@ -69,6 +71,9 @@ pub(crate) struct PyTask {
     pub(super) stats: TaskStats,
     slot_kind: SlotKind,
     pub(super) pending_kind: Kind,
+    /// Whether the lane keeps the task's waker for its current wait (`wait.rs`,
+    /// `lane::keep_linked_wait`).
+    pub(super) linked_wait: bool,
     /// How many cancel scopes this task entered and has not exited.
     cancel_depth: u8,
     /// The entry of a `Sleep` wait.
@@ -170,8 +175,14 @@ pub(crate) enum Spawned {
     Detached,
     /// Rust code joins it through the returned reference ([`join`]): `porto.run`'s main task.
     Joined,
-    /// A scope's child: the outcome also goes to its [`Task`] object, which tells the scope.
-    Child(Py<Task>),
+    /// A scope's child: the scope counts it until it ends and records its failure (C4,
+    /// [`TaskBody::take_failure`]); the outcome also goes to its [`Task`] object.
+    Child {
+        /// The `porto.Task` the scope's `spawn` returned.
+        task: Py<Task>,
+        /// The scope it is spawned into, its base scope.
+        scope: PyScopeRef,
+    },
 }
 
 /// Spawns `coro` as a task on the runtime behind `handle`, which MUST be a Python lane's (see
@@ -189,12 +200,12 @@ pub(crate) fn spawn(
     }
     // SAFETY: a new, non-null reference, which the `Bound` takes over.
     let context = unsafe { Bound::from_owned_ptr(py, context) }.unbind();
-    let (flags, py_handle) = match spawned {
-        Spawned::Detached => (TaskFlags::PYTHON | TaskFlags::DETACHED_DROP, None),
-        Spawned::Joined => (TaskFlags::PYTHON, None),
-        Spawned::Child(task) => (TaskFlags::PYTHON, Some(task)),
+    let (flags, py_handle, scope) = match spawned {
+        Spawned::Detached => (TaskFlags::PYTHON | TaskFlags::DETACHED_DROP, None, None),
+        Spawned::Joined => (TaskFlags::PYTHON, None, None),
+        Spawned::Child { task, scope } => (TaskFlags::PYTHON, Some(task), Some(scope)),
     };
-    let body = PyTask {
+    let mut body = PyTask {
         coro: Some(coro.unbind()),
         context,
         slot: None,
@@ -205,12 +216,18 @@ pub(crate) fn spawn(
         stats: TaskStats::default(),
         slot_kind: SlotKind::ResumeNone,
         pending_kind: Kind::None,
+        linked_wait: false,
         cancel_depth: 0,
         timer: TaskTimer::new(),
         wait_node: WaitNode::new(0),
         _pinned: PhantomPinned,
     };
-    Ok(handle.spawn_body(body, flags))
+    let Some(scope) = scope else {
+        return Ok(handle.spawn_body(body, flags));
+    };
+    // The base scope: the walk of its effective cancellation starts there (spec 15 §1.2).
+    body.cancel_scope = Some(scope.clone());
+    Ok(handle.spawn_body_in(&scope, body, flags))
 }
 
 impl PyTask {
@@ -282,8 +299,9 @@ impl PyTask {
         Ok(())
     }
 
-    /// Records that the task exited `scope`. Returns `false`, changing nothing, if `scope` is
-    /// not its innermost one (scopes exit in the reverse order they were entered).
+    /// Records that the task exited `scope`: its parent is the innermost one again (the base
+    /// scope once it exited every scope it entered). Returns `false`, changing nothing, if
+    /// `scope` is not its innermost one (scopes exit in the reverse order they were entered).
     #[allow(dead_code, reason = "called by cancel scopes (porto-szb.36)")]
     pub(super) fn exit_cancel_scope(&mut self, scope: &ScopeNode<Py<PyBaseException>>) -> bool {
         let Some(innermost) = self.cancel_scope.take() else {
@@ -294,9 +312,7 @@ impl PyTask {
             return false;
         }
         self.cancel_depth -= 1;
-        if self.cancel_depth > 0 {
-            self.cancel_scope = innermost.parent().cloned();
-        }
+        self.cancel_scope = innermost.parent().cloned();
         true
     }
 
@@ -336,7 +352,7 @@ impl PyTask {
     pub(super) fn complete(&mut self, py: Python<'_>, header: &Header, outcome: TaskOutcome) {
         let coro = self.coro.take();
         if let Some(task) = self.py_handle.take() {
-            task.get().finish(py, outcome.clone_ref(py));
+            task.get().finish(outcome.clone_ref(py));
         } else if header.flags().contains(TaskFlags::DETACHED_DROP)
             && let TaskOutcome::Err(exception) = &outcome
         {
@@ -385,6 +401,38 @@ impl TaskBody for PyTask {
         let py = unsafe { Python::assume_attached() };
         // SAFETY: the step loop never moves the body or its nodes (see `PyTask::timer`).
         step::poll(unsafe { self.get_unchecked_mut() }, header, py, cx)
+    }
+
+    /// The exception the coroutine raised, for the scope it was spawned into (C4): `None` if it
+    /// returned, or if it raised `Cancelled` while its scope is cancelled (the scope, or one of
+    /// its ancestors, is what cancelled it). The outcome stays for the joiners.
+    ///
+    /// A Rust panic in the step loop is not asked for here: the task fails without a payload
+    /// for the scope, which is cancelled with `ChildFailed`, and the panic goes on out of
+    /// `porto.run` (it is resumed on the lane), so no scope exit waits to report it.
+    fn take_failure(self: Pin<&mut Self>) -> Option<Box<dyn Any + Send>> {
+        if self.slot_kind != SlotKind::Err {
+            return None;
+        }
+        // SAFETY: porto-core asks right after the poll that returned `Ready`, on the lane that
+        // ran it, which is attached (see `poll`).
+        let py = unsafe { Python::assume_attached() };
+        // SAFETY: only `complete` stores `Err`, with an exception.
+        let exception = unsafe {
+            self.slot
+                .as_ref()?
+                .bind(py)
+                .cast_unchecked::<PyBaseException>()
+        };
+        let cancelled_by_its_scope = exception.is_instance_of::<Cancelled>()
+            && self
+                .cancel_scope
+                .as_deref()
+                .is_some_and(|scope| scope.effective_cancellation().is_some());
+        if cancelled_by_its_scope {
+            return None;
+        }
+        Some(Box::new(exception.clone().unbind()))
     }
 
     fn cancel(self: Pin<&mut Self>, _header: &Header) {

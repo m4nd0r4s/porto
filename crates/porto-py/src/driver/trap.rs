@@ -59,10 +59,6 @@ pub(crate) enum TrapKind {
         /// When to resume.
         deadline: Deadline,
     },
-    /// Wait for a wake that whoever made the trap arranged (a scope registers the task's waker
-    /// before handing out the trap). Any wake resumes the task, so the awaiting code re-checks
-    /// what it waits for.
-    Park,
     /// Wait until a sync primitive grants the task's embedded wait node (spec 16).
     #[allow(
         dead_code,
@@ -78,10 +74,6 @@ pub(crate) enum TrapKind {
         target: TaskBodyRef<PyTask>,
     },
     /// Wait until a scope's children finished (spec 15 §1.1).
-    #[allow(
-        dead_code,
-        reason = "made by Scope.__aexit__ once scopes use the tree (porto-szb.93)"
-    )]
     ScopeExit {
         /// The scope whose children the task waits for.
         scope: PyScopeRef,
@@ -103,7 +95,6 @@ impl From<TrapKind> for Pending {
             TrapKind::Yield => Self::Yield,
             TrapKind::YieldThen(value) => Self::YieldThen(value),
             TrapKind::Sleep { deadline } => Self::Sleep(deadline),
-            TrapKind::Park => Self::Park,
             TrapKind::Notified(wait) => Self::Notified(wait),
             TrapKind::Io(io) => Self::Io(io),
             TrapKind::Join { target } => Self::Join(target),
@@ -166,11 +157,6 @@ impl Trap {
     /// A trap that resumes the task at `deadline` (`porto.sleep`, `porto.sleep_until`).
     pub fn sleep_until(deadline: Deadline) -> Self {
         Self::new(TrapKind::Sleep { deadline })
-    }
-
-    /// A trap that waits for a wake arranged by its maker (a scope waiting for its children).
-    pub fn park() -> Self {
-        Self::new(TrapKind::Park)
     }
 
     /// The deadline of a sleep trap.
@@ -249,7 +235,7 @@ fn reused_error() -> PyErr {
 
 #[pymethods]
 impl Trap {
-    /// What the trap asks for: `"yield"`, `"sleep"`, `"park"`, `"notified"`, `"io"`,
+    /// What the trap asks for: `"yield"`, `"sleep"`, `"notified"`, `"io"`,
     /// `"join"`, `"scope_exit"` or `"future"`.
     #[getter(kind)]
     fn py_kind(&self) -> &'static str {
@@ -378,12 +364,11 @@ mod tests {
         assert_eq!(deadline_of(sleep.take()), Some(Deadline::from_nanos(7)));
         // The getters still read the kind and the deadline once the trap was taken.
         assert_eq!(sleep.deadline(), Some(Deadline::from_nanos(7)));
-        for (trap, name) in [(Trap::yield_now(), "yield"), (Trap::park(), "park")] {
-            assert_eq!(trap.kind.name(), name);
-            assert_eq!(trap.deadline(), None);
-            assert!(matches!(trap.resume(true), Step::Suspend));
-            assert!(trap.take().is_some());
-        }
+        let trap = Trap::yield_now();
+        assert_eq!(trap.kind.name(), "yield");
+        assert_eq!(trap.deadline(), None);
+        assert!(matches!(trap.resume(true), Step::Suspend));
+        assert!(trap.take().is_some());
     }
 
     #[test]

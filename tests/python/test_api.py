@@ -269,7 +269,8 @@ def test_a_body_exception_without_child_failures_propagates_unchanged() -> None:
 
 
 def test_siblings_of_a_failing_child_run_to_completion() -> None:
-    # M0 has no cancellation: a failure does not stop the siblings (C4 cancels them in M1).
+    # The failure cancels the scope (C4), but nothing delivers that cancellation to the
+    # siblings yet (porto-szb.36): they run to completion.
     tasks: list[porto.Task[int]] = []
 
     async def main() -> None:
