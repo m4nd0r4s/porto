@@ -5,9 +5,11 @@
 //! (`PyTask.wait_node`), so waiting allocates nothing.
 //!
 //! A node's `state` moves `IDLE -> WAITING` (the owner enqueues it, under the lock), then
-//! `WAITING -> GRANTED` (a granter unlinks it and takes its waker, under the lock), then back to
-//! `IDLE` (the owner observes the grant, or cancels). The granter's `GRANTED` store is its last
-//! access to the node, so the owner may observe it without the lock and free the node at once.
+//! `WAITING -> GRANTED` or `WAITING -> WOKEN` (a granter unlinks it and takes its waker, under
+//! the lock), then back to `IDLE` (the owner observes the grant, or cancels). The granter's
+//! store is its last access to the node, so the owner may observe it without the lock and free
+//! the node at once. `GRANTED` is an exclusive grant ([`Locked::grant_front`]), which a
+//! cancelled owner passes on; `WOKEN` is a shared one ([`Locked::grant_all`]), which it drops.
 //! Everything else in a node (links, waker) is only touched under the queue lock.
 
 use std::fmt;
@@ -27,8 +29,15 @@ use super::primitives::{AtomicU8, Mutex, MutexGuard, UnsafeCell};
 const IDLE: u8 = 0;
 /// Linked into a queue, waiting for a grant.
 const WAITING: u8 = 1;
-/// Unlinked by a granter; the owner has not observed the grant yet.
+/// Unlinked by [`Locked::grant_front`]; the owner has not observed the grant yet.
 const GRANTED: u8 = 2;
+/// Unlinked by [`Locked::grant_all`]; the owner has not observed the wake yet.
+const WOKEN: u8 = 3;
+
+/// Whether `state` is a grant the owner has not observed yet.
+fn is_granted(state: u8) -> bool {
+    state == GRANTED || state == WOKEN
+}
 
 /// What a primitive does with a grant its waiter can no longer take.
 pub trait WaitState: Sized {
@@ -38,7 +47,8 @@ pub trait WaitState: Sized {
     ///
     /// The implementation MUST pass the grant on, typically to the next waiter
     /// ([`Locked::grant_front`]), or return it to the state (unlock, give the permits back).
-    /// Primitives whose grants are not exclusive (an event wakes everyone) do nothing.
+    /// Grants made by [`Locked::grant_all`] are shared (an event or `notify_all` wakes
+    /// everyone) and are never passed on: this is not called for them.
     fn pass_grant(waiters: &mut Locked<'_, Self>, token: usize);
 }
 
@@ -114,7 +124,8 @@ impl fmt::Debug for WaitNode {
         let state = match self.state.load(Ordering::Acquire) {
             IDLE => "idle",
             WAITING => "waiting",
-            _ => "granted",
+            GRANTED => "granted",
+            _ => "woken",
         };
         f.debug_struct("WaitNode")
             .field("state", &state)
@@ -214,8 +225,8 @@ impl<S: WaitState> WaitQueue<S> {
     {
         let node = node.get_ref();
         match node.state.load(Ordering::Acquire) {
-            GRANTED => {
-                // The granter's last access was its `GRANTED` store; the node is ours again.
+            GRANTED | WOKEN => {
+                // The granter's last access was its grant store; the node is ours again.
                 node.state.store(IDLE, Ordering::Relaxed);
                 Poll::Ready(())
             }
@@ -234,7 +245,7 @@ impl<S: WaitState> WaitQueue<S> {
                 // a waker can run arbitrary code, which may use this queue.
                 let mut stale = None;
                 let _locked = self.lock();
-                if node.state.load(Ordering::Acquire) == GRANTED {
+                if is_granted(node.state.load(Ordering::Acquire)) {
                     node.state.store(IDLE, Ordering::Relaxed);
                     return Poll::Ready(());
                 }
@@ -255,8 +266,9 @@ impl<S: WaitState> WaitQueue<S> {
     }
 
     /// Cancels `node`'s wait: unlinks it if it is still queued, or passes its grant on
-    /// ([`WaitState::pass_grant`]) if it was granted but has not observed it. Does nothing for
-    /// an idle node. The node is idle afterwards.
+    /// ([`WaitState::pass_grant`]) if it was granted by [`Locked::grant_front`] but has not
+    /// observed it. Drops an unobserved [`Locked::grant_all`] wake. Does nothing for an idle
+    /// node. The node is idle afterwards.
     ///
     /// # Safety
     /// As for [`WaitQueue::poll_wait`]; if the node is pending, it is pending on this queue.
@@ -278,6 +290,7 @@ impl<S: WaitState> WaitQueue<S> {
                 node.state.store(IDLE, Ordering::Relaxed);
                 S::pass_grant(&mut locked, node.token);
             }
+            WOKEN => node.state.store(IDLE, Ordering::Relaxed),
             _ => {}
         }
         drop(locked);
@@ -334,7 +347,27 @@ impl<S> Locked<'_, S> {
 
     /// Grants the first waiter: unlinks it and wakes it once the lock is released. Returns
     /// `false` if no waiter is queued.
+    ///
+    /// The grant is exclusive (a lock, a permit): if the waiter is cancelled before it observes
+    /// the grant, [`WaitState::pass_grant`] passes it on.
     pub fn grant_front(&mut self) -> bool {
+        self.grant_front_as(GRANTED)
+    }
+
+    /// Wakes every queued waiter, in order. Returns how many there were.
+    ///
+    /// The wakes are shared (an event, `notify_all`): a waiter cancelled before it observes its
+    /// wake drops it, and [`WaitState::pass_grant`] is not called.
+    pub fn grant_all(&mut self) -> usize {
+        let mut granted = 0;
+        while self.grant_front_as(WOKEN) {
+            granted += 1;
+        }
+        granted
+    }
+
+    /// Unlinks the first waiter, queues its wake and leaves it in `grant` (`GRANTED`, `WOKEN`).
+    fn grant_front_as(&mut self, grant: u8) -> bool {
         let head = self.guard.head;
         if head.is_null() {
             return false;
@@ -346,17 +379,8 @@ impl<S> Locked<'_, S> {
             self.wakes.push(waker);
         }
         // The last access: from here the owner may observe the grant and free the node.
-        node.state.store(GRANTED, Ordering::Release);
+        node.state.store(grant, Ordering::Release);
         true
-    }
-
-    /// Grants every queued waiter, in order. Returns how many there were.
-    pub fn grant_all(&mut self) -> usize {
-        let mut granted = 0;
-        while self.grant_front() {
-            granted += 1;
-        }
-        granted
     }
 
     /// Appends `node` with `waker` and marks it waiting.

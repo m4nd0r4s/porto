@@ -7,6 +7,15 @@
 //! - Cancellation: dropping a waiting future removes its node. If the waiter had **already been
 //!   granted** (grant and cancel raced), the grant is passed on through
 //!   [`WaitState::pass_grant`], so a lock or permit is never lost.
+//!
+//! On top of it:
+//!
+//! - [`Event`]: a flag that, once set, releases every waiter; not clearable.
+//! - [`Notify`]: `notify_one` wakes one waiter or stores one permit, `notify_all` wakes the
+//!   current waiters.
+//!
+//! And:
+//!
 //! - [`blocking_wait`]: waits from a thread that does not run a lane, the backing of every
 //!   `blocking_*` method. On a lane thread it returns [`BlockingOnLane`] instead of stalling
 //!   the lane.
@@ -18,14 +27,24 @@
 //! ```
 
 mod blocking;
+mod event;
+mod notify;
 mod primitives;
 mod wait_queue;
 
 #[cfg(all(test, not(loom)))]
 mod tests;
 
+#[cfg(all(test, not(loom)))]
+mod event_notify_tests;
+
 #[cfg(all(test, loom))]
 mod loom_tests;
 
+#[cfg(all(test, loom))]
+mod loom_event_notify_tests;
+
 pub use blocking::{BlockingOnLane, blocking_wait};
+pub use event::{Event, EventWait};
+pub use notify::{Notified, Notify};
 pub use wait_queue::{Locked, Wait, WaitNode, WaitQueue, WaitState};
