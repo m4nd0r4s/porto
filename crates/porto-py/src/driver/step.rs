@@ -6,9 +6,9 @@
 //!
 //! - a `_Trap` (exact type) is taken and its request becomes the task's [`Pending`] wait:
 //!   `Yield` and `YieldThen` requeue the task at the back of the local queue, `Sleep` arms the
-//!   task's embedded timer (a deadline already passed is a yield), `Park` waits for a wake that
-//!   the trap's maker arranged through [`current_waker`], and every other kind is polled at
-//!   once: a wait that is already over continues the loop without a scheduler round trip;
+//!   task's embedded timer (a deadline already passed is a yield), and every other kind is
+//!   polled at once: a wait that is already over continues the loop without a scheduler round
+//!   trip;
 //! - `None` (a bare `yield` in a generator-based coroutine) is a yield;
 //! - anything else is an error thrown back into the coroutine, at the `await` that yielded it.
 //!
@@ -57,8 +57,7 @@ fn running<'a>() -> Option<&'a Running> {
     (!running.is_null()).then(|| unsafe { &*running })
 }
 
-/// A clone of the waker of the task running on this thread, if a task is running: what native
-/// code called from a coroutine registers before handing it a [`TrapKind::Park`] trap.
+/// A clone of the waker of the task running on this thread, if a task is running.
 pub(crate) fn current_waker() -> Option<Waker> {
     // SAFETY: `poll` borrows the waker for as long as it publishes it.
     running().map(|running| unsafe { &*running.waker }.clone())
@@ -203,7 +202,6 @@ fn step_until_wait(
                         }
                         return None;
                     }
-                    Kind::Park => return None,
                     // Polled at the top of the loop: a wait that is already over continues
                     // without a round trip through the scheduler.
                     _ => {}

@@ -15,7 +15,7 @@
 //! - `ScopeExit`: the scope forgets the task's exit waker;
 //! - `Future`, `Io`: the future is dropped, which unregisters its wakers (an operation
 //!   consumes data only in the attempt that completes it);
-//! - `Yield`, `YieldThen`, `Park`: nothing is linked; the value or the wake is dropped.
+//! - `Yield`, `YieldThen`: nothing is linked; the value is dropped.
 
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
@@ -52,10 +52,9 @@ impl PyTask {
     pub(super) fn poll_pending(&mut self, py: Python<'_>, cx: &mut Context<'_>) -> Poll<Resume> {
         match self.pending_kind {
             Kind::None => Poll::Ready(Resume::None),
-            // A yielded task was requeued; a parked one is only polled after a wake: whoever
-            // woke it ended the wait. Neither payload owns anything: the hot path of a switch,
-            // kept inline.
-            Kind::Yield | Kind::Park => {
+            // A yielded task was requeued, so the wait is over. Its payload owns nothing: the
+            // hot path of a switch, kept inline.
+            Kind::Yield => {
                 self.pending_kind = Kind::None;
                 Poll::Ready(Resume::None)
             }
@@ -66,7 +65,7 @@ impl PyTask {
     /// [`PyTask::poll_pending`] for the kinds that register something.
     fn poll_linked_wait(&mut self, py: Python<'_>, cx: &mut Context<'_>) -> Poll<Resume> {
         let resume = match self.pending_kind {
-            Kind::None | Kind::Yield | Kind::Park => unreachable!("resolved inline"),
+            Kind::None | Kind::Yield => unreachable!("resolved inline"),
             Kind::YieldThen => match self.take_pending() {
                 Pending::YieldThen(value) => return Poll::Ready(Resume::Value(value)),
                 _ => unreachable!("the payload of a YieldThen is its value"),

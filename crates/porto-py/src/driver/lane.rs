@@ -7,10 +7,8 @@
 //! Detaching around parks lets other Python threads run, and on free-threaded builds lets a
 //! stop-the-world GC proceed.
 //!
-//! The lane also keeps what belongs to one run and must not outlive it: the wakers of tasks
-//! waiting for a scope's children (held here, not by the scope, so a task waiting on a scope it
-//! owns is not a reference cycle), an error that stops the run (see [`fail`]), and the
-//! interrupts filed for waiting tasks (see [`interrupt`]).
+//! The lane also keeps what belongs to one run and must not outlive it: an error that stops the
+//! run (see [`fail`]) and the interrupts filed for waiting tasks (see [`interrupt`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -43,8 +41,6 @@ thread_local! {
 
 #[derive(Default)]
 struct LaneState {
-    /// The tasks waiting for a scope's children, by scope key.
-    scope_waiters: HashMap<usize, Waker>,
     /// Exceptions to throw into tasks at their next wait that is not over, by task key.
     interrupts: HashMap<usize, Py<PyBaseException>>,
     /// An exception that stops the run, raised out of `porto.run` in place of main's outcome.
@@ -92,20 +88,6 @@ pub(crate) fn current() -> Option<Handle> {
         Handle::try_current()
     } else {
         None
-    }
-}
-
-/// Wakes `waker` once the scope keyed `scope` calls [`wake_scope_waiter`]. Replaces an earlier
-/// registration for the same scope.
-pub(crate) fn register_scope_waiter(scope: usize, waker: Waker) {
-    let previous = LANE.with_borrow_mut(|lane| lane.scope_waiters.insert(scope, waker));
-    drop(previous);
-}
-
-/// Wakes the task waiting for the scope keyed `scope`, if one is.
-pub(crate) fn wake_scope_waiter(scope: usize) {
-    if let Some(waker) = LANE.with_borrow_mut(|lane| lane.scope_waiters.remove(&scope)) {
-        waker.wake();
     }
 }
 

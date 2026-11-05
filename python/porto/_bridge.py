@@ -9,8 +9,8 @@ _T = TypeVar("_T")
 
 
 async def finish_scope(scope: Scope, exc: BaseException | None) -> None:
-    """The waiting part of ``Scope.__aexit__``: parks until no child runs, then closes the scope
-    (raising the children's failures)."""
+    """The waiting part of ``Scope.__aexit__``: waits on ``ScopeExit`` traps until no child
+    runs, then closes the scope (raising the children's failures)."""
     while (trap := scope._wait_trap()) is not None:  # pyright: ignore[reportPrivateUsage]
         await trap
     scope._finish(exc)  # pyright: ignore[reportPrivateUsage]

@@ -121,7 +121,7 @@ class _Trap:
     @property
     def kind(
         self,
-    ) -> Literal["yield", "sleep", "park", "notified", "io", "join", "scope_exit", "future"]:
+    ) -> Literal["yield", "sleep", "notified", "io", "join", "scope_exit", "future"]:
         """What the trap asks the driver for."""
 
     @property

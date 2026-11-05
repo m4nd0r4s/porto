@@ -1,17 +1,26 @@
-//! `porto.scope()`, `Scope` and `Task`: the M0 nursery (15-structured-concurrency-and-
-//! cancellation.md §1-§2, the parts without cancellation).
+//! `porto.scope()`, `Scope` and `Task`: the nursery (15-structured-concurrency-and-
+//! cancellation.md §1-§2, the parts without cancel delivery).
 //!
-//! A scope counts its live children. `__aexit__` waits until the count is zero (C5), parked on a
-//! `Park` trap whose waker the lane holds (`lane::register_scope_waiter`); the last child to
-//! finish wakes it. Child failures are collected and raised at exit as a strict exception group,
-//! the body's exception first (C4, ADR-009). Spawning into a closed scope raises (C7).
+//! A scope is a node of porto-core's scope tree (`ScopeNode`), made when its block is entered.
+//! Its children are spawned into the node, which counts them (`live_children`) and records
+//! their failures, each of which cancels the scope with `ChildFailed` (C4, through
+//! `PyTask::take_failure`). `__aexit__` waits until no child is left (C5) on a `ScopeExit`
+//! trap, which files the owner's waker as the node's `exit_waiter`; the last child to end wakes
+//! it. The failures are raised at exit as a strict exception group, the body's exception first
+//! (ADR-009). Spawning into a closed scope raises (C7).
 //!
-//! Not in M0: cancellation (a failing child does not cancel its siblings or the body; C1-C3,
-//! C6), deadlines and timeouts (C9), shields (C8), `start()` (§3), `Task.cancel()` and awaiting a
-//! task (§4), names, and spawning from other lanes or threads (C10).
+//! Not yet: delivering the cancellation (porto-szb.36). A failing child cancels the scope, but
+//! its siblings and the body only stop once checkpoints raise `Cancelled`; until then they run
+//! to completion. Nor are deadlines and timeouts (C9), shields (C8), `start()` (§3),
+//! `Task.cancel()` and awaiting a task (§4), names, and spawning from other lanes or threads
+//! (C10). The node is a root for now, owned by no recorded task: linking it under the owner's
+//! innermost scope needs the running task's cancel stack, which cancel delivery makes
+//! reachable from Python calls (porto-szb.36).
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
+use porto_core::scope::{CancelReason, ScopeNode};
 use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -20,10 +29,10 @@ use pyo3::{PyTraverseError, PyVisit};
 
 use super::run::coroutine_from;
 use crate::driver::lane;
-use crate::driver::pytask::{self, Spawned, TaskOutcome};
+use crate::driver::pytask::{self, PyScopeRef, Spawned, TaskOutcome};
 use crate::driver::ready::Ready;
-use crate::driver::step::{checkpoint_if_needed, current_waker};
-use crate::driver::trap::Trap;
+use crate::driver::step::checkpoint_if_needed;
+use crate::driver::trap::{Trap, TrapKind};
 use crate::errors::{InvalidStateError, NoRuntimeError};
 
 /// Adds the classes and functions to `module`.
@@ -37,36 +46,21 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 fn scope() -> Scope {
     Scope {
-        shared: Arc::new(ScopeShared {
-            state: Mutex::new(ScopeState {
-                phase: Phase::New,
-                live: 0,
-                errors: Vec::new(),
-            }),
-        }),
+        node: OnceLock::new(),
+        closed: AtomicBool::new(false),
     }
 }
 
 /// A nursery: every task spawned into it finishes before its `async with` block exits.
 #[pyclass(frozen, module = "porto._core", name = "Scope")]
 pub struct Scope {
-    shared: Arc<ScopeShared>,
+    /// The scope's node in the tree, set when the block is entered.
+    node: OnceLock<PyScopeRef>,
+    /// Whether its `async with` block exited.
+    closed: AtomicBool,
 }
 
-/// The part of a scope its children reach.
-pub(crate) struct ScopeShared {
-    /// Only held to read or update the counters, never while calling into Python.
-    state: Mutex<ScopeState>,
-}
-
-struct ScopeState {
-    phase: Phase,
-    /// Children spawned and not finished.
-    live: usize,
-    /// The exceptions children raised, in the order they finished.
-    errors: Vec<Py<PyBaseException>>,
-}
-
+/// Where a scope is in its life.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     /// Created, not entered yet.
@@ -75,34 +69,6 @@ enum Phase {
     Open,
     /// Its `async with` block exited.
     Closed,
-}
-
-impl ScopeShared {
-    /// The key the lane files the scope's waiter under: the scope's address, which cannot be
-    /// reused while a waiter is filed (the waiting task keeps the scope alive).
-    fn key(self: &Arc<Self>) -> usize {
-        Arc::as_ptr(self).addr()
-    }
-
-    fn lock(&self) -> MutexGuard<'_, ScopeState> {
-        // Nothing panics under the lock but an allocation failure; the state stays consistent.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// A child finished, raising `error` if it failed. The last one wakes the scope's exit.
-    fn child_finished(self: &Arc<Self>, error: Option<Py<PyBaseException>>) {
-        let last = {
-            let mut state = self.lock();
-            state.live -= 1;
-            if let Some(error) = error {
-                state.errors.push(error);
-            }
-            state.live == 0
-        };
-        if last {
-            lane::wake_scope_waiter(self.key());
-        }
-    }
 }
 
 /// `BaseExceptionGroup`, built in since 3.11.
@@ -123,34 +89,33 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         };
-        match self.shared.lock().phase {
-            Phase::Open => {}
-            Phase::New => {
-                return Err(PyRuntimeError::new_err(
-                    "porto: the scope is not entered yet; spawn inside its block: \
-                     `async with porto.scope() as s: s.spawn(...)`",
-                ));
-            }
-            Phase::Closed => {
+        let node = match (self.phase(), self.node.get()) {
+            (Phase::Open, Some(node)) => node.clone(),
+            (Phase::Closed, _) => {
                 return Err(PyRuntimeError::new_err(
                     "porto: scope is closed: its `async with` block has exited, so it cannot \
                      spawn more tasks; spawn from inside the block, or open a new scope",
                 ));
             }
-        }
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "porto: the scope is not entered yet; spawn inside its block: \
+                     `async with porto.scope() as s: s.spawn(...)`",
+                ));
+            }
+        };
         let coro = coroutine_from(&coro_or_fn, &args, "Scope.spawn")?;
         let task = Py::new(
             py,
             Task {
-                scope: self.shared.clone(),
                 outcome: Mutex::new(None),
             },
         )?;
-        self.shared.lock().live += 1;
-        if let Err(error) = pytask::spawn(&handle, coro, Spawned::Child(task.clone_ref(py))) {
-            self.shared.lock().live -= 1;
-            return Err(error);
-        }
+        let spawned = Spawned::Child {
+            task: task.clone_ref(py),
+            scope: node,
+        };
+        pytask::spawn(&handle, coro, spawned)?;
         Ok(task)
     }
 
@@ -161,15 +126,12 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         }
-        let mut state = slf.get().shared.lock();
-        if state.phase != Phase::New {
+        if slf.get().node.set(ScopeNode::new_root(0)).is_err() {
             return Err(PyRuntimeError::new_err(
                 "porto: a scope can be entered only once; open a new one with \
                  `async with porto.scope() as s:` for each block",
             ));
         }
-        state.phase = Phase::Open;
-        drop(state);
         // T2: entering completes synchronously.
         checkpoint_if_needed(slf.py(), slf.clone().into_any().unbind())
     }
@@ -190,7 +152,7 @@ impl Scope {
             drop(errors);
             return Ok(Bound::new(py, Ready::new(py.None()))?.into_any());
         }
-        if slf.get().shared.lock().live == 0 {
+        if slf.get().live_children() == 0 {
             slf.get().finish(exc)?;
             // T2: no child to wait for, so the exit completes synchronously.
             return Ok(checkpoint_if_needed(py, py.None())?.into_bound(py));
@@ -200,20 +162,14 @@ impl Scope {
             .call1((slf, exc))
     }
 
-    /// While children run: files the running task as the scope's waiter and returns a trap to
-    /// await, which resumes it once the last child finished. `None` once none runs.
-    fn _wait_trap(&self) -> PyResult<Option<Trap>> {
-        if self.shared.lock().live == 0 {
-            return Ok(None);
+    /// While children run: a `ScopeExit` trap to await, which resumes the awaiting task once
+    /// the last child ended. `None` once none runs.
+    fn _wait_trap(&self) -> Option<Trap> {
+        if self.live_children() == 0 {
+            return None;
         }
-        let Some(waker) = current_waker() else {
-            return Err(NoRuntimeError::new_err(
-                "porto: a scope's exit must be awaited by a porto task; use \
-                 `async with porto.scope()` inside porto.run(main)",
-            ));
-        };
-        lane::register_scope_waiter(self.shared.key(), waker);
-        Ok(Some(Trap::park()))
+        let scope = self.node.get()?.clone();
+        Some(Trap::new(TrapKind::ScopeExit { scope }))
     }
 
     /// Closes the scope; raises the children's failures, after `exc` (the body's exception, or
@@ -224,22 +180,61 @@ impl Scope {
     }
 
     fn __repr__(&self) -> String {
-        let state = self.shared.lock();
-        let phase = match state.phase {
+        let phase = match self.phase() {
             Phase::New => "new",
             Phase::Open => "open",
             Phase::Closed => "closed",
         };
-        format!("<porto.Scope {phase}, {} live tasks>", state.live)
+        let Some(node) = self.node.get() else {
+            return format!("<porto.Scope {phase}>");
+        };
+        let cancelled = match node.cancel_called() {
+            None => "",
+            Some(CancelReason::Explicit) => ", cancelled",
+            Some(CancelReason::Deadline) => ", cancelled: deadline",
+            Some(CancelReason::Parent) => ", cancelled: parent",
+            Some(CancelReason::ChildFailed) => ", cancelled: a child failed",
+            Some(CancelReason::Shutdown) => ", cancelled: shutdown",
+        };
+        let state = node.lock_state();
+        let exit = if state.exit_waiter.is_some() {
+            ", exit waiting"
+        } else {
+            ""
+        };
+        format!(
+            "<porto.Scope {phase}{cancelled}, {} live tasks{exit}>",
+            state.live_children
+        )
     }
 }
 
 impl Scope {
+    fn phase(&self) -> Phase {
+        if self.closed.load(Ordering::Acquire) {
+            Phase::Closed
+        } else if self.node.get().is_some() {
+            Phase::Open
+        } else {
+            Phase::New
+        }
+    }
+
+    /// Children spawned and not ended.
+    fn live_children(&self) -> u32 {
+        self.node
+            .get()
+            .map_or(0, |node| node.lock_state().live_children)
+    }
+
     /// Closes the scope and returns the children's failures.
     fn close(&self) -> Vec<Py<PyBaseException>> {
-        let mut state = self.shared.lock();
-        state.phase = Phase::Closed;
-        std::mem::take(&mut state.errors)
+        self.closed.store(true, Ordering::Release);
+        let Some(node) = self.node.get() else {
+            return Vec::new();
+        };
+        // Taken out under the lock, dropped by the caller after it.
+        std::mem::take(&mut node.lock_state().errors)
     }
 
     fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -268,7 +263,6 @@ impl Scope {
 /// the scope's `async with` block exited.
 #[pyclass(frozen, module = "porto._core", name = "Task")]
 pub struct Task {
-    scope: Arc<ScopeShared>,
     /// `None` until the task finishes. Only held to store, read or take the outcome.
     outcome: Mutex<Option<TaskOutcome>>,
 }
@@ -278,14 +272,10 @@ impl Task {
         self.outcome.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stores the outcome of the finished task and tells its scope.
-    pub(crate) fn finish(&self, py: Python<'_>, outcome: TaskOutcome) {
-        let error = match &outcome {
-            TaskOutcome::Ok(_) | TaskOutcome::Cancelled => None,
-            TaskOutcome::Err(exception) => Some(exception.clone_ref(py)),
-        };
-        *self.lock() = Some(outcome);
-        self.scope.child_finished(error);
+    /// Stores the outcome of the finished task (its scope hears of it from porto-core).
+    pub(crate) fn finish(&self, outcome: TaskOutcome) {
+        let previous = self.lock().replace(outcome);
+        drop(previous);
     }
 }
 
