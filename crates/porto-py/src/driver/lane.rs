@@ -106,8 +106,14 @@ pub(crate) fn keep_linked_wait(key: usize, waker: &Waker) {
 }
 
 /// Stops keeping the waker of the task keyed `key`: its wait ended.
+///
+/// Safe from any thread: a task cancelled off its lane (a wake after shutdown) finds nothing
+/// to forget there, also while that thread's locals are being destroyed.
 pub(crate) fn forget_linked_wait(key: usize) {
-    let kept = LANE.with_borrow_mut(|lane| lane.linked_waits.remove(&key));
+    let kept = LANE
+        .try_with(|lane| lane.borrow_mut().linked_waits.remove(&key))
+        .ok()
+        .flatten();
     // Dropped after the borrow: the last reference to a task frees it, which runs Python code.
     drop(kept);
 }
