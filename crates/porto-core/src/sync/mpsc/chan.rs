@@ -26,6 +26,10 @@
 //!
 //! Closing never relies on hints: the last sender (or receiver) to close always locks the
 //! other side's list and wakes every waiter, and waiters check the counts under that lock.
+//! Closing one handle also wakes every waiter on its own side's list: a waiter parked through
+//! that handle sees the handle's closed flag (also read under the lock) and gives up, and the
+//! others retry. Waking them all rather than the closed handle's own waiters keeps a wake the
+//! closed handle's waiter took, but will not act on, from being lost.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -260,21 +264,70 @@ impl<T> Chan<T> {
         true
     }
 
-    pub(super) fn open_sender(&self) {
-        self.senders.fetch_add(1, Ordering::Relaxed);
+    /// A sender's slow path for a wait with a caller-owned node (`Sender::poll_ready`), under
+    /// the `send_waiters` lock: `true` if there is room or every receiver is gone, so the
+    /// waiter retries instead of queueing. The same hint protocol as `push_or_queue`, with a
+    /// look at the buffer's length instead of a push: a pop that the look misses reads the
+    /// raised hint and wakes the waiter.
+    pub(super) fn writable_or_queue(&self, waiters: &Locked<'_, Retry>) -> bool {
+        let Some(capacity) = self.capacity() else {
+            return true;
+        };
+        self.send_hint.store(waiters.len() + 1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let ready = self.buffer.len() < capacity || self.receivers_closed();
+        if ready {
+            self.send_hint.store(waiters.len(), Ordering::Relaxed);
+        }
+        ready
     }
 
-    pub(super) fn open_receiver(&self) {
-        self.receivers.fetch_add(1, Ordering::Relaxed);
+    /// A receiver's slow path for a wait with a caller-owned node (`Receiver::poll_ready`),
+    /// under the `recv_waiters` lock: `true` if a value is buffered or every sender is gone.
+    /// See `writable_or_queue`.
+    pub(super) fn readable_or_queue(&self, waiters: &Locked<'_, Retry>) -> bool {
+        self.recv_hint.store(waiters.len() + 1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let ready = self.buffer.len() != 0 || self.senders_closed();
+        if ready {
+            self.recv_hint.store(waiters.len(), Ordering::Relaxed);
+        }
+        ready
+    }
+
+    /// Counts one more open sender, unless the last one already closed: a clone made while
+    /// the last sender closes concurrently must not reopen a channel whose receivers saw its
+    /// end. Returns whether the sender was counted.
+    pub(super) fn open_sender(&self) -> bool {
+        open_if_any(&self.senders)
+    }
+
+    /// As `open_sender`, for receivers.
+    pub(super) fn open_receiver(&self) -> bool {
+        open_if_any(&self.receivers)
+    }
+
+    /// Wakes every sender waiting for room, so one queued on a handle that was just closed
+    /// sees the close. The others retry and queue again. Waiters read the handle's closed
+    /// flag under this lock, so one that locks after this sees the flag set.
+    pub(super) fn wake_all_senders(&self) {
+        let mut waiters = self.send_waiters.lock();
+        waiters.grant_all();
+        self.send_hint.store(0, Ordering::Relaxed);
+    }
+
+    /// As `wake_all_senders`, for receivers waiting for a value.
+    pub(super) fn wake_all_receivers(&self) {
+        let mut waiters = self.recv_waiters.lock();
+        waiters.grant_all();
+        self.recv_hint.store(0, Ordering::Relaxed);
     }
 
     /// Closes one sender handle. The last one ends the channel: every waiting receiver wakes,
     /// drains what is left and then sees the end.
     pub(super) fn close_sender(&self) {
         if self.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut waiters = self.recv_waiters.lock();
-            waiters.grant_all();
-            self.recv_hint.store(0, Ordering::Relaxed);
+            self.wake_all_receivers();
         }
     }
 
@@ -282,11 +335,7 @@ impl<T> Chan<T> {
     /// drops the buffered values nobody can receive any more.
     pub(super) fn close_receiver(&self) {
         if self.receivers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            {
-                let mut waiters = self.send_waiters.lock();
-                waiters.grant_all();
-                self.send_hint.store(0, Ordering::Relaxed);
-            }
+            self.wake_all_senders();
             // Dropped outside any lock: a value's drop may run arbitrary code. A send that
             // races with the close may still land a value; it drains it
             // (`drain_if_receivers_closed`, whose fence pairs with this one).
@@ -294,6 +343,17 @@ impl<T> Chan<T> {
             self.drain();
         }
     }
+}
+
+fn open_if_any(count: &AtomicUsize) -> bool {
+    let mut open = count.load(Ordering::Relaxed);
+    while open != 0 {
+        match count.compare_exchange_weak(open, open + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => open = actual,
+        }
+    }
+    false
 }
 
 impl<T> fmt::Debug for Chan<T> {

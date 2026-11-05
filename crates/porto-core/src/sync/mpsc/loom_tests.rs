@@ -9,11 +9,19 @@
 //! the unbounded search does not finish. Bounded search is loom's documented practice; most
 //! concurrency bugs need two or three preemptions.
 
+use std::future::poll_fn;
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::Poll;
+
 use loom::future::block_on;
 use loom::model::Builder;
 use loom::thread;
 
-use super::{Receiver, RecvError, SendError, channel};
+use super::super::WaitNode;
+use super::{
+    Receiver, RecvError, SendError, Sender, TryRecvError, TrySendError, channel, unbounded_channel,
+};
 
 /// Explores `f` under the bound described in the module docs.
 fn model(f: impl Fn() + Sync + Send + 'static) {
@@ -149,5 +157,214 @@ fn mpsc_send_recv_wakeup_two_receivers() {
             ),
             "one receiver gets the value, the other the end: {mine:?}, {theirs:?}"
         );
+    });
+}
+
+/// Receives the way the Python binding does: with a node that no `recv` future owns, waited on
+/// with `poll_ready`, retrying `try_recv` after each wake.
+fn recv_with_node(rx: &Receiver<u32>) -> Result<u32, RecvError> {
+    let node = pin!(WaitNode::new(0));
+    let received = block_on(poll_fn(|cx| {
+        // SAFETY: the node lives in this frame, is only used with this channel, and is
+        // cancelled below before the frame ends.
+        if node.is_pending() && unsafe { rx.poll_ready(node.as_ref(), cx) }.is_pending() {
+            return Poll::Pending;
+        }
+        loop {
+            match rx.try_recv() {
+                Ok(value) => return Poll::Ready(Ok(value)),
+                Err(TryRecvError::Closed) => return Poll::Ready(Err(RecvError)),
+                Err(TryRecvError::Empty) => {}
+            }
+            // SAFETY: as above.
+            if unsafe { rx.poll_ready(node.as_ref(), cx) }.is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }));
+    // SAFETY: as above.
+    unsafe { rx.cancel_ready(node.as_ref()) };
+    received
+}
+
+/// Sends the way the Python binding does; see `recv_with_node`.
+fn send_with_node(tx: &Sender<u32>, value: u32) -> Result<(), SendError<u32>> {
+    let node = pin!(WaitNode::new(0));
+    let mut value = Some(value);
+    let sent = block_on(poll_fn(|cx| {
+        // SAFETY: as in `recv_with_node`.
+        if node.is_pending() && unsafe { tx.poll_ready(node.as_ref(), cx) }.is_pending() {
+            return Poll::Pending;
+        }
+        loop {
+            match tx.try_send(value.take().expect("held until sent")) {
+                Ok(()) => return Poll::Ready(Ok(())),
+                Err(TrySendError::Closed(back)) => return Poll::Ready(Err(SendError(back))),
+                Err(TrySendError::Full(back)) => value = Some(back),
+            }
+            // SAFETY: as above.
+            if unsafe { tx.poll_ready(node.as_ref(), cx) }.is_pending() {
+                return Poll::Pending;
+            }
+        }
+    }));
+    // SAFETY: as above.
+    unsafe { tx.cancel_ready(node.as_ref()) };
+    sent
+}
+
+/// External-node waits: a receiver waiting with `poll_ready` sees every send (its look at the
+/// buffer and the sender's hint check cannot both miss), then the end.
+#[test]
+fn mpsc_ready_wait_receiver_sees_every_send() {
+    model(|| {
+        let (tx, rx) = channel(1);
+        let sender = thread::spawn(move || {
+            block_on(tx.send(1)).unwrap();
+            block_on(tx.send(2)).unwrap();
+        });
+        assert_eq!(recv_with_node(&rx), Ok(1));
+        assert_eq!(recv_with_node(&rx), Ok(2));
+        sender.join().unwrap();
+        assert_eq!(recv_with_node(&rx), Err(RecvError));
+    });
+}
+
+/// External-node waits: a sender waiting for room with `poll_ready` sees every receive.
+#[test]
+fn mpsc_ready_wait_sender_sees_every_receive() {
+    model(|| {
+        let (tx, rx) = channel(1);
+        let sender = thread::spawn(move || {
+            send_with_node(&tx, 1).unwrap();
+            send_with_node(&tx, 2).unwrap();
+        });
+        assert_eq!(block_on(rx.recv()), Ok(1));
+        assert_eq!(block_on(rx.recv()), Ok(2));
+        sender.join().unwrap();
+    });
+}
+
+/// External-node waits: the last receiver closes while a sender waits for room; the send
+/// settles and never hangs.
+#[test]
+fn mpsc_ready_wait_sender_vs_receiver_close() {
+    model(|| {
+        let (tx, rx) = channel(1);
+        tx.try_send(1).unwrap();
+        let sender = thread::spawn(move || send_with_node(&tx, 2));
+        drop(rx);
+        let sent = sender.join().unwrap();
+        assert!(matches!(sent, Ok(()) | Err(SendError(2))), "{sent:?}");
+    });
+}
+
+/// Handle close vs a parked waiter: another thread closes the receiving handle a node waiter
+/// is parked on (Python's `rx.close()` from another task) while the sender stays open and
+/// idle. The waiter wakes and sees the end.
+#[test]
+fn mpsc_handle_close_wakes_parked_node_receiver() {
+    model(|| {
+        let (tx, rx) = channel::<u32>(1);
+        let rx = Arc::new(rx);
+        let closer = {
+            let rx = rx.clone();
+            thread::spawn(move || rx.close())
+        };
+        assert_eq!(recv_with_node(&rx), Err(RecvError));
+        closer.join().unwrap();
+        drop(tx);
+    });
+}
+
+/// Handle close vs a parked waiter: as above, for a sender waiting for room on a full channel.
+#[test]
+fn mpsc_handle_close_wakes_parked_node_sender() {
+    model(|| {
+        let (tx, rx) = channel::<u32>(1);
+        tx.try_send(1).unwrap();
+        let tx = Arc::new(tx);
+        let closer = {
+            let tx = tx.clone();
+            thread::spawn(move || tx.close())
+        };
+        assert_eq!(send_with_node(&tx, 2), Err(SendError(2)));
+        closer.join().unwrap();
+        drop(rx);
+    });
+}
+
+/// Handle close vs a parked waiter: as above, for a `recv` future.
+#[test]
+fn mpsc_handle_close_wakes_parked_recv_future() {
+    model(|| {
+        let (tx, rx) = channel::<u32>(1);
+        let rx = Arc::new(rx);
+        let closer = {
+            let rx = rx.clone();
+            thread::spawn(move || rx.close())
+        };
+        assert_eq!(block_on(rx.recv()), Err(RecvError));
+        closer.join().unwrap();
+        drop(tx);
+    });
+}
+
+/// Handle close vs a wake it holds: two receivers wait, a send wakes one of them and its
+/// handle closes before it retries. The value still reaches the other receiver while the
+/// sender is open: the close does not swallow the wake.
+#[test]
+fn mpsc_handle_close_passes_on_the_wake_it_holds() {
+    model_bounded(2, || {
+        let (tx, rx) = unbounded_channel::<u32>();
+        let rx = Arc::new(rx);
+        let rx2 = (*rx).clone();
+        let closed = {
+            let rx = rx.clone();
+            thread::spawn(move || recv_with_node(&rx))
+        };
+        let other = thread::spawn(move || recv_with_node(&rx2));
+        tx.try_send(7).unwrap();
+        rx.close();
+        if closed.join().unwrap() == Ok(7) {
+            drop(tx);
+            assert_eq!(other.join().unwrap(), Err(RecvError));
+        } else {
+            assert_eq!(other.join().unwrap(), Ok(7));
+            drop(tx);
+        }
+    });
+}
+
+/// As above, for senders: two senders wait for room, a receive wakes one of them and its
+/// handle closes before it retries. The other sender still gets the room.
+///
+/// Three threads spinning on a bounded queue: at a bound of 2 the search exceeds loom's
+/// path budget, so this model runs at 1.
+#[test]
+fn mpsc_handle_close_passes_on_the_room_it_holds() {
+    model_bounded(1, || {
+        let (tx, rx) = channel::<u32>(1);
+        tx.try_send(0).unwrap();
+        let tx = Arc::new(tx);
+        let tx2 = (*tx).clone();
+        let closed = {
+            let tx = tx.clone();
+            thread::spawn(move || send_with_node(&tx, 1))
+        };
+        let other = thread::spawn(move || send_with_node(&tx2, 2));
+        assert_eq!(rx.try_recv(), Ok(0));
+        tx.close();
+        match closed.join().unwrap() {
+            // Its send landed before the close: the other one waits for the next receive.
+            Ok(()) => {
+                assert_eq!(rx.try_recv(), Ok(1));
+                assert_eq!(other.join().unwrap(), Ok(()));
+            }
+            // It gave up: the room it was woken for goes to the other send.
+            Err(SendError(1)) => assert_eq!(other.join().unwrap(), Ok(())),
+            Err(SendError(other)) => panic!("the send handed back {other}, not its value"),
+        }
+        assert_eq!(rx.try_recv(), Ok(2));
     });
 }

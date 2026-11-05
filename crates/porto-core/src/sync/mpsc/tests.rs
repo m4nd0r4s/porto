@@ -132,7 +132,7 @@ fn receivers_drain_before_seeing_the_end() {
 
 #[test]
 fn the_channel_ends_only_when_every_sender_is_closed() {
-    let (mut tx, rx) = channel(4);
+    let (tx, rx) = channel(4);
     let tx2 = tx.clone();
     tx.close();
     tx.close(); // idempotent
@@ -152,7 +152,7 @@ fn the_channel_ends_only_when_every_sender_is_closed() {
 
 #[test]
 fn sends_fail_with_the_value_once_every_receiver_is_gone() {
-    let (tx, mut rx) = channel(4);
+    let (tx, rx) = channel(4);
     let rx2 = rx.clone();
     rx.close();
     assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
@@ -501,4 +501,62 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<Receiver<String>>();
     assert_send::<super::SendFuture<'static, String>>();
     assert_send::<super::RecvFuture<'static, String>>();
+}
+
+#[test]
+fn a_ready_wait_with_an_external_node_is_woken_and_passes_an_unobserved_wake_on() {
+    use crate::sync::WaitNode;
+
+    let (tx, rx) = channel::<u32>(1);
+    let (first_wakes, first_waker) = CountingWaker::new();
+    let (second_wakes, second_waker) = CountingWaker::new();
+    let first = pin!(WaitNode::new(0));
+    let second = pin!(WaitNode::new(0));
+    let mut first_cx = Context::from_waker(&first_waker);
+    let mut second_cx = Context::from_waker(&second_waker);
+    // SAFETY: both nodes outlive their waits on this channel and end idle (cancelled below).
+    unsafe {
+        assert!(rx.poll_ready(first.as_ref(), &mut first_cx).is_pending());
+        assert!(rx.poll_ready(second.as_ref(), &mut second_cx).is_pending());
+        tx.try_send(1).unwrap();
+        assert_eq!(first_wakes.wakes(), 1, "one send wakes the oldest waiter");
+        assert_eq!(second_wakes.wakes(), 0);
+        // The first waiter gives up before it saw its wake: the second one gets it.
+        rx.cancel_ready(first.as_ref());
+        assert_eq!(second_wakes.wakes(), 1);
+        assert!(rx.poll_ready(second.as_ref(), &mut second_cx).is_ready());
+        assert_eq!(rx.try_recv(), Ok(1));
+        // A value is buffered: no wait.
+        tx.try_send(2).unwrap();
+        assert!(rx.poll_ready(first.as_ref(), &mut first_cx).is_ready());
+        // Full: a sender waits for room, and a receive wakes it.
+        let (sender_wakes, sender_waker) = CountingWaker::new();
+        let mut sender_cx = Context::from_waker(&sender_waker);
+        assert!(tx.poll_ready(first.as_ref(), &mut sender_cx).is_pending());
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(sender_wakes.wakes(), 1);
+        assert!(tx.poll_ready(first.as_ref(), &mut sender_cx).is_ready());
+        // A closed handle never waits.
+        rx.close();
+        assert!(rx.poll_ready(second.as_ref(), &mut second_cx).is_ready());
+        rx.cancel_ready(second.as_ref());
+    }
+}
+
+#[test]
+fn closing_through_a_shared_reference_is_per_handle_and_idempotent() {
+    let (tx, rx) = channel::<u32>(2);
+    let tx2 = tx.clone();
+    tx.close();
+    tx.close();
+    assert!(tx.is_handle_closed());
+    assert!(!tx2.is_handle_closed());
+    tx2.try_send(3).unwrap();
+    drop(tx2);
+    assert_eq!(rx.try_recv(), Ok(3));
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
+    assert!(
+        !rx.is_handle_closed(),
+        "the channel ended, the handle is open"
+    );
 }

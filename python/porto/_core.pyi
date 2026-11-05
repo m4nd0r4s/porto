@@ -1,7 +1,8 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock`` and ``__version__``
+``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock``, ``Sender``,
+``Receiver`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -217,6 +218,96 @@ class Lock:
         traceback: TracebackType | None,
         /,
     ) -> Awaitable[None]: ...
+
+# Channels (16-sync-primitives-and-channels.md §2; constructed by porto.channel and
+# porto.unbounded_channel)
+
+_T_contra = TypeVar("_T_contra", contravariant=True)
+
+@final
+class Sender(Generic[_T_contra]):
+    """The sending end of a channel. Clone it for more producers.
+
+    Closing it (``close()``, ``async with``, or dropping the last reference) is per handle:
+    once every sender is closed, receivers drain what is buffered and then see the end.
+    """
+
+    def send(self, value: _T_contra, /) -> Awaitable[None]:
+        """Sends ``value``, waiting for room while the channel is full. Raises
+        ``porto.BrokenResourceError`` if every receiver is gone, ``porto.ClosedResourceError``
+        if this sender was closed. Nothing happens until it is awaited."""
+
+    def try_send(self, value: _T_contra, /) -> None:
+        """Sends ``value`` if there is room now; raises ``porto.WouldBlock`` if the channel is
+        full, and the errors of ``send``."""
+
+    def blocking_send(self, value: _T_contra, /) -> None:
+        """``send`` from a thread that does not run porto, blocking that thread while the
+        channel is full. Raises ``RuntimeError`` on a porto lane thread."""
+
+    def clone(self) -> Sender[_T_contra]:
+        """Another sender on the same channel. A clone of a closed sender is closed."""
+
+    def close(self) -> None:
+        """Closes this sender; other clones are unaffected. Sends already waiting
+        through it raise ``porto.ClosedResourceError``. Closing twice does nothing."""
+
+    def is_closed(self) -> bool:
+        """Whether sends through this sender fail: it was closed, or every receiver is gone."""
+
+    @property
+    def capacity(self) -> int | None:
+        """The channel's capacity, ``None`` for an unbounded channel."""
+
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> None:
+        """Closes the sender."""
+
+@final
+class Receiver(Generic[_T_co]):
+    """The receiving end of a channel. Clone it for more consumers: each value goes to one.
+
+    Closing it (``close()``, or dropping the last reference) is per handle: once every
+    receiver is closed, sends raise ``porto.BrokenResourceError`` and the buffered values are
+    dropped.
+    """
+
+    def recv(self) -> Awaitable[_T_co]:
+        """The next value, waiting while the channel is empty. Raises ``porto.EndOfChannel``
+        once every sender is closed and the buffer is drained, ``porto.ClosedResourceError``
+        if this receiver was closed. Nothing happens until it is awaited."""
+
+    def recv_many(self, max: int, /) -> Awaitable[list[_T_co]]:
+        """Waits for at least one value, then returns up to ``max`` buffered values (``max``
+        >= 1) without waiting again. Raises as ``recv``."""
+
+    def try_recv(self) -> _T_co:
+        """The next value if one is buffered now; raises ``porto.WouldBlock`` if the channel is
+        empty, and the errors of ``recv``."""
+
+    def blocking_recv(self) -> _T_co:
+        """``recv`` from a thread that does not run porto, blocking that thread while the
+        channel is empty. Raises ``RuntimeError`` on a porto lane thread."""
+
+    def clone(self) -> Receiver[_T_co]:
+        """Another receiver on the same channel. A clone of a closed receiver is closed."""
+
+    def close(self) -> None:
+        """Closes this receiver; other clones are unaffected. Receives already waiting
+        through it raise ``porto.ClosedResourceError``. Closing twice does nothing."""
+
+    def __aiter__(self) -> Self: ...
+    def __anext__(self) -> Awaitable[_T_co]:
+        """``async for value in rx``: like ``recv``; the end of the channel ends the loop."""
+
+def _channel(capacity: int, /) -> tuple[Sender[Any], Receiver[Any]]: ...
+def _unbounded_channel() -> tuple[Sender[Any], Receiver[Any]]: ...
 
 @final
 class _Trap:

@@ -39,12 +39,13 @@ tx, rx = porto.watch[T](initial)                 # latest-value; rx.changed(), r
 `await rx.recv()` (raises `porto.EndOfChannel` when closed and drained), `rx.try_recv()`, `async for v in rx:`, `rx.clone()`, `rx.close()`, `rx.blocking_recv()`, `await rx.recv_many(max)` → `list[T]` (batching, important for throughput).
 
 ### 2.3 Closure semantics
-The channel closes when all senders are closed or dropped (receivers see the end after draining), or when all receivers are dropped (sends raise `porto.BrokenResourceError`). Dropping a handle is equivalent to closing it, and works on refcount release.
+The channel closes when all senders are closed or dropped (receivers see the end after draining), or when all receivers are dropped (sends raise `porto.BrokenResourceError`). Dropping a handle is equivalent to closing it, and works on refcount release. Using a handle that was itself closed raises `porto.ClosedResourceError` (the program closed it) rather than `EndOfChannel` or `BrokenResourceError` (the other side went away). Full and empty `try_send`/`try_recv` raise `porto.WouldBlock`. `channel()` without a capacity is a `TypeError` that names `unbounded_channel()`.
 
 ### 2.4 Implementation notes
 - Bounded MPMC: a Vyukov array-based queue (the `crossbeam::ArrayQueue` design, vendored so that loom models its atomics) plus two waiter lists (senders and receivers), each a wait queue under its own small mutex. Fast path: lock-free push/pop, then a `SeqCst` fence and a load of the other side's waiter hint; the lock is taken only when someone waits. Wake exactly one counterpart; a woken waiter retries (a waiter not yet queued may take the value or room first), and a woken waiter cancelled before retrying passes the wake on.
 - Unbounded: a deque under a mutex; senders never wait, receivers wait as for the bounded channel.
-- Closing a handle (`close()`, or dropping it) is per handle. A send that races with the last receiver's close may succeed; its value is dropped with the channel.
+- Python waits: `await tx.send(v)` / `await rx.recv()` do nothing until awaited, then try the fast path; if they must wait, the task parks its embedded `wait_node` on the waiter list (a `Notified` trap whose target is the handle, no allocation besides the trap) and retries when woken. The waiter's last look under the lock checks the buffer's length instead of pushing or popping, with the same hint-and-fence handshake, so the value never has to travel through the wake.
+- Closing a handle (`close()`, or dropping it) is per handle. A task or thread already waiting through that handle wakes and raises `porto.ClosedResourceError`; waiters on other handles keep waiting. A send that races with the last receiver's close may succeed; its value is dropped with the channel.
 - Elements are `PyObj`. Moving an object between lanes requires no copy; the free-threaded refcount handles ownership. On the GIL build, all Python tasks are on lane 0 anyway.
 - Rust-side channels (`porto::sync::mpsc`) are generic over `T: Send`. The Python channel is `T = PyObj`.
 
