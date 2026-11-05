@@ -8,12 +8,11 @@ use porto_core::sync::{self as core_sync, WaitNode};
 use pyo3::prelude::*;
 
 use super::blocking;
+use super::wait_op::{Grant, SyncWait};
 use crate::api::time::require_lane;
-use crate::driver::step::checkpoint_if_needed;
 use crate::driver::thin::{WaitSource, Waitable};
-use crate::driver::trap::{Trap, TrapKind};
 
-struct EventSource(core_sync::Event);
+pub(super) struct EventSource(pub(super) core_sync::Event);
 
 // SAFETY: forwards to the event's node API, whose contract is `WaitSource`'s.
 unsafe impl WaitSource for EventSource {
@@ -55,16 +54,15 @@ impl Event {
     }
 
     /// An awaitable that completes once the event is set: without suspending if it is.
-    fn wait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// Nothing happens until it is awaited.
+    fn wait(&self) -> PyResult<SyncWait> {
         require_lane("Event.wait")?;
-        if self.event.0.is_set() {
-            return checkpoint_if_needed(py, py.None());
-        }
-        Ok(Py::new(py, Trap::new(TrapKind::Notified(self.event.target())))?.into_any())
+        Ok(SyncWait::new(Grant::EventSet(Arc::clone(&self.event))))
     }
 
     /// Blocks the calling thread until the event is set. Only for threads that do not run
-    /// porto: on a lane thread it raises `RuntimeError`.
+    /// porto: on a lane thread it raises `RuntimeError`. Runs detached, without signal checks:
+    /// Ctrl-C does not interrupt it.
     fn blocking_wait(&self, py: Python<'_>) -> PyResult<()> {
         blocking(py, "Event.blocking_wait", || self.event.0.blocking_wait())
     }
@@ -79,7 +77,7 @@ impl Event {
     }
 }
 
-struct NotifySource(core_sync::Notify);
+pub(super) struct NotifySource(pub(super) core_sync::Notify);
 
 // SAFETY: forwards to the notify's node API, whose contract is `WaitSource`'s.
 unsafe impl WaitSource for NotifySource {
@@ -123,19 +121,15 @@ impl Notify {
 
     /// An awaitable that completes when notified: at once if a permit is stored (consuming
     /// it), otherwise when a `notify_one` or `notify_all` comes after the `await` started.
-    fn notified(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// Nothing happens until it is awaited: an un-awaited one consumes no permit.
+    fn notified(&self) -> PyResult<SyncWait> {
         require_lane("Notify.notified")?;
-        if self.notify.0.try_notified() {
-            return checkpoint_if_needed(py, py.None()).inspect_err(|_| {
-                // Not delivered: the permit is not lost.
-                self.notify.0.notify_one();
-            });
-        }
-        Ok(Py::new(py, Trap::new(TrapKind::Notified(self.notify.target())))?.into_any())
+        Ok(SyncWait::new(Grant::Notified(Arc::clone(&self.notify))))
     }
 
     /// Blocks the calling thread until notified. Only for threads that do not run porto: on a
-    /// lane thread it raises `RuntimeError`.
+    /// lane thread it raises `RuntimeError`. Runs detached, without signal checks: Ctrl-C does
+    /// not interrupt it.
     fn blocking_notified(&self, py: Python<'_>) -> PyResult<()> {
         blocking(py, "Notify.blocking_notified", || {
             self.notify.0.blocking_notified()

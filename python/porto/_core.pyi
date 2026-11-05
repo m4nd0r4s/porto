@@ -125,15 +125,18 @@ class Event:
     def is_set(self) -> bool:
         """Whether the event is set."""
 
-    def wait(self) -> Awaitable[None]:
+    def wait(self) -> _SyncWait:
         """Completes once the event is set; without suspending if it already is.
 
-        Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``.
+        Nothing happens until it is awaited; ``await`` it inside ``porto.run``.
         """
 
     def blocking_wait(self) -> None:
         """Blocks the calling thread until the event is set. Only from threads that do not run
-        porto: raises ``RuntimeError`` on a lane thread."""
+        porto: raises ``RuntimeError`` on a lane thread.
+
+        The wait does not check for signals: Ctrl-C does not interrupt it, and the
+        ``KeyboardInterrupt`` is raised once it is over."""
 
 @final
 class Notify:
@@ -149,16 +152,20 @@ class Notify:
     def notify_all(self) -> None:
         """Wakes every task waiting now. Stores no permit."""
 
-    def notified(self) -> Awaitable[None]:
+    def notified(self) -> _SyncWait:
         """Completes when notified: at once if a permit is stored (consuming it), otherwise on
         a ``notify_one()`` or ``notify_all()`` made after the ``await`` started.
 
-        Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``.
+        Nothing happens until it is awaited: one that is never awaited consumes no permit. A
+        task closed or cancelled before it observed the wake passes it on.
         """
 
     def blocking_notified(self) -> None:
         """Blocks the calling thread until notified. Only from threads that do not run porto:
-        raises ``RuntimeError`` on a lane thread."""
+        raises ``RuntimeError`` on a lane thread.
+
+        The wait does not check for signals: Ctrl-C does not interrupt it, and the
+        ``KeyboardInterrupt`` is raised once it is over."""
 
 @final
 class _Trap:
@@ -179,6 +186,31 @@ class _Trap:
 
     def __await__(self) -> Generator[_Trap, object, object]: ...
     def __iter__(self) -> Generator[_Trap, object, object]: ...
+    def __next__(self) -> _Trap: ...
+    def send(self, value: object, /) -> _Trap: ...
+    @overload
+    def throw(
+        self, typ: BaseException, val: None = None, tb: TracebackType | None = None, /
+    ) -> NoReturn: ...
+    @overload
+    def throw(
+        self,
+        typ: type[BaseException],
+        val: object = None,
+        tb: TracebackType | None = None,
+        /,
+    ) -> NoReturn: ...
+    def close(self) -> None: ...
+
+@final
+class _SyncWait:
+    """The awaitable a sync primitive's wait returns (``Event.wait()``, ``Notify.notified()``).
+
+    Lazy: it tries the primitive when awaited, and only then. Await it once.
+    """
+
+    def __await__(self) -> Generator[_Trap, object]: ...
+    def __iter__(self) -> Generator[_Trap, object]: ...
     def __next__(self) -> _Trap: ...
     def send(self, value: object, /) -> _Trap: ...
     @overload

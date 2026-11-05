@@ -1,16 +1,30 @@
 """porto.Event and porto.Notify (16-sync-primitives-and-channels.md §1).
 
-A wait that has to wait is a ``Notified`` trap on the primitive; one that is over at once is a
-synchronous completion (a ``_Ready``). ``_interrupt(token, exc)`` throws into a waiting task
+``wait()`` and ``notified()`` are lazy ``_SyncWait`` awaitables: a wait that has to wait yields a
+``Notified`` trap on the primitive; one that is over at once completes in the step that awaits
+it. ``_interrupt(token, exc)`` throws into a waiting task
 the way cancellation will (porto-szb.36): the wait is given up first (T3).
 """
 
 import threading
+from collections.abc import Awaitable
+from typing import Any
 
 import pytest
 
 import porto
 from porto import _core
+
+
+def completes_at_once(awaitable: Awaitable[None]) -> bool:
+    """Resumes ``awaitable`` once by hand: whether it completed without suspending."""
+    steps = awaitable.__await__()
+    try:
+        steps.send(None)
+    except StopIteration:
+        return True
+    steps.close()
+    return False
 
 
 async def settle() -> None:
@@ -36,9 +50,8 @@ def test_event_wait_after_set_returns_without_suspending() -> None:
     async def main() -> None:
         event = porto.Event()
         event.set()
-        waiting = event.wait()
-        assert isinstance(waiting, _core._Ready)
-        await waiting
+        assert completes_at_once(event.wait())
+        await event.wait()
 
     porto.run(main)
 
@@ -98,11 +111,8 @@ def test_notify_one_stores_one_permit_consumed_once() -> None:
         notify = porto.Notify()
         notify.notify_one()
         notify.notify_one()  # still one permit
-        first = notify.notified()
-        assert isinstance(first, _core._Ready)
-        await first
-        second = notify.notified()
-        assert isinstance(second, _core._Trap), "the permit was consumed"
+        assert completes_at_once(notify.notified())
+        assert not completes_at_once(notify.notified()), "the permit was consumed"
 
     porto.run(main)
 
@@ -196,11 +206,7 @@ def test_a_waiter_cancelled_after_notify_one_passes_the_wake_on() -> None:
         notify.notify_one()
 
     _core._run(main())
-
-    async def has_permit() -> bool:
-        return isinstance(notify.notified(), _core._Ready)
-
-    assert porto.run(has_permit), "the notify_one wake was lost"
+    assert notify_has_permit(notify), "the notify_one wake was lost"
 
 
 def test_notify_blocking_notified_from_a_thread_and_refused_on_a_lane() -> None:
@@ -234,3 +240,55 @@ def test_notify_is_shared_across_os_threads() -> None:
 
     threading.Thread(target=consume).start()
     assert done.wait(5)
+
+
+# A grant the task has not observed yet is never lost
+
+
+def notify_has_permit(notify: porto.Notify) -> bool:
+    """Whether a stored permit lets a fresh waiter through (consuming it)."""
+    woken: list[bool] = []
+
+    async def waiter() -> None:
+        await notify.notified()
+        woken.append(True)
+
+    async def main() -> None:
+        _core._spawn(waiter())
+        await settle()
+
+    porto.run(main)
+    return bool(woken)
+
+
+def test_a_permit_is_not_lost_when_the_run_ends_after_notified() -> None:
+    # The spinner gives itself a permit and takes it back, until the run ends and closes it.
+    # Wherever it was suspended, its permit is either stored or was observed and reissued.
+    for _ in range(100):
+        notify = porto.Notify()
+
+        async def spinner(notify: porto.Notify = notify) -> None:
+            while True:
+                notify.notify_one()
+                await notify.notified()
+
+        async def main(spinner: Any = spinner) -> None:
+            _core._spawn(spinner())
+            await porto.sleep(0.002)
+
+        porto.run(main)
+        assert notify_has_permit(notify), "the spinner's permit was lost"
+
+
+def test_notified_and_wait_do_nothing_until_awaited() -> None:
+    notify = porto.Notify()
+    notify.notify_one()
+
+    async def make_and_drop() -> None:
+        not_awaited = notify.notified()
+        del not_awaited
+        never = porto.Event().wait()
+        del never
+
+    porto.run(make_and_drop)
+    assert notify_has_permit(notify), "an un-awaited notified() consumed the permit"
