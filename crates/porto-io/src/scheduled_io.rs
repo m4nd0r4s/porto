@@ -242,20 +242,31 @@ impl ScheduledIo {
             return Poll::Ready(event);
         }
         let mut waiters = self.lock_waiters();
+        // A stale ID (the slot was released, perhaps reused) must not touch the waker slots: it
+        // would replace the new owner's waker and that owner would never wake.
+        let word = self.readiness.load(Ordering::Acquire);
+        if unpack_generation(word) != id.generation() {
+            drop(waiters);
+            return Poll::Ready(ReadyEvent::closed(mask, id.generation()));
+        }
         let slot = match direction {
             Direction::Read => &mut waiters.reader,
             Direction::Write => &mut waiters.writer,
         };
-        match slot {
-            Some(waker) if waker.will_wake(cx.waker()) => {}
-            _ => *slot = Some(cx.waker().clone()),
-        }
+        // Taken out and dropped after the unlock: a waker's `Drop` may use this registration.
+        let stale = match slot {
+            Some(waker) if waker.will_wake(cx.waker()) => None,
+            _ => slot.replace(cx.waker().clone()),
+        };
         // A dispatch that raced with us updated the word before taking the lock to wake, so
         // with the waker stored, a second look cannot miss it.
-        match event_if_ready(self.readiness.load(Ordering::Acquire), id, mask) {
+        let poll = match event_if_ready(self.readiness.load(Ordering::Acquire), id, mask) {
             Some(event) => Poll::Ready(event),
             None => Poll::Pending,
-        }
+        };
+        drop(waiters);
+        drop(stale);
+        poll
     }
 
     /// A future that resolves once readiness matching `interest` is set, for any number of

@@ -18,6 +18,11 @@ const _: () = assert!(CAPACITY <= RESERVED_INDEX);
 /// The slots of every live registration. Pages are allocated on demand and never freed, so a
 /// `&ScheduledIo` stays valid as long as the slab and lookups take no lock. A released slot
 /// moves to its next generation before it is reused, so stale IDs are ignored.
+///
+/// The generation is 8 bits, so it wraps after 256 reuses of one slot. An ID kept that long
+/// after its registration was closed looks live again and sees the new owner's readiness: a
+/// use-after-close bug in the holder. Events queued by the backend are dispatched within one
+/// `turn`, far below 256 reuses, so the driver itself is not exposed.
 pub struct IoSlab {
     pages: [OnceLock<Box<[ScheduledIo]>>; PAGES],
     allocator: Mutex<Allocator>,
@@ -184,6 +189,38 @@ mod tests {
             io.ready_event(new, crate::Interest::READABLE)
                 .ready()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_poll_with_a_stale_id_keeps_the_new_owners_waker() {
+        use std::task::{Context, Poll};
+
+        use crate::scheduled_io::Direction;
+        use crate::test_util::CountingWaker;
+
+        let slab = IoSlab::new();
+        let old = slab.allocate().unwrap();
+        slab.release(old);
+        let new = slab.allocate().unwrap();
+        let io = slab.get(new).unwrap();
+
+        let (owner, owner_waker) = CountingWaker::new();
+        let pending =
+            io.poll_readiness(&mut Context::from_waker(&owner_waker), new, Direction::Read);
+        assert!(pending.is_pending());
+
+        let (_, stale_waker) = CountingWaker::new();
+        let stale = slab.slot(old).unwrap();
+        let closed =
+            stale.poll_readiness(&mut Context::from_waker(&stale_waker), old, Direction::Read);
+        assert!(matches!(closed, Poll::Ready(event) if event.ready().is_read_closed()));
+
+        assert!(slab.dispatch(new, Ready::READABLE));
+        assert_eq!(
+            owner.wakes(),
+            1,
+            "the new owner's waker survived the stale poll"
         );
     }
 
