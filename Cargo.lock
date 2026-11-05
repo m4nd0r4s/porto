@@ -38,6 +38,10 @@ name = "porto-core"
 version = "0.0.0"
 
 [[package]]
+name = "porto-io"
+version = "0.0.0"
+
+[[package]]
 name = "porto-py"
 version = "0.0.0"
 dependencies = [
