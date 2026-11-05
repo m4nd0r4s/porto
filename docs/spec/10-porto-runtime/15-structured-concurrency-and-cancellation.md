@@ -22,6 +22,7 @@ struct ScopeNode {
     state: Mutex<ScopeState>,      // children list, deadline, counters
     status: AtomicU8,              // cancel_called and shield, written under `state`, read lock-free
     cancel_epoch: AtomicU64,       // bumped on cancel; tasks compare to detect new cancels quickly
+    walk_cache: AtomicU64,         // (cancel_generation << 1 | cancelled) of the last walk from here
     deadline_timer: TimerEntry,
 }
 struct ScopeState {
