@@ -40,7 +40,9 @@ tx, rx = porto.watch[T](initial)                 # latest-value; rx.changed(), r
 The channel closes when all senders are closed or dropped (receivers see the end after draining), or when all receivers are dropped (sends raise `porto.BrokenResourceError`). Dropping a handle is equivalent to closing it, and works on refcount release.
 
 ### 2.4 Implementation notes
-- Bounded MPMC: a Vyukov array-based queue (`crossbeam::ArrayQueue`) plus two waiter lists (senders and receivers) under a small mutex. Fast path: lock-free push/pop. Wake exactly one counterpart.
+- Bounded MPMC: a Vyukov array-based queue (the `crossbeam::ArrayQueue` design, vendored so that loom models its atomics) plus two waiter lists (senders and receivers), each a wait queue under its own small mutex. Fast path: lock-free push/pop, then a `SeqCst` fence and a load of the other side's waiter hint; the lock is taken only when someone waits. Wake exactly one counterpart; a woken waiter retries (a waiter not yet queued may take the value or room first), and a woken waiter cancelled before retrying passes the wake on.
+- Unbounded: a deque under a mutex; senders never wait, receivers wait as for the bounded channel.
+- Closing a handle (`close()`, or dropping it) is per handle. A send that races with the last receiver's close may succeed; its value is dropped with the channel.
 - Elements are `PyObj`. Moving an object between lanes requires no copy; the free-threaded refcount handles ownership. On the GIL build, all Python tasks are on lane 0 anyway.
 - Rust-side channels (`porto::sync::mpsc`) are generic over `T: Send`. The Python channel is `T = PyObj`.
 

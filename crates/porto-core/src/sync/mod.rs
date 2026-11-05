@@ -19,6 +19,7 @@
 //! - [`blocking_wait`]: waits from a thread that does not run a lane, the backing of every
 //!   `blocking_*` method. On a lane thread it returns [`BlockingOnLane`] instead of stalling
 //!   the lane.
+//! - [`mpsc`]: bounded and unbounded multi-producer multi-consumer channels.
 //!
 //! The grant-versus-cancel race is model-checked with [loom](https://docs.rs/loom):
 //!
@@ -28,6 +29,7 @@
 
 mod blocking;
 mod event;
+pub mod mpsc;
 mod notify;
 mod primitives;
 mod wait_queue;
