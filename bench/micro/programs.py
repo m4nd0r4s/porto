@@ -115,7 +115,7 @@ def run_porto(main: Main, loops: int) -> float:
     return porto.run(main, loops)
 
 
-def run_asyncio(
+def runasyncio_program(
     loop: str, main: Main, loops: int, *, eager: bool = False, ready_fd: bool = False
 ) -> float:
     with asyncio.Runner(loop_factory=LOOP_FACTORIES[loop]) as runner:
@@ -141,6 +141,20 @@ def run_asyncio(
 
 def _ignore() -> None:
     """The ready pipe's reader: leaves the byte in the pipe so it stays readable."""
+
+
+def run_trio(main: Main, loops: int) -> float:
+    import trio
+
+    return trio.run(main, loops)
+
+
+def run_anyio_uvloop(main: Main, loops: int) -> float:
+    """anyio on asyncio+uvloop: the cost of anyio's task groups and cancel scopes over the same
+    loop as the ``uvloop`` baseline."""
+    import anyio
+
+    return anyio.run(main, loops, backend="asyncio", backend_options={"use_uvloop": True})
 
 
 # 1. checkpoint: one task yielding to the scheduler, per operation ----------------------------
@@ -343,22 +357,26 @@ class Benchmark:
     function: TimeFunction
     inner_loops: int = 1
     min_python: tuple[int, int] = (3, 11)
-    needs_uvloop: bool = False
+    #: The modules the program imports besides porto and asyncio (``uvloop``, ``trio``): the
+    #: suite skips it on a Python where one is missing.
+    requires: tuple[str, ...] = ()
 
     @property
     def name(self) -> str:
         return f"{self.bench}/{self.variant}"
 
 
-def _porto(main: Main) -> TimeFunction:
+def porto_program(main: Main) -> TimeFunction:
     return lambda loops: run_porto(main, loops)
 
 
-def _asyncio(loop: str, main: Main, *, eager: bool = False, ready_fd: bool = False) -> TimeFunction:
-    return lambda loops: run_asyncio(loop, main, loops, eager=eager, ready_fd=ready_fd)
+def asyncio_program(
+    loop: str, main: Main, *, eager: bool = False, ready_fd: bool = False
+) -> TimeFunction:
+    return lambda loops: runasyncio_program(loop, main, loops, eager=eager, ready_fd=ready_fd)
 
 
-def _variants(
+def variants(
     bench: str,
     porto_main: Main | None,
     asyncio_main: Main,
@@ -367,61 +385,69 @@ def _variants(
     suffix: str = "",
     baseline: bool = True,
     ready_fd: bool = True,
+    nopoll: bool = True,
 ) -> list[Benchmark]:
     """porto, then asyncio and uvloop (baselines, or informative), then asyncio-nopoll and
-    uvloop-readyfd (informative; ``ready_fd=False`` leaves the latter out)."""
+    uvloop-readyfd (informative; ``ready_fd=False`` and ``nopoll=False`` leave them out:
+    ``asyncio-nopoll`` cannot run a program whose loop waits for a wake-up from another
+    thread)."""
     role: Role = "baseline" if baseline else "informative"
     found: list[Benchmark] = []
     if porto_main is not None:
-        found.append(Benchmark(bench, "porto", "porto", _porto(porto_main), inner_loops))
+        found.append(Benchmark(bench, "porto", "porto", porto_program(porto_main), inner_loops))
     found += [
-        Benchmark(bench, f"asyncio{suffix}", role, _asyncio("asyncio", asyncio_main), inner_loops),
+        Benchmark(
+            bench, f"asyncio{suffix}", role, asyncio_program("asyncio", asyncio_main), inner_loops
+        ),
         Benchmark(
             bench,
             f"uvloop{suffix}",
             role,
-            _asyncio("uvloop", asyncio_main),
+            asyncio_program("uvloop", asyncio_main),
             inner_loops,
-            needs_uvloop=True,
-        ),
-        Benchmark(
-            bench,
-            f"asyncio-nopoll{suffix}",
-            "informative",
-            _asyncio("asyncio-nopoll", asyncio_main),
-            inner_loops,
+            requires=("uvloop",),
         ),
     ]
+    if nopoll:
+        found.append(
+            Benchmark(
+                bench,
+                f"asyncio-nopoll{suffix}",
+                "informative",
+                asyncio_program("asyncio-nopoll", asyncio_main),
+                inner_loops,
+            )
+        )
     if ready_fd:
         found.append(
             Benchmark(
                 bench,
                 f"uvloop-readyfd{suffix}",
                 "informative",
-                _asyncio("uvloop", asyncio_main, ready_fd=True),
+                asyncio_program("uvloop", asyncio_main, ready_fd=True),
                 inner_loops,
-                needs_uvloop=True,
+                requires=("uvloop",),
             )
         )
     return found
 
 
-def _eager(bench: str, asyncio_main: Main, suffix: str = "") -> list[Benchmark]:
+def eager_variants(bench: str, asyncio_main: Main, suffix: str = "") -> list[Benchmark]:
     return [
         Benchmark(
             bench,
             f"asyncio-eager{suffix}",
             "informative",
-            _asyncio("asyncio", asyncio_main, eager=True),
+            asyncio_program("asyncio", asyncio_main, eager=True),
             min_python=(3, 12),
         ),
         Benchmark(
             bench,
             f"uvloop-eager{suffix}",
             "informative",
-            _asyncio("uvloop", asyncio_main, eager=True),
+            asyncio_program("uvloop", asyncio_main, eager=True),
             min_python=(3, 12),
-            needs_uvloop=True,
+            requires=("uvloop",),
         ),
     ]
 
@@ -429,10 +455,10 @@ def _eager(bench: str, asyncio_main: Main, suffix: str = "") -> list[Benchmark]:
 #: Every benchmark, in report order. The gating baseline of a row is its fastest ``baseline``
 #: variant on the loop the gate names (asyncio+uvloop).
 BENCHMARKS: list[Benchmark] = [
-    *_variants("checkpoint", porto_checkpoint, asyncio_checkpoint),
-    *_variants("switch", porto_switch, asyncio_switch, inner_loops=2),
-    *_variants("spawn_one", porto_spawn_one, asyncio_spawn_one),
-    *_variants(
+    *variants("checkpoint", porto_checkpoint, asyncio_checkpoint),
+    *variants("switch", porto_switch, asyncio_switch, inner_loops=2),
+    *variants("spawn_one", porto_spawn_one, asyncio_spawn_one),
+    *variants(
         "spawn_one",
         None,
         asyncio_spawn_one_taskgroup,
@@ -440,18 +466,16 @@ BENCHMARKS: list[Benchmark] = [
         baseline=False,
         ready_fd=False,
     ),
-    *_eager("spawn_one", asyncio_spawn_one),
+    *eager_variants("spawn_one", asyncio_spawn_one),
     # One batch is a handful of loop iterations, so the poll is noise here: no readyfd variant.
-    *_variants(
+    *variants(
         "spawn_join_100k",
         porto_spawn_join,
         asyncio_spawn_join_taskgroup,
         suffix="-taskgroup",
         ready_fd=False,
     ),
-    *_variants(
-        "spawn_join_100k", None, asyncio_spawn_join_gather, suffix="-gather", ready_fd=False
-    ),
-    *_eager("spawn_join_100k", asyncio_spawn_join_taskgroup, "-taskgroup"),
-    *_variants("ping_pong", porto_ping_pong, asyncio_ping_pong),
+    *variants("spawn_join_100k", None, asyncio_spawn_join_gather, suffix="-gather", ready_fd=False),
+    *eager_variants("spawn_join_100k", asyncio_spawn_join_taskgroup, "-taskgroup"),
+    *variants("ping_pong", porto_ping_pong, asyncio_ping_pong),
 ]

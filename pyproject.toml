@@ -29,6 +29,9 @@ dev = [
     "uvloop>=0.22; sys_platform != 'win32'",
     # The micro-benchmark harness (bench/micro/, 53-benchmarks.md §1-§2).
     "pyperf>=2.9",
+    # Informative rows of the scope and cancellation benchmarks (bench/micro/scope_programs.py).
+    "trio>=0.30",
+    "anyio>=4.9",
 ]
 
 [tool.ruff]

@@ -2,9 +2,10 @@
 
     <venv>/bin/python bench/micro/suite.py -o out.json [--select REGEX] [pyperf options]
 
-The venv needs porto (a release build), pyperf and uvloop; ``bench/micro/run.py`` builds those
-venvs and runs this script once per Python. pyperf re-runs this file in worker processes, so it
-is a script, not a module: it imports its sibling ``programs`` from its own directory.
+The venv needs porto (a release build), pyperf, uvloop, trio and anyio; ``bench/micro/run.py``
+builds those venvs and runs this script once per Python. pyperf re-runs this file in worker
+processes, so it is a script, not a module: it imports its siblings (``catalog``,
+``programs``) from its own directory.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ import sys
 from collections.abc import Callable
 from typing import Any, Protocol, cast
 
-from programs import BENCHMARKS, Benchmark
+from catalog import BENCHMARKS
+from programs import Benchmark
 
 
 class _ArgumentParser(Protocol):
@@ -46,8 +48,10 @@ def _pass_select(command: list[str], options: Any) -> None:
     command.extend(("--select", cast(str, options.select)))
 
 
-def _runnable(benchmark: Benchmark, has_uvloop: bool) -> bool:
-    return sys.version_info >= benchmark.min_python and (has_uvloop or not benchmark.needs_uvloop)
+def _runnable(benchmark: Benchmark) -> bool:
+    return sys.version_info >= benchmark.min_python and all(
+        importlib.util.find_spec(module) is not None for module in benchmark.requires
+    )
 
 
 def main() -> None:
@@ -60,9 +64,8 @@ def main() -> None:
     )
     options = runner.parse_args()
     selected = re.compile(cast(str, options.select))
-    has_uvloop = importlib.util.find_spec("uvloop") is not None
     for benchmark in BENCHMARKS:
-        if not selected.search(benchmark.name) or not _runnable(benchmark, has_uvloop):
+        if not selected.search(benchmark.name) or not _runnable(benchmark):
             continue
         runner.bench_time_func(
             benchmark.name,
