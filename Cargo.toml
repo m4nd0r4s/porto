@@ -19,6 +19,8 @@ porto-core = { path = "crates/porto-core" }
 pyo3 = "0.30"
 # The `Py_3_12`-style cfgs for code that differs between CPython versions (porto-py's build.rs).
 pyo3-build-config = "0.30"
+# The epoll/kqueue/IOCP poller under porto-io. No `log`: porto reports through its own channels.
+mio = { version = "1.2.4", default-features = false, features = ["os-poll", "os-ext"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
