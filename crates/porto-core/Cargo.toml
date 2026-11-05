@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 num_cpus.workspace = true
+# The I/O driver the lane polls at maintenance and parks in (12-scheduler-and-lanes.md §9).
+porto-io.workspace = true
 
 [dev-dependencies]
 criterion = "0.8.2"

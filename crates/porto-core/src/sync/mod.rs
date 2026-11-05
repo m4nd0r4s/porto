@@ -35,7 +35,7 @@ mod event;
 mod join_waiters;
 pub mod mpsc;
 mod notify;
-mod primitives;
+pub(crate) mod primitives;
 mod wait_queue;
 
 #[cfg(all(test, not(loom)))]

@@ -15,6 +15,7 @@ publish = false
 
 [workspace.dependencies]
 porto-core = { path = "crates/porto-core" }
+porto-io = { path = "crates/porto-io" }
 # No abi3: it is unavailable for free-threaded builds (ADR-024), so wheels are per Python version.
 pyo3 = "0.30"
 # The `Py_3_12`-style cfgs for code that differs between CPython versions (porto-py's build.rs).
