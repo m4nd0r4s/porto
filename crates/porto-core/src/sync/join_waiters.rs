@@ -199,7 +199,8 @@ impl JoinWaiters {
                 hint::spin_loop();
                 spins += 1;
             } else {
-                spin();
+                // A step past the spin-hint range: yield to the OS scheduler.
+                spin(u32::MAX);
             }
             current = self.word.load(Ordering::Relaxed);
         }

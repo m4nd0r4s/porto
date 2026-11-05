@@ -49,15 +49,3 @@ impl<T> UnsafeCell<T> {
         f(self.0.get())
     }
 }
-
-/// One turn of a spin loop. Loom must see a yield, or it explores the loop forever.
-#[cfg(all(loom, test))]
-pub(crate) fn spin() {
-    loom::thread::yield_now();
-}
-
-/// One turn of a spin loop.
-#[cfg(not(all(loom, test)))]
-pub(crate) fn spin() {
-    std::thread::yield_now();
-}

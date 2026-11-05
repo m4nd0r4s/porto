@@ -147,11 +147,16 @@ fn a_parked_body_is_freed_with_its_last_waker() {
 #[test]
 fn a_panicking_body_completes_and_the_panic_reaches_the_lane() {
     let rt = Runtime::new();
-    let task = rt
-        .handle()
-        .spawn_body(TestBody::new(Script::Panic), TaskFlags::NONE);
+    let body = TestBody::new(Script::Panic);
+    let cancels = body.cancels.clone();
+    let task = rt.handle().spawn_body(body, TaskFlags::NONE);
     let panicked = panic::catch_unwind(AssertUnwindSafe(|| rt.run_until_idle()));
     assert!(panicked.is_err());
     assert!(task.is_complete());
     assert_eq!(rt.run_until_idle(), 0, "the runtime stays usable");
+    assert_eq!(
+        cancels.load(Ordering::Relaxed),
+        1,
+        "a panicked body is cancelled, so its joiners are released"
+    );
 }

@@ -36,8 +36,10 @@ pub trait TaskBody: Send + 'static {
     fn poll(self: Pin<&mut Self>, header: &Header, cx: &mut Context<'_>) -> Poll<()>;
 
     /// The task is cancelled instead of polled: its run-queue entry was dropped (the runtime
-    /// shut down). Release what the body runs and record the cancellation for its joiners; the
-    /// task completes right after, and the body is not polled again.
+    /// shut down), or its last poll panicked. Release what the body runs and record the
+    /// cancellation for its joiners; the task completes right after, and the body is not
+    /// polled again. After a panic the body may be half-way through a step, so this must not
+    /// assume a consistent resume state.
     fn cancel(self: Pin<&mut Self>, header: &Header);
 }
 
@@ -222,9 +224,16 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
         // SAFETY: still RUNNING with the run reference, which `complete` releases.
         Ok(Poll::Ready(())) => unsafe { complete::<B, S>(task, None) },
         // A body that panics completes: it is not polled again, and the panic goes on from
-        // here once the task is released.
-        // SAFETY: as above.
-        Err(payload) => unsafe { complete::<B, S>(task, Some(payload)) },
+        // here once the task is released. It is cancelled first, so its joiners are released
+        // instead of waiting forever; a panic from that cleanup is dropped (the first wins).
+        Err(payload) => {
+            drop(panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: still RUNNING: the panicked poll released nothing.
+                unsafe { body_mut(cell) }.cancel(&cell.header);
+            })));
+            // SAFETY: as above.
+            unsafe { complete::<B, S>(task, Some(payload)) }
+        }
     }
 }
 
