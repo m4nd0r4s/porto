@@ -37,7 +37,7 @@ use pyo3::prelude::*;
 
 use super::pending::{Kind, Payload};
 use super::{lane, step};
-use crate::api::scope::Task;
+use crate::api::task::Task;
 use crate::errors::{Cancelled, RuntimeClosed};
 use crate::py_compat::take_exception;
 
