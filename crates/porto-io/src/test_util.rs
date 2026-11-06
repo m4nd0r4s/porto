@@ -33,12 +33,15 @@ impl Wake for CountingWaker {
 }
 
 /// A driver with no OS behind it: registrations only take slab slots, and readiness comes
-/// from [`IoSlab::dispatch`](crate::IoSlab::dispatch). Lets miri run the registration code.
+/// from [`IoSlab::dispatch`](crate::IoSlab::dispatch). Lets miri run the registration code
+/// (whose tests are Unix-only: they register file descriptors).
+#[cfg(unix)]
 pub(crate) struct SlabDriver {
     slab: crate::IoSlab,
     waker: crate::DriverWaker,
 }
 
+#[cfg(unix)]
 impl SlabDriver {
     pub(crate) fn new() -> Self {
         Self {
@@ -48,6 +51,7 @@ impl SlabDriver {
     }
 }
 
+#[cfg(unix)]
 impl crate::Driver for SlabDriver {
     fn register(
         &self,
