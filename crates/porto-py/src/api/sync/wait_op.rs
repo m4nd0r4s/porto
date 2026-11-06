@@ -115,8 +115,19 @@ impl SyncWait {
     /// A wait that calls `then()` once granted and evaluates to its result.
     pub(super) fn calling(grant: Grant, then: Py<PyAny>) -> Self {
         Self {
+            state: State::Trying(grant),
+            started: false,
             then: Some(then),
-            ..Self::new(grant)
+        }
+    }
+
+    /// The call that returned this wait, as the user wrote it.
+    fn call_name(&self, grant: &Grant) -> &'static str {
+        match grant {
+            Grant::EventSet(_) => "Event.wait()",
+            Grant::Notified(_) => "Notify.notified()",
+            Grant::Locked(_) if self.then.is_some() => "Mutex.__aenter__()",
+            Grant::Locked(_) => "Lock.acquire()",
         }
     }
 
@@ -157,6 +168,17 @@ impl SyncWait {
             // The driver resumes a `Notified` wait only once it was granted.
             State::Waiting(grant) => self.granted(py, &grant),
             State::Done => Err(reused_error()),
+        }
+    }
+}
+
+/// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).
+impl Drop for SyncWait {
+    fn drop(&mut self) {
+        if let State::Trying(grant) = &self.state
+            && !self.started
+        {
+            crate::unawaited::warn_never_awaited(self.call_name(grant));
         }
     }
 }

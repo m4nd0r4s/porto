@@ -45,6 +45,9 @@ const DONE: u8 = 3;
 const PHASE: u8 = 0b0011;
 /// Set with TAKEN: the payload was moved out, so dropping the trap must not drop it again.
 const MOVED: u8 = 0b0100;
+/// Set on a FRESH trap that a public API returned (`porto.sleep`, `porto.checkpoint`):
+/// freeing it while still FRESH warns that it was never awaited. The first resume clears it.
+const WATCHED: u8 = 0b1000;
 
 /// What a trap asks the driver to do (11-task-model-and-trap-protocol.md §5.2).
 pub(crate) enum TrapKind {
@@ -154,6 +157,22 @@ impl Trap {
         trap
     }
 
+    /// This trap, warning if it is freed without ever being awaited (see `unawaited.rs`): for
+    /// the traps a user's call returns. Only the kinds a user can call are named.
+    pub(crate) fn watched(mut self) -> Self {
+        debug_assert!(matches!(self.kind, Kind::Yield | Kind::Sleep));
+        *self.state.get_mut() |= WATCHED;
+        self
+    }
+
+    /// The call that returned a watched trap, as the user wrote it.
+    fn call_name(&self) -> &'static str {
+        match self.kind {
+            Kind::Sleep => "porto.sleep(...)",
+            _ => "porto.checkpoint()",
+        }
+    }
+
     /// A trap that yields to the scheduler once (`porto.checkpoint`).
     pub fn yield_now() -> Self {
         Self::new(TrapKind::Yield)
@@ -216,7 +235,11 @@ impl Trap {
 
 impl Drop for Trap {
     fn drop(&mut self) {
-        if self.kind.owns_payload() && *self.state.get_mut() & MOVED == 0 {
+        let state = *self.state.get_mut();
+        if state & (PHASE | WATCHED) == FRESH | WATCHED {
+            crate::unawaited::warn_never_awaited(self.call_name());
+        }
+        if self.kind.owns_payload() && state & MOVED == 0 {
             // SAFETY: not moved out, so the payload is live and packed with `self.kind`; it is
             // never read again. A trap's request is never linked anywhere, so dropping it is
             // all there is to undo.
@@ -387,6 +410,24 @@ mod tests {
         assert!(matches!(trap.resume(true), Step::Reused));
         assert!(trap.take().is_none());
         assert_eq!(trap.state.load(Ordering::Acquire), DONE | MOVED);
+    }
+
+    #[test]
+    fn a_watched_trap_stops_watching_once_resumed_thrown_into_or_closed() {
+        // A watched trap freed while FRESH warns, which needs Python: each of these must clear
+        // the watch, so dropping them here needs none.
+        let awaited = Trap::sleep_until(Deadline::from_nanos(7)).watched();
+        assert_eq!(awaited.state.load(Ordering::Acquire), FRESH | WATCHED);
+        assert!(matches!(awaited.resume(true), Step::Suspend));
+        assert_eq!(awaited.state.load(Ordering::Acquire), SUSPENDED);
+        let closed = Trap::yield_now().watched();
+        closed.finish();
+        assert_eq!(closed.state.load(Ordering::Acquire) & PHASE, DONE);
+        // A refused first resume leaves it FRESH and watched: it still was never awaited.
+        let refused = Trap::yield_now().watched();
+        assert!(matches!(refused.resume(false), Step::NotStarted));
+        assert_eq!(refused.state.load(Ordering::Acquire), FRESH | WATCHED);
+        refused.finish();
     }
 
     #[test]

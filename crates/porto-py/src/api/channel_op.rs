@@ -54,6 +54,16 @@ pub(super) enum Op {
 }
 
 impl Op {
+    /// The call that returned this operation, as the user wrote it.
+    fn call_name(&self) -> &'static str {
+        match self {
+            Self::Send { .. } => "Sender.send(...)",
+            Self::Recv { .. } => "Receiver.recv()",
+            Self::Next { .. } => "anext(receiver)",
+            Self::RecvMany { .. } => "Receiver.recv_many(...)",
+        }
+    }
+
     /// Tries the operation without waiting: `Some(result)` once done, `None` to wait.
     fn attempt(&mut self, py: Python<'_>) -> PyResult<Option<PyObj>> {
         match self {
@@ -163,6 +173,15 @@ impl ChannelOp {
                 self.state = State::Waiting(op);
                 suspend(py, TrapKind::Notified(target))
             }
+        }
+    }
+}
+
+/// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).
+impl Drop for ChannelOp {
+    fn drop(&mut self) {
+        if let State::Fresh(op) = &self.state {
+            crate::unawaited::warn_never_awaited(op.call_name());
         }
     }
 }

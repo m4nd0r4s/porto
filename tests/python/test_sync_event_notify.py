@@ -286,9 +286,11 @@ def test_notified_and_wait_do_nothing_until_awaited() -> None:
 
     async def make_and_drop() -> None:
         not_awaited = notify.notified()
-        del not_awaited
+        with pytest.warns(RuntimeWarning, match=r"Notify\.notified\(\) was never awaited"):
+            del not_awaited
         never = porto.Event().wait()
-        del never
+        with pytest.warns(RuntimeWarning, match=r"Event\.wait\(\) was never awaited"):
+            del never
 
     porto.run(make_and_drop)
     assert notify_has_permit(notify), "an un-awaited notified() consumed the permit"

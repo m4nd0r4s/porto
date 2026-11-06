@@ -370,10 +370,12 @@ def test_an_operation_never_awaited_neither_sends_nor_loses_a_value() -> None:
     tx, rx = porto.channel[int](1)
     tx.try_send(1)
     pending_recv = rx.recv()
-    del pending_recv
+    with pytest.warns(RuntimeWarning, match=r"Receiver\.recv\(\) was never awaited"):
+        del pending_recv
     assert rx.try_recv() == 1
     pending_send = tx.send(2)
-    del pending_send
+    with pytest.warns(RuntimeWarning, match=r"Sender\.send\(\.\.\.\) was never awaited"):
+        del pending_send
     with pytest.raises(porto.WouldBlock):
         rx.try_recv()
 
