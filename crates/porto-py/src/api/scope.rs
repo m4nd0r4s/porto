@@ -236,6 +236,14 @@ impl Scope {
         Some(Trap::new(TrapKind::ScopeExit { scope }))
     }
 
+    /// How many tasks are filed with the scope as waiting in a cancellable wait (C10): 0 before
+    /// it is entered. For tests: every way a wait ends takes its task out (porto-szb.114).
+    fn _waiter_count(&self) -> usize {
+        self.node
+            .get()
+            .map_or(0, |node| node.lock_state().waiter_count())
+    }
+
     /// Closes the scope; raises the children's failures, after `exc` (the body's exception, or
     /// `None`), as an exception group. Returns whether `exc` is a `Cancelled` the scope
     /// absorbs (the `__aexit__` result).
