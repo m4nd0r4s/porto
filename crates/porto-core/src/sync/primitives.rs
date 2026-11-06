@@ -1,6 +1,7 @@
 //! The concurrency primitives the wait queue, the channels and the scheduler's injector and
-//! parking are built from: std's, or loom's under `cfg(loom)` (in loom test builds) so the model
-//! checker sees every lock, atomic, cell access and thread unpark.
+//! parking are built from: std's (and a parking_lot [`Mutex`] behind std's API), or loom's under
+//! `cfg(loom)` (in loom test builds) so the model checker sees every lock, atomic, cell access
+//! and thread unpark.
 
 #[cfg(all(loom, test))]
 pub(crate) use loom::cell::UnsafeCell;
@@ -12,9 +13,11 @@ pub(crate) use loom::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use loom_thread::{Thread, current as current_thread, park};
 
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, fence};
+pub(crate) use lock::{Mutex, MutexGuard};
 #[cfg(not(all(loom, test)))]
-pub(crate) use std::sync::{Arc, Mutex, MutexGuard};
+pub(crate) use std::sync::Arc;
+#[cfg(not(all(loom, test)))]
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, fence};
 #[cfg(not(all(loom, test)))]
 pub(crate) use std::thread::{Thread, current as current_thread, park};
 
@@ -104,5 +107,48 @@ mod loom_thread {
             }
             *available = false;
         });
+    }
+}
+
+/// A short-held lock with std's `Mutex` API (`lock()` returns a `LockResult`, never poisoned)
+/// over parking_lot's: one byte and a compare-and-swap uncontended. std's allocates and
+/// initializes a pthread mutex on the first lock of each one on macOS, which a scope, a wait
+/// queue and a channel each paid on the hot path (porto-itr.7). Loom builds use loom's.
+#[cfg(not(all(loom, test)))]
+mod lock {
+    use std::sync::LockResult;
+
+    /// A mutual-exclusion lock around `T`; see the module docs.
+    #[derive(Default)]
+    pub(crate) struct Mutex<T: ?Sized>(parking_lot::Mutex<T>);
+
+    /// Holds a [`Mutex`] until dropped.
+    pub(crate) type MutexGuard<'a, T> = parking_lot::MutexGuard<'a, T>;
+
+    impl<T> Mutex<T> {
+        /// An unlocked mutex around `value`.
+        pub(crate) const fn new(value: T) -> Self {
+            Self(parking_lot::const_mutex(value))
+        }
+    }
+
+    impl<T: ?Sized> Mutex<T> {
+        /// Locks it, blocking the thread while another holds it. Never `Err`: a panic while
+        /// it was held does not poison it.
+        #[inline]
+        pub(crate) fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+            Ok(self.0.lock())
+        }
+
+        /// The value, through the exclusive borrow (no locking). Never `Err`.
+        pub(crate) fn get_mut(&mut self) -> LockResult<&mut T> {
+            Ok(self.0.get_mut())
+        }
+    }
+
+    impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for Mutex<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
     }
 }
