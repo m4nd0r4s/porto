@@ -54,8 +54,18 @@ impl<const N: usize> FreeList<N> {
                 let object = slots[*len];
                 // SAFETY: a freed object of this type (only `free` pushes, for this type),
                 // whose memory is still allocated; `PyObject_Init` makes it a live object of
-                // `subtype` with one reference, as pyo3's freelist does.
-                return unsafe { ffi::PyObject_Init(object, subtype) };
+                // `subtype` with one reference, as pyo3's freelist does. Its `tp_dealloc`
+                // stopped the collector tracking it: track it again, as `PyType_GenericAlloc`
+                // does for a new one, or reference cycles through it are never collected. The
+                // caller writes the value before anything can run the collector (no Python
+                // code or allocation in between), so a traversal never sees the old one.
+                unsafe {
+                    let object = ffi::PyObject_Init(object, subtype);
+                    if ffi::PyType_IS_GC(subtype) != 0 {
+                        ffi::PyObject_GC_Track(object.cast());
+                    }
+                    return object;
+                }
             }
         }
         // SAFETY: attached; the generic allocation pyo3 falls back to.

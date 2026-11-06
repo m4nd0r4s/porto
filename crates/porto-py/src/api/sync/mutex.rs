@@ -16,7 +16,9 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pyo3::PyTraverseError;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::sync::critical_section::with_critical_section;
 use pyo3::types::PyType;
@@ -149,6 +151,23 @@ impl Mutex {
             "<porto.Mutex unlocked>"
         }
     }
+
+    // The value may reference the mutex again (an object that owns its own mutex, a guard
+    // stored in it): let the cycle collector see through it.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        // SAFETY: the collector traverses with every other thread stopped (or, on a GIL build,
+        // not attached), so no write to the cell overlaps this read.
+        visit.call(unsafe { &*self.value.0.get() })
+    }
+
+    fn __clear__(&self) {
+        let old = Python::attach(|py| {
+            // SAFETY: the collector clears only objects nothing else references, so no other
+            // access to the cell can overlap this write.
+            unsafe { std::mem::replace(&mut *self.value.0.get(), py.None()) }
+        });
+        drop(old);
+    }
 }
 
 /// Access to a `porto.Mutex`'s value while its lock is held; what `async with` gives.
@@ -197,6 +216,10 @@ impl MutexGuard {
         item: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         generic_alias(cls, item)
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.mutex)
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {

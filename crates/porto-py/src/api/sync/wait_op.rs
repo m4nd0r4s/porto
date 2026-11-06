@@ -21,8 +21,10 @@
 
 use std::sync::Arc;
 
+use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 
 use super::event::{EventSource, NotifySource};
@@ -259,6 +261,15 @@ impl SyncWait {
 
     fn close(&mut self) {
         self.state = State::Done;
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.then)
+    }
+
+    fn __clear__(&mut self) {
+        let then = self.then.take();
+        drop(then);
     }
 
     fn __repr__(&self) -> &'static str {

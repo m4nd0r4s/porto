@@ -11,8 +11,10 @@
 //! A throw (the owner closed at shutdown, a test interrupt) ends the wait without closing the
 //! scope, as the coroutine did: the exception goes on from the `await`.
 
+use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 use pyo3::types::PyBool;
 
@@ -109,6 +111,18 @@ impl ScopeExit {
 
     fn close(&mut self) {
         self.done = true;
+    }
+
+    // The exception's traceback reaches the frame that awaits this: let the cycle collector
+    // see through it.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.scope)?;
+        visit.call(&self.exc)
+    }
+
+    fn __clear__(&mut self) {
+        let exc = Python::attach(|py| std::mem::replace(&mut self.exc, py.None()));
+        drop(exc);
     }
 
     fn __repr__(&self) -> &'static str {
