@@ -5,9 +5,10 @@ use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
-use super::primitives::UnsafeCell;
+use super::primitives::{AtomicU8, UnsafeCell};
 use super::{BlockingOnLane, Locked, Wait, WaitNode, WaitQueue, WaitState, blocking_wait};
 
 /// An async mutual-exclusion lock around a `T`.
@@ -46,11 +47,23 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 /// The first-poll check of a lock wait, as a nameable type.
 type Acquire = fn(&mut Locked<'_, LockState>) -> bool;
 
-/// The queue state. Invariant: waiters are queued only while `locked`.
-#[derive(Debug, Default)]
-struct LockState {
-    locked: bool,
-}
+/// The queue state: none beyond the list. The lock itself is the queue's lock-free byte
+/// ([`WaitQueue::word`]): [`LOCKED`] while held (or being handed to a waiter), [`QUEUED`] while
+/// waiters may be queued.
+///
+/// Invariants: waiters are queued only while [`LOCKED`], and [`QUEUED`] is set (under the queue
+/// lock) before a waiter is queued and stays set while one is. So a free lock has nobody
+/// queued, and the fast paths can skip the queue lock: taking a free lock is a
+/// compare-and-swap from 0, and releasing a lock nobody waits for is one from [`LOCKED`] to 0.
+/// Anything else takes the queue lock. [`QUEUED`] may stay set after the last waiter left (a
+/// cancelled wait); that only sends the next release down the slow path, which clears it.
+#[derive(Debug)]
+struct LockState;
+
+/// The lock is held, or being handed to a waiter.
+const LOCKED: u8 = 1;
+/// Waiters may be queued: a release must take the queue lock to hand the lock over.
+const QUEUED: u8 = 2;
 
 impl WaitState for LockState {
     /// A handoff whose waiter gave up: the lock goes to the next waiter, or is unlocked.
@@ -59,16 +72,43 @@ impl WaitState for LockState {
     }
 }
 
-/// Takes the lock if it is free (and the waiter queues otherwise). Fair: by the invariant, a
-/// free lock has nobody queued ahead.
-fn try_lock_locked(locked: &mut Locked<'_, LockState>) -> bool {
-    !std::mem::replace(&mut locked.locked, true)
+/// Takes the lock if it is free (and the waiter queues otherwise), without the queue lock.
+/// Fair: by the invariant, a free lock has nobody queued ahead.
+fn try_lock_fast(word: &AtomicU8) -> bool {
+    word.compare_exchange(0, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
 }
 
-/// Hands the lock to the first waiter, or unlocks it if nobody waits.
+/// Takes the lock if it is free; otherwise marks it [`QUEUED`], since the caller then queues
+/// a waiter before releasing the queue lock.
+fn try_lock_locked(locked: &mut Locked<'_, LockState>) -> bool {
+    let word = locked.word();
+    let mut current = word.load(Ordering::Relaxed);
+    loop {
+        let (new, acquired) = if current == 0 {
+            (LOCKED, true)
+        } else {
+            (current | QUEUED, false)
+        };
+        match word.compare_exchange_weak(current, new, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return acquired,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Hands the lock to the first waiter, or unlocks it if nobody waits. Under the queue lock,
+/// with the lock held.
 fn unlock_locked(locked: &mut Locked<'_, LockState>) {
-    if !locked.grant_front() {
-        locked.locked = false;
+    if locked.grant_front() {
+        if locked.is_empty() {
+            // Still held (by the waiter now), and nobody queued behind it: its release can
+            // take the fast path. No fast path changes a word with `QUEUED` set, and every
+            // other change is under the queue lock.
+            locked.word().store(LOCKED, Ordering::Relaxed);
+        }
+    } else {
+        locked.word().store(0, Ordering::Release);
     }
 }
 
@@ -76,7 +116,7 @@ impl<T> Mutex<T> {
     /// An unlocked mutex around `value`.
     pub fn new(value: T) -> Self {
         Self {
-            queue: WaitQueue::new(LockState::default()),
+            queue: WaitQueue::new(LockState),
             value: UnsafeCell::new(value),
         }
     }
@@ -100,9 +140,7 @@ impl<T: ?Sized> Mutex<T> {
 
     /// Takes the lock if it is free right now.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        // The queue lock is released before a guard exists: a guard unlocks on drop.
-        let acquired = try_lock_locked(&mut self.queue.lock());
-        if acquired {
+        if try_lock_fast(self.queue.word()) {
             Some(MutexGuard { mutex: self })
         } else {
             None
@@ -121,7 +159,7 @@ impl<T: ?Sized> Mutex<T> {
     /// Whether the lock is held (or being handed to a waiter). A snapshot: it may change
     /// right after.
     pub fn is_locked(&self) -> bool {
-        self.queue.lock().locked
+        self.queue.word().load(Ordering::Relaxed) & LOCKED != 0
     }
 
     /// The value, through the exclusive borrow of the mutex (no locking needed).
@@ -158,12 +196,21 @@ impl<T: ?Sized> Mutex<T> {
     /// # Safety
     /// No reference to the value obtained through the lock being released is used afterwards.
     pub unsafe fn force_unlock(&self) -> bool {
-        let mut locked = self.queue.lock();
-        if !locked.locked {
-            return false;
+        self.release()
+    }
+
+    /// Releases the lock: [`LOCKED`] to 0 without the queue lock if nobody may be queued, else
+    /// a handoff under it. `false`, doing nothing, if the lock was not held.
+    fn release(&self) -> bool {
+        let word = self.queue.word();
+        match word.compare_exchange(LOCKED, 0, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => true,
+            Err(current) if current & LOCKED == 0 => false,
+            Err(_) => {
+                unlock_locked(&mut self.queue.lock());
+                true
+            }
         }
-        unlock_locked(&mut locked);
-        true
     }
 }
 
@@ -177,7 +224,10 @@ impl<T: ?Sized> fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let locked = self.queue.lock();
         f.debug_struct("Mutex")
-            .field("locked", &locked.locked)
+            .field(
+                "locked",
+                &(locked.word().load(Ordering::Relaxed) & LOCKED != 0),
+            )
             .field("waiters", &locked.len())
             .finish_non_exhaustive()
     }
@@ -218,7 +268,7 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        unlock_locked(&mut self.mutex.queue.lock());
+        self.mutex.release();
     }
 }
 

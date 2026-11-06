@@ -149,8 +149,13 @@ unsafe impl<S: Send> Send for Inner<S> {}
 ///
 /// The state and the queue share one lock ([`WaitQueue::lock`]), so a primitive decides "free
 /// or wait" and "grant to whom" atomically. Wakers are woken after the lock is released.
+///
+/// Beside them is one byte the primitive may also use without the lock ([`WaitQueue::word`],
+/// [`Locked::word`]), for a fast path that does not need the list: `Mutex` keeps its lock bit
+/// there, so an uncontended lock and unlock are one compare-and-swap each.
 pub struct WaitQueue<S> {
     inner: Mutex<Inner<S>>,
+    word: AtomicU8,
 }
 
 impl<S: WaitState> WaitQueue<S> {
@@ -163,7 +168,13 @@ impl<S: WaitState> WaitQueue<S> {
                 tail: ptr::null(),
                 len: 0,
             }),
+            word: AtomicU8::new(0),
         }
+    }
+
+    /// The primitive's lock-free byte (see the type docs); 0 in a new queue.
+    pub fn word(&self) -> &AtomicU8 {
+        &self.word
     }
 
     /// Locks the state and the queue. Wakes queued by [`Locked::grant_front`] and
@@ -175,6 +186,7 @@ impl<S: WaitState> WaitQueue<S> {
         Locked {
             guard: ManuallyDrop::new(guard),
             wakes: Vec::new(),
+            word: &self.word,
         }
     }
 
@@ -326,9 +338,15 @@ impl<S: fmt::Debug> fmt::Debug for WaitQueue<S> {
 pub struct Locked<'a, S> {
     guard: ManuallyDrop<MutexGuard<'a, Inner<S>>>,
     wakes: Vec<Waker>,
+    word: &'a AtomicU8,
 }
 
 impl<S> Locked<'_, S> {
+    /// The queue's lock-free byte ([`WaitQueue::word`]).
+    pub fn word(&self) -> &AtomicU8 {
+        self.word
+    }
+
     /// Whether no waiter is queued.
     pub fn is_empty(&self) -> bool {
         self.guard.len == 0
