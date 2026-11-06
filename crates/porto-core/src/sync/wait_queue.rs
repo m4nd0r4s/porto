@@ -23,7 +23,7 @@ use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 
-use super::primitives::{AtomicU8, Mutex, MutexGuard, UnsafeCell};
+use super::primitives::{AtomicU8, AtomicU64, AtomicUsize, Mutex, MutexGuard, UnsafeCell};
 
 /// Not in a queue, no grant pending.
 pub(super) const IDLE: u8 = 0;
@@ -50,6 +50,16 @@ pub trait WaitState: Sized {
     /// Grants made by [`Locked::grant_all`] are shared (an event or `notify_all` wakes
     /// everyone) and are never passed on: this is not called for them.
     fn pass_grant(waiters: &mut Locked<'_, Self>, token: usize);
+
+    /// Called, with the queue locked, right after a waiter that was still queued (not granted)
+    /// was cancelled and unlinked. `token` is the waiter's [`WaitNode::token`].
+    ///
+    /// A primitive whose front waiter can block the ones behind it (a semaphore waiter that
+    /// wants more permits than are free, a writer ahead of readers) grants them here once it
+    /// left. The default does nothing.
+    fn waiter_left(waiters: &mut Locked<'_, Self>, token: usize) {
+        let _ = (waiters, token);
+    }
 }
 
 /// A waiter: one entry of a [`WaitQueue`], embedded in whatever waits.
@@ -60,8 +70,10 @@ pub trait WaitState: Sized {
 /// [`WaitQueue::cancel`] first.
 pub struct WaitNode {
     pub(super) state: AtomicU8,
-    /// Set by the owner at creation; the primitive's meaning (permits wanted, reader/writer).
-    token: usize,
+    /// Set by the owner while the node is idle ([`WaitNode::new`], [`WaitNode::set_token`]),
+    /// read by granters under the queue lock; the primitive's meaning (permits wanted,
+    /// reader/writer).
+    token: AtomicUsize,
     /// Guarded by the lock of the queue the node is in.
     pub(super) links: UnsafeCell<Links>,
     _pinned: PhantomPinned,
@@ -85,7 +97,7 @@ impl WaitNode {
     pub fn new(token: usize) -> Self {
         Self {
             state: AtomicU8::new(IDLE),
-            token,
+            token: AtomicUsize::new(token),
             links: UnsafeCell::new(Links {
                 prev: ptr::null(),
                 next: ptr::null(),
@@ -95,9 +107,24 @@ impl WaitNode {
         }
     }
 
-    /// The token this node was created with.
+    /// The node's token: what it was created with, or the last [`WaitNode::set_token`].
     pub fn token(&self) -> usize {
-        self.token
+        self.token.load(Ordering::Relaxed)
+    }
+
+    /// Changes the token, for a node embedded in a task that waits on different primitives
+    /// (or for different amounts) over its life. Only the owner calls it, while the node is
+    /// idle: the queue lock taken when the node is queued publishes the new value to granters.
+    ///
+    /// # Panics
+    /// If the node is queued or holds an unobserved grant: its token is what the queue
+    /// accounts the wait by.
+    pub fn set_token(&self, token: usize) {
+        assert!(
+            !self.is_pending(),
+            "porto: WaitNode::set_token on a node that is still waiting; set it while idle"
+        );
+        self.token.store(token, Ordering::Relaxed);
     }
 
     /// Whether the node is in a queue or holds a grant it has not observed yet.
@@ -129,7 +156,7 @@ impl fmt::Debug for WaitNode {
         };
         f.debug_struct("WaitNode")
             .field("state", &state)
-            .field("token", &self.token)
+            .field("token", &self.token())
             .finish()
     }
 }
@@ -150,12 +177,13 @@ unsafe impl<S: Send> Send for Inner<S> {}
 /// The state and the queue share one lock ([`WaitQueue::lock`]), so a primitive decides "free
 /// or wait" and "grant to whom" atomically. Wakers are woken after the lock is released.
 ///
-/// Beside them is one byte the primitive may also use without the lock ([`WaitQueue::word`],
+/// Beside them is one word the primitive may also use without the lock ([`WaitQueue::word`],
 /// [`Locked::word`]), for a fast path that does not need the list: `Mutex` keeps its lock bit
-/// there, so an uncontended lock and unlock are one compare-and-swap each.
+/// there, so an uncontended lock and unlock are one compare-and-swap each, and `Semaphore` its
+/// permit counts.
 pub struct WaitQueue<S> {
     inner: Mutex<Inner<S>>,
-    word: AtomicU8,
+    word: AtomicU64,
 }
 
 impl<S: WaitState> WaitQueue<S> {
@@ -168,12 +196,12 @@ impl<S: WaitState> WaitQueue<S> {
                 tail: ptr::null(),
                 len: 0,
             }),
-            word: AtomicU8::new(0),
+            word: AtomicU64::new(0),
         }
     }
 
-    /// The primitive's lock-free byte (see the type docs); 0 in a new queue.
-    pub fn word(&self) -> &AtomicU8 {
+    /// The primitive's lock-free word (see the type docs); 0 in a new queue.
+    pub fn word(&self) -> &AtomicU64 {
         &self.word
     }
 
@@ -297,10 +325,11 @@ impl<S: WaitState> WaitQueue<S> {
                 // SAFETY: the node is in this queue's list and we hold its lock.
                 stale = unsafe { locked.unlink(node) };
                 node.state.store(IDLE, Ordering::Relaxed);
+                S::waiter_left(&mut locked, node.token());
             }
             GRANTED => {
                 node.state.store(IDLE, Ordering::Relaxed);
-                S::pass_grant(&mut locked, node.token);
+                S::pass_grant(&mut locked, node.token());
             }
             WOKEN => node.state.store(IDLE, Ordering::Relaxed),
             _ => {}
@@ -338,12 +367,12 @@ impl<S: fmt::Debug> fmt::Debug for WaitQueue<S> {
 pub struct Locked<'a, S> {
     guard: ManuallyDrop<MutexGuard<'a, Inner<S>>>,
     wakes: Vec<Waker>,
-    word: &'a AtomicU8,
+    word: &'a AtomicU64,
 }
 
 impl<S> Locked<'_, S> {
-    /// The queue's lock-free byte ([`WaitQueue::word`]).
-    pub fn word(&self) -> &AtomicU8 {
+    /// The queue's lock-free word ([`WaitQueue::word`]).
+    pub fn word(&self) -> &AtomicU64 {
         self.word
     }
 
@@ -360,7 +389,7 @@ impl<S> Locked<'_, S> {
     /// The token of the first queued waiter, the next one [`Locked::grant_front`] grants.
     pub fn front_token(&self) -> Option<usize> {
         // SAFETY: queued nodes stay alive while they are in the list, and we hold the lock.
-        (!self.guard.head.is_null()).then(|| unsafe { (*self.guard.head).token })
+        (!self.guard.head.is_null()).then(|| unsafe { (*self.guard.head).token() })
     }
 
     /// Grants the first waiter: unlinks it and wakes it once the lock is released. Returns
