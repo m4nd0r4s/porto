@@ -1,5 +1,5 @@
-//! One level of the wheel: 64 slots, each a FIFO list of entries, and a bitmap of the occupied
-//! ones.
+//! One level of the wheel: 64 slots, each a FIFO list of entries with a lower bound of their
+//! ticks, and a bitmap of the occupied ones.
 
 use std::ptr::NonNull;
 
@@ -7,10 +7,23 @@ use super::entry::{TimerEntry, UNLINKED};
 use super::{LEVELS, SLOT_BITS, SLOTS};
 
 /// A doubly linked FIFO list of entries.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(super) struct Slot {
     head: Option<NonNull<TimerEntry>>,
     tail: Option<NonNull<TimerEntry>>,
+    /// At most the earliest `deadline_tick` in the list (`u64::MAX` when empty): exact until
+    /// an entry is removed, then possibly lower. It bounds the next-deadline scan to O(1)
+    /// (porto-szb.95); a stale value only wakes the lane early, to cascade the slot, which
+    /// makes it exact again.
+    min_tick: u64,
+}
+
+impl Slot {
+    const EMPTY: Self = Self {
+        head: None,
+        tail: None,
+        min_tick: u64::MAX,
+    };
 }
 
 pub(super) struct Level {
@@ -23,10 +36,7 @@ impl Level {
     pub(super) const fn new() -> Self {
         Self {
             occupied: 0,
-            slots: [Slot {
-                head: None,
-                tail: None,
-            }; SLOTS],
+            slots: [Slot::EMPTY; SLOTS],
         }
     }
 
@@ -84,6 +94,7 @@ impl Level {
             (*state).prev = list.tail;
             (*state).next = None;
             (*state).location = location(level, slot);
+            list.min_tick = list.min_tick.min((*state).deadline_tick);
             match list.tail {
                 Some(tail) => (*TimerEntry::state(tail)).next = Some(entry),
                 None => list.head = Some(entry),
@@ -116,6 +127,7 @@ impl Level {
             (*state).location = UNLINKED;
         }
         if list.head.is_none() {
+            list.min_tick = u64::MAX;
             self.occupied &= !(1 << slot);
         }
     }
@@ -124,11 +136,17 @@ impl Level {
         self.slots[slot].head
     }
 
+    /// A lower bound of the ticks of `slot`'s entries, in O(1): their earliest tick unless an
+    /// entry was removed since the slot was last empty. `u64::MAX` for an empty slot.
+    pub(super) fn min_tick(&self, slot: usize) -> u64 {
+        self.slots[slot].min_tick
+    }
+
     /// Takes the whole list of `slot`, leaving it empty. The entries keep their links to each
     /// other (walk them with `next`) but are marked unlinked as they are visited by the caller.
     pub(super) fn take(&mut self, slot: usize) -> Option<NonNull<TimerEntry>> {
         self.occupied &= !(1 << slot);
-        let list = std::mem::take(&mut self.slots[slot]);
+        let list = std::mem::replace(&mut self.slots[slot], Slot::EMPTY);
         list.head
     }
 
@@ -149,8 +167,17 @@ pub(super) fn slot_of(tick: u64, level: usize) -> usize {
 }
 
 fn location(level: usize, slot: usize) -> u16 {
-    // At most LEVELS * SLOTS = 384.
-    u16::try_from(level * SLOTS + slot).unwrap_or(UNLINKED)
+    debug_assert!(
+        level < LEVELS && slot < SLOTS,
+        "slot {slot} on level {level}"
+    );
+    // At most LEVELS * SLOTS = 384, well below UNLINKED.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "level < 6 and slot < 64: at most 383"
+    )]
+    let location = (level * SLOTS + slot) as u16;
+    location
 }
 
 /// The (level, slot) a linked entry's `location` stands for.

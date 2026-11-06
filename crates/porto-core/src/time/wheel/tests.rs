@@ -141,6 +141,64 @@ fn the_next_deadline_is_the_earliest_entry_not_the_cascade() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "100k entries and a wall-clock bound: too slow under miri"
+)]
+fn the_next_deadline_of_a_crowded_slot_is_found_without_walking_it() {
+    // porto-szb.95: 100k sleeps of about the same long duration share one level-3 slot (64^3
+    // ticks); the park's next-deadline query reads the slot's cached bound instead of walking
+    // the list. Timed against the walk it replaced: 100k pointer hops per park.
+    const COUNT: usize = 100_000;
+    let entries = Entries::new(COUNT);
+    let mut wheel = Wheel::new();
+    let base = 1 << 19;
+    for index in 0..COUNT {
+        insert(&mut wheel, &entries, index, base + 1_000 + index as u64);
+    }
+    assert_eq!(wheel.next_deadline_tick(), Some(base + 1_000));
+    let started = std::time::Instant::now();
+    for _ in 0..10_000 {
+        assert_eq!(
+            std::hint::black_box(&wheel).next_deadline_tick(),
+            Some(base + 1_000)
+        );
+    }
+    // 10k queries in well under the time of one 100k-entry walk each (seconds in all).
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "{:?} for 10k queries",
+        started.elapsed()
+    );
+    drain(&mut wheel);
+}
+
+#[test]
+fn cancelling_the_earliest_entry_of_a_slot_costs_at_most_one_early_wake() {
+    let entries = Entries::new(3);
+    let mut wheel = Wheel::new();
+    // All three in one level-2 slot (4096 ticks), the earliest cancelled.
+    insert(&mut wheel, &entries, 0, 8_300);
+    insert(&mut wheel, &entries, 1, 9_000);
+    insert(&mut wheel, &entries, 2, 8_700);
+    remove(&mut wheel, &entries, 0);
+    // The bound is stale: early, never late.
+    let stale = wheel.next_deadline_tick().unwrap();
+    assert!((8_192..=8_700).contains(&stale), "{stale}");
+    // The early wake cascades the slot and fires nothing; the bound is exact from then on.
+    assert!(advance(&mut wheel, &entries, stale).is_empty());
+    assert_eq!(wheel.next_deadline_tick(), Some(8_700));
+    assert_eq!(advance(&mut wheel, &entries, 8_700), [2]);
+    assert_eq!(wheel.next_deadline_tick(), Some(9_000));
+    // A slot that empties forgets its bound.
+    remove(&mut wheel, &entries, 1);
+    assert_eq!(wheel.next_deadline_tick(), None);
+    insert(&mut wheel, &entries, 1, 20_000);
+    assert_eq!(wheel.next_deadline_tick(), Some(20_000));
+    drain(&mut wheel);
+}
+
+#[test]
 fn a_tick_beyond_the_span_is_clamped_and_re_armed() {
     let entries = Entries::new(2);
     let mut wheel = Wheel::new();
@@ -294,11 +352,15 @@ fn run_model(ops: &[Op]) -> Result<(), TestCaseError> {
     // Same-tick entries fire in insertion order, except that an entry re-armed from beyond
     // the span joins its tick's slot when it gets there: only the tick order is checked then.
     let mut clamped = false;
+    // A removal may leave a slot's cached lower bound below its earliest entry: the next
+    // deadline may then be early (never late) until the slot cascades or empties.
+    let mut removed = false;
     for op in ops {
         match *op {
             Op::Insert { index, delay } => {
                 if entries.is_linked(index) {
                     remove(&mut wheel, &entries, index);
+                    removed = true;
                 }
                 let tick = now + delay;
                 clamped |= delay >= MAX_SPAN - 1;
@@ -308,6 +370,7 @@ fn run_model(ops: &[Op]) -> Result<(), TestCaseError> {
             Op::Cancel { index } => {
                 if entries.is_linked(index) {
                     remove(&mut wheel, &entries, index);
+                    removed = true;
                 }
                 model.cancel(index);
             }
@@ -341,13 +404,17 @@ fn run_model(ops: &[Op]) -> Result<(), TestCaseError> {
                     next <= earliest.max(now),
                     "next {next}, earliest {earliest}"
                 );
-                if !clamped {
+                prop_assert!(next >= wheel.elapsed(), "next {next} is in the past");
+                if !clamped && !removed {
                     prop_assert_eq!(next, earliest.max(wheel.elapsed()));
                 }
             }
             (next, earliest) => {
                 prop_assert!(false, "next {next:?} but earliest {earliest:?}");
             }
+        }
+        if wheel.is_empty() {
+            removed = false;
         }
     }
     drain(&mut wheel);

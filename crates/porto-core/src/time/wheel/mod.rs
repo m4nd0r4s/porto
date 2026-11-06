@@ -146,23 +146,20 @@ impl Wheel {
 
     /// The earliest tick at which [`Wheel::pop_expired`] has work: the earliest entry's tick,
     /// or, for an entry beyond the span, the tick at which it is re-armed. Never later than
-    /// the earliest entry's tick, so parking until then never oversleeps a timer.
+    /// the earliest entry's tick, so parking until then never oversleeps a timer. O(1): after
+    /// the earliest entry of a slot above level 0 is cancelled it may be earlier than needed
+    /// (the lane then wakes once to cascade that slot, which makes it exact again).
     pub(crate) fn next_deadline_tick(&self) -> Option<u64> {
         let (level, slot, start) = self.next_expiration()?;
         if level == 0 {
             return Some(start);
         }
-        // The earliest slot on the lowest occupied level holds the earliest entry: walk it, so
-        // a park waits for that entry and not for each cascade on the way down.
+        // The earliest slot on the lowest occupied level holds the earliest entry; its cached
+        // lower bound says when, in O(1), so a park waits for that entry and not for each
+        // cascade on the way down. A clamped entry's tick is past the slot's end: it is re-armed
+        // there at the latest.
         let end = start + (1 << (SLOT_BITS * level)) - 1;
-        let mut earliest = end;
-        let mut cursor = self.levels[level].head(slot);
-        while let Some(entry) = cursor {
-            // SAFETY: linked in this wheel, which the caller owns.
-            let state = unsafe { &*TimerEntry::state(entry) };
-            earliest = earliest.min(state.deadline_tick);
-            cursor = state.next;
-        }
+        let earliest = self.levels[level].min_tick(slot).min(end);
         Some(earliest.max(start))
     }
 
