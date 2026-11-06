@@ -132,6 +132,11 @@ fn is_coroutine(object: &Bound<'_, PyAny>) -> PyResult<bool> {
     if unsafe { ffi::PyCoro_CheckExact(object.as_ptr()) } != 0 {
         return Ok(true);
     }
+    // SAFETY: as above. A plain function (`s.spawn(work, ...)`) is never a coroutine: skip the
+    // ABC's `isinstance`, which costs more than the rest of a spawn.
+    if unsafe { ffi::PyFunction_Check(object.as_ptr()) } != 0 {
+        return Ok(false);
+    }
     let coroutine_abc = COROUTINE_ABC.import(object.py(), "collections.abc", "Coroutine")?;
     object.is_instance(coroutine_abc)
 }

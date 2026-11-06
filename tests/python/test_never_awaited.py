@@ -36,6 +36,7 @@ def steps_of(awaitable: Awaitable[Any]) -> Generator[Any, Any, Any]:
 
 # Each kind warns, naming the call and saying to add `await`
 
+
 #: (the call as the warning names it, a function making that awaitable inside a task)
 KINDS: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
     ("porto.sleep(...)", lambda: porto.sleep(0.01)),
@@ -43,6 +44,7 @@ KINDS: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
     ("Event.wait()", lambda: porto.Event().wait()),
     ("Notify.notified()", lambda: porto.Notify().notified()),
     ("Lock.acquire()", lambda: porto.Lock().acquire()),
+    ("Lock.__aenter__()", lambda: porto.Lock().__aenter__()),
     ("Mutex.__aenter__()", lambda: porto.Mutex(0).__aenter__()),
     ("Sender.send(...)", lambda: porto.channel[int](1)[0].send(1)),
     ("Receiver.recv()", lambda: porto.channel[int](1)[1].recv()),

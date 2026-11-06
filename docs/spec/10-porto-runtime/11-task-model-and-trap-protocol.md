@@ -191,8 +191,9 @@ A cancellable wait that does not resolve at once is registered with the task's i
 - **T4** A trap yielded by a coroutine **not** running inside a Porto task (e.g., awaited inside an asyncio Task on the facade) is handled by the facade (§22): the Trap implements `_asyncio_future_blocking` via a slow path.
 
 ## 6. Allocation strategy
-- **Trap:** freelist (pyclass `freelist`). Most hot primitives return *ready awaitables* that never allocate a Trap.
-- **Ready awaitable:** a single freelisted `_Ready` type holding the result. `__await__` returns self, and `__next__` raises `StopIteration(result)`. Use `am_send` to return `PYGEN_RETURN` directly with no StopIteration allocation.
+- **Trap:** freelist (pyclass `freelist`). Most hot primitives return *ready awaitables* that never allocate a Trap. On a GIL build `porto.checkpoint()` hands out one spare `Yield` trap again whenever nothing else references it (its reference count is the spare's own), reset to fresh: a checkpoint loop allocates nothing. Free-threaded builds allocate.
+- **Ready awaitable:** a single freelisted `_Ready` type holding the result. `__await__` returns self. Use `am_send` to return `PYGEN_RETURN` directly with no StopIteration allocation. From 3.12 the `SEND` opcode resumes a non-generator awaitable through `tp_iternext` instead, so `__next__` ends the iteration with no exception for a `None` result (one shared `_Ready(None)` serves every `None` completion), and raises `StopIteration(result)` otherwise; on a GIL build that is one spare exception raised again while nothing else references it, its value, arguments and raise state reset first.
+- **Slots:** `tp_iternext` and `am_await` of the hot awaitables (`_Trap`, `_Ready`, `_SyncWait`, the scope exit's `_ScopeExit`) are raw C functions rather than pyo3 trampolines; the Python-visible `__next__` and `__await__` do the same.
 - **Timer entries** for `Sleep` are embedded in the PyTask body (one active sleep per task), so there is no allocation.
 - **Waiter nodes** for sync primitives are embedded in the PyTask body (`wait_node`). A task waits on at most one thing at a time.
 

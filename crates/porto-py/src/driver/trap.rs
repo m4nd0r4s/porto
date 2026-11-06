@@ -30,7 +30,7 @@ use pyo3::prelude::*;
 use super::pending::{AbiFuture, IoWait, Kind, Payload, Pending};
 use super::pytask::{PyScopeRef, PyTask, Resume};
 use super::thin::{BoxedFuture, WaitTarget};
-use crate::async_slots::{guard_send, stop_iteration};
+use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
 use crate::throw_args::thrown_exception;
 
 /// Not awaited yet: the next resume suspends.
@@ -370,6 +370,49 @@ pub(crate) unsafe extern "C" fn trap_am_send(
         // SAFETY: `presult` is writable (am_send contract); it receives a new reference.
         unsafe { *presult = result };
         status
+    })
+}
+
+/// Building `_Trap` objects over the freelist without pyo3's generic path (`fast_new.rs`): the
+/// trap of every `porto.checkpoint()`.
+pub(crate) mod fast_new {
+    use pyo3::prelude::*;
+
+    use super::Trap;
+    use crate::driver::fast_new::FastNew;
+
+    static TRAPS: FastNew<Trap> = FastNew::new();
+
+    /// Enables [`object`]'s fast path if the layout allows it. Call it once from module init,
+    /// after the type's slots are installed.
+    pub(crate) fn init(py: Python<'_>) -> PyResult<()> {
+        TRAPS.init(py, Trap::yield_now())
+    }
+
+    /// `trap` as a new `_Trap` object.
+    pub(crate) fn object(py: Python<'_>, trap: Trap) -> PyResult<Py<Trap>> {
+        TRAPS.object(py, trap)
+    }
+}
+
+/// `tp_iternext` for `_Trap` (see `async_slots`): the same steps as `__next__`.
+///
+/// # Safety
+///
+/// CPython calls it as `tp_iternext` of `_Trap`, attached, with `slf` a live `_Trap`.
+pub(crate) unsafe extern "C" fn trap_iternext(slf: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    guard_next(|py| {
+        // SAFETY: `slf` is live for the call, and the slot is only installed on `_Trap`.
+        let slf = unsafe { Borrowed::from_ptr(py, slf) };
+        // SAFETY: see above.
+        let trap = unsafe { slf.cast_unchecked::<Trap>() };
+        match trap.get().resume(true) {
+            Step::Suspend => Ok(IterNext::Yield(slf.to_owned())),
+            // `next()` sends None, so the await evaluates to None.
+            Step::Complete => Ok(IterNext::Return(py.None().into_bound(py))),
+            Step::NotStarted => Err(not_started_error()),
+            Step::Reused => Err(reused_error()),
+        }
     })
 }
 

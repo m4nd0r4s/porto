@@ -5,6 +5,7 @@ A minimal driver steps coroutines with ``coro.send()``, as the Rust step driver 
 """
 
 import sys
+import sysconfig
 import types
 from collections.abc import Callable, Coroutine, Generator
 from itertools import repeat
@@ -343,9 +344,11 @@ def test_a_ready_resumed_through_am_send_allocates_nothing() -> None:
 
 
 # From 3.12 the SEND opcode resumes a non-generator awaitable with `tp_iternext` (for None) or its
-# `send` method, never `am_send`, so the await ends in a StopIteration: one allocation. On 3.11
-# SEND goes through PyIter_Send, hence am_send, and allocates nothing.
-NESTED_AWAIT_ALLOCATIONS = 0 if sys.version_info < (3, 12) else 1
+# `send` method, never `am_send`, so a value comes back in a StopIteration. A GIL build raises a
+# spare one again (py_compat/stop_iteration.rs): no allocation. A free-threaded build allocates
+# one per await. On 3.11 SEND goes through PyIter_Send, hence am_send, and allocates nothing.
+FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+NESTED_AWAIT_ALLOCATIONS = 1 if sys.version_info >= (3, 12) and FREE_THREADED else 0
 
 
 def test_a_nested_await_of_a_ready_allocates_at_most_the_stop_iteration() -> None:
@@ -354,6 +357,35 @@ def test_a_nested_await_of_a_ready_allocates_at_most_the_stop_iteration() -> Non
         lambda: run(await_ready_in_a_loop(ready)), lambda: run(loop_without_awaits())
     )
     assert allocations == NESTED_AWAIT_ALLOCATIONS
+
+
+def test_a_nested_await_of_a_none_ready_allocates_nothing() -> None:
+    # A `None` result ends the iteration with no exception at all, on every build.
+    ready = _core._make_ready(None)
+    allocations = per_await_allocations(
+        lambda: run(await_ready_in_a_loop(ready)), lambda: run(loop_without_awaits())
+    )
+    assert allocations == 0
+
+
+def test_a_stop_iteration_someone_holds_is_never_reused() -> None:
+    # The spare StopIteration is raised again only when nobody else references it: one caught
+    # and kept by user code keeps its value, traceback and arguments.
+    async def main() -> None:
+        first, second = object(), object()
+        steps = _core._make_ready(first).__await__()
+        try:
+            next(steps)
+        except StopIteration as stop:
+            kept = stop
+        assert kept.value is first
+        for _ in range(3):
+            assert await _core._make_ready(second) is second
+        assert kept.value is first
+        assert kept.args == (first,)
+        assert kept.__traceback__ is not None
+
+    run(main())
 
 
 def test_a_fresh_ready_per_await_comes_from_the_freelist() -> None:

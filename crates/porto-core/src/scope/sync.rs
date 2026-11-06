@@ -1,8 +1,11 @@
-//! The synchronization types of the scope tree: std's, or loom's when the loom models run.
+//! The synchronization types of the scope tree: std's (and the crate's short lock), or loom's
+//! when the loom models run.
 
 #[cfg(not(all(test, loom)))]
+pub(super) use crate::sync::primitives::{Mutex, MutexGuard};
+#[cfg(not(all(test, loom)))]
 pub(super) use std::sync::{
-    Arc, Mutex, MutexGuard,
+    Arc,
     atomic::{AtomicU8, AtomicU64},
 };
 

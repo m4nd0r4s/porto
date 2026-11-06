@@ -24,6 +24,8 @@ from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Event,
     Lock,
+    Mutex,
+    MutexGuard,
     Notify,
     Receiver,
     Scope,
@@ -37,7 +39,6 @@ from porto._core import (
     scope,
     sleep,
 )
-from porto._sync import Mutex, MutexGuard
 from porto.errors import (
     BrokenResourceError,
     Cancelled,

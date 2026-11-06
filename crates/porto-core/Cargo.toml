@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 num_cpus.workspace = true
+parking_lot.workspace = true
 # The I/O driver the lane polls at maintenance and parks in (12-scheduler-and-lanes.md §9).
 porto-io.workspace = true
 

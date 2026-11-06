@@ -4,7 +4,11 @@ Fair FIFO handoff, non-reentrant, cancel-safe. ``_interrupt(token, exc)`` throws
 waiting task the way cancellation will (porto-szb.36): the wait is given up first (T3).
 """
 
+import gc
+import re
+import sys
 import threading
+import warnings
 from collections.abc import Awaitable, Callable
 
 import pytest
@@ -376,13 +380,131 @@ def test_acquire_does_nothing_until_awaited() -> None:
         with pytest.warns(RuntimeWarning, match=r"Lock\.acquire\(\) was never awaited"):
             del not_awaited
         assert not lock.locked()
-        mutex = porto.Mutex(0)
-        entering = mutex.__aenter__()
-        with pytest.warns(RuntimeWarning, match=r"Mutex\.__aenter__\(\) was never awaited"):
-            del entering
-        assert not mutex.locked()
 
     porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_entering_a_free_lock_takes_it_when_awaited_without_suspending(kind: str) -> None:
+    # `async with` awaits `__aenter__()` in the same step: the free lock is taken on the first
+    # resume, which completes at once (porto-szb.115).
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+        entering = primitive.__aenter__()
+        assert not primitive.locked()
+        assert completes_at_once(entering)
+        assert primitive.locked()
+        await primitive.__aexit__(None, None, None)
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+@pytest.mark.parametrize("held", [False, True], ids=["free", "held"])
+def test_entering_takes_nothing_until_awaited(kind: str, held: bool) -> None:
+    # A dropped `__aenter__()` takes nothing, and warns like any forgotten await.
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+        if held:
+            async with primitive:
+                entering = primitive.__aenter__()
+        else:
+            entering = primitive.__aenter__()
+        assert not primitive.locked()
+        call = "Lock.__aenter__()" if kind == "lock" else "Mutex.__aenter__()"
+        with pytest.warns(RuntimeWarning, match=rf"{re.escape(call)} was never awaited"):
+            del entering
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+class RaisedAfterAenter(Exception):
+    """Raised by a profile hook as ``__aenter__()`` returns, before the block is entered."""
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="before 3.14 `async with` calls __aenter__ inside one opcode: no hook runs between",
+)
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_an_exception_between_aenter_and_the_block_leaves_the_lock_free(kind: str) -> None:
+    # From 3.14, `async with` calls `__aenter__` and awaits its result in separate opcodes, and
+    # `__aexit__` is only guaranteed from the block on: an exception in between (a profile or
+    # trace hook, a KeyboardInterrupt) must not leave the lock held forever.
+    def raise_once(_frame: object, event: str, arg: object) -> None:
+        if event == "c_return" and getattr(arg, "__name__", "") == "__aenter__":
+            sys.setprofile(None)
+            raise RaisedAfterAenter
+
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                sys.setprofile(raise_once)
+                async with primitive:
+                    pytest.fail("the block must not run")
+            except RaisedAfterAenter:
+                pass
+            finally:
+                sys.setprofile(None)
+            gc.collect()
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_a_cancelled_task_entering_a_free_lock_gets_cancelled_and_takes_nothing(
+    kind: str,
+) -> None:
+    # The fast path is a checkpoint (T2): a pending cancel is raised before the lock is taken.
+    primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+    events: list[str] = []
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.cancel()
+            try:
+                async with primitive:
+                    events.append("entered")
+            except porto.Cancelled:
+                events.append("cancelled")
+                raise
+        assert not primitive.locked()
+
+    porto.run(main)
+    assert events == ["cancelled"]
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_a_loop_of_uncontended_async_with_lets_other_tasks_run(kind: str) -> None:
+    # Each fast-path entry spends a unit of the budget (T2); once it is spent, the entry yields
+    # before it takes the lock, so the loop cannot starve the lane.
+    primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+    ticks: list[int] = []
+    budget = porto.RuntimeConfig().coop_budget
+
+    async def ticker() -> None:
+        while True:
+            ticks.append(1)
+            await porto.checkpoint()
+
+    async def main() -> int:
+        async with porto.scope() as s:
+            s.spawn(ticker)
+            await porto.checkpoint()
+            before = len(ticks)
+            for _ in range(4 * budget):
+                async with primitive:
+                    pass
+            s.cancel()
+        return len(ticks) - before
+
+    assert porto.run(main) > 0
+    assert not primitive.locked()
 
 
 def test_a_release_by_another_task_breaks_exclusion_and_the_holder_gets_the_error() -> None:
@@ -423,3 +545,21 @@ def test_acquire_then_gives_the_lock_back_if_its_callback_raises() -> None:
         assert not lock.locked()
 
     porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["Lock", "Mutex"])
+def test_aexit_with_the_wrong_arguments_is_a_type_error(kind: str) -> None:
+    primitive = porto.Lock() if kind == "Lock" else porto.Mutex(0)
+    exit_method: Callable[..., object] = primitive.__aexit__
+    with pytest.raises(
+        TypeError,
+        match=rf"{kind}\.__aexit__\(\) takes exactly 3 positional arguments "
+        r"\(exc_type, exc, traceback\), 2 given",
+    ):
+        exit_method(None, None)
+    with pytest.raises(TypeError, match="keyword arguments"):
+        exit_method(None, None, traceback=None)
+    unbound: Callable[..., object] = type(primitive).__aexit__
+    with pytest.raises(TypeError, match="doesn't apply to a 'object' object"):
+        unbound(object(), None, None, None)
+    assert not primitive.locked()

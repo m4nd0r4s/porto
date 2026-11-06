@@ -60,10 +60,10 @@ use pyo3::{ffi, intern};
 use super::lane;
 use super::pending::{Kind, Pending};
 use super::pytask::{CancelStack, PyScopeNode, PyScopeRef, PyTask, Resume, TaskOutcome};
-use super::ready::Ready;
+use super::ready::ready;
 use super::trap::{Trap, TrapKind};
 use crate::errors::Cancelled;
-use crate::py_compat::{Sent, names, send, take_exception};
+use crate::py_compat::{Sent, names, release_spare_value, send, take_exception};
 
 thread_local! {
     /// The task this lane is polling, null between polls.
@@ -154,17 +154,33 @@ impl Drop for RunningTask {
 /// back when this raises. The `YieldThen` result is always delivered: once the value is
 /// stashed, the coroutine gets it, and the cancellation comes at its next checkpoint.
 pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    if let Some(running) = running() {
-        if let Some(cancelled) = running_cancellation(py, running) {
-            return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
-        }
-        let budget = &running.budget;
-        match budget.get() {
-            0 => return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any()),
-            left => budget.set(left - 1),
+    if !proceed(py)? {
+        return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any());
+    }
+    // A `None` result is the shared `_Ready(None)`: no allocation.
+    ready(py, value)
+}
+
+/// The T2 decision of [`checkpoint_if_needed`] with no result object: raises `Cancelled` while
+/// the running task is cancelled (before spending anything), else spends one unit of its budget
+/// and returns `true`, or returns `false` if the budget was already spent (the caller then
+/// suspends instead of completing). Always `true` outside a porto task.
+#[inline]
+pub(crate) fn proceed(py: Python<'_>) -> PyResult<bool> {
+    let Some(running) = running() else {
+        return Ok(true);
+    };
+    if let Some(cancelled) = running_cancellation(py, running) {
+        return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
+    }
+    let budget = &running.budget;
+    match budget.get() {
+        0 => Ok(false),
+        left => {
+            budget.set(left - 1);
+            Ok(true)
         }
     }
-    Ok(Py::new(py, Ready::new(value))?.into_any())
 }
 
 /// T2 for a native awaitable that completed synchronously and suspends by itself: spends one
@@ -277,6 +293,9 @@ pub(super) fn poll(
         step_until_wait(task, &coro, &running, cx)
     };
     task.coro = Some(coro.unbind());
+    // The task gives the lane up: the last result an await returned through the spare
+    // `StopIteration` must not live on in it.
+    release_spare_value(py);
     match outcome {
         Some(outcome) => {
             let outcome = cancelled_by_its_scope(py, task, outcome);

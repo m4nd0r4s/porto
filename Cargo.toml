@@ -22,6 +22,9 @@ pyo3 = "0.30"
 pyo3-build-config = "0.30"
 # The epoll/kqueue/IOCP poller under porto-io. No `log`: porto reports through its own channels.
 mio = { version = "1.2.4", default-features = false, features = ["os-poll", "os-ext"] }
+# The short locks of porto's queues, scopes and task handles: one byte and a CAS, where std's
+# Mutex allocates a pthread mutex per lock on macOS (porto-itr.7). No `deadlock_detection`.
+parking_lot = { version = "0.12.5", default-features = false }
 # Physical core count for `lanes="auto"` (12-scheduler-and-lanes.md §7); std only knows logical.
 num_cpus = "1.17"
 # Property and model-based tests (dev only; 52-testing-strategy.md item 1).

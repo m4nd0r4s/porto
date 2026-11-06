@@ -1,9 +1,11 @@
-//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()` and `Lock.acquire()`
-//! (16-sync-primitives-and-channels.md §1).
+//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()`, `Lock.acquire()` and
+//! `async with` on a `Lock` or `Mutex` (16-sync-primitives-and-channels.md §1).
 //!
 //! Nothing happens until it is awaited, so a `notified()` created and never awaited consumes
-//! no permit, and an `acquire()` never awaited takes no lock. A grant is only ever taken in the step that hands it to the coroutine, so a task
-//! closed or cancelled at any suspension point cannot hold a grant it never saw:
+//! no permit, and an `acquire()` or `__aenter__()` never awaited takes no lock. A grant is only
+//! ever taken in the step that hands it to the coroutine, so a task closed or cancelled at any
+//! suspension point cannot hold a grant it never saw, and neither can one that an exception
+//! stops between calling `__aenter__` and awaiting it (3.14 runs hooks in between):
 //!
 //! - the first resume spends one unit of the task's budget (T2). If that ran the budget out,
 //!   it takes nothing: it yields a `Yield` trap and tries again on the next resume, after the
@@ -21,14 +23,18 @@
 
 use std::sync::Arc;
 
+use pyo3::PyTraverseError;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
+use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 
 use super::event::{EventSource, NotifySource};
 use super::lock::LockSource;
-use crate::async_slots::{guard_send, stop_iteration};
-use crate::driver::step::checkpoint_if_needed;
+use super::mutex::Mutex;
+use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
+use crate::driver::fast_new::FastNew;
+use crate::driver::step;
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
 use crate::throw_args::thrown_exception;
@@ -84,15 +90,26 @@ enum State {
     Done,
 }
 
+/// What the await evaluates to once the grant is taken, made in the same step.
+pub(super) enum Then {
+    /// `None`.
+    Nothing,
+    /// The result of calling this; if it raises, the grant is given back and the await raises
+    /// (`Lock._acquire_then`).
+    Call(Py<PyAny>),
+    /// A guard for the block that now holds this mutex (`Mutex.__aenter__`).
+    Guard(Py<Mutex>),
+}
+
 /// An awaitable wait on a sync primitive.
 #[pyclass(freelist = 256, module = "porto._core", name = "_SyncWait")]
 pub(crate) struct SyncWait {
     state: State,
     /// Whether it has been resumed: a first resume must send `None`.
     started: bool,
-    /// Called once the grant is taken, in the same step; the await evaluates to its result.
-    /// If it raises, the grant is given back and the await raises.
-    then: Option<Py<PyAny>>,
+    then: Then,
+    /// The call that returned this wait, as the user wrote it (for the never-awaited warning).
+    call: &'static str,
 }
 
 /// What one resume does.
@@ -104,45 +121,41 @@ enum Stepped {
 }
 
 impl SyncWait {
+    /// The wait of `wait()`, `notified()` or `acquire()`; the await evaluates to `None`.
     pub(super) fn new(grant: Grant) -> Self {
-        Self {
-            state: State::Trying(grant),
-            started: false,
-            then: None,
-        }
-    }
-
-    /// A wait that calls `then()` once granted and evaluates to its result.
-    pub(super) fn calling(grant: Grant, then: Py<PyAny>) -> Self {
-        Self {
-            state: State::Trying(grant),
-            started: false,
-            then: Some(then),
-        }
-    }
-
-    /// The call that returned this wait, as the user wrote it.
-    fn call_name(&self, grant: &Grant) -> &'static str {
-        match grant {
+        let call = match grant {
             Grant::EventSet(_) => "Event.wait()",
             Grant::Notified(_) => "Notify.notified()",
-            Grant::Locked(_) if self.then.is_some() => "Mutex.__aenter__()",
             Grant::Locked(_) => "Lock.acquire()",
+        };
+        Self::with(grant, Then::Nothing, call)
+    }
+
+    /// A wait for `grant` that `call` returned and that evaluates to `then`'s result.
+    pub(super) fn with(grant: Grant, then: Then, call: &'static str) -> Self {
+        Self {
+            state: State::Trying(grant),
+            started: false,
+            then,
+            call,
         }
+    }
+
+    /// This wait as a new `_SyncWait` object, over the freelist (`fast_new.rs`).
+    pub(super) fn into_object(self, py: Python<'_>) -> PyResult<Py<Self>> {
+        SYNC_WAITS.object(py, self)
     }
 
     /// The grant is taken: what the await evaluates to.
     fn granted(&mut self, py: Python<'_>, grant: &Grant) -> PyResult<Stepped> {
-        let Some(then) = self.then.take() else {
-            return Ok(Stepped::Return(py.None()));
+        let result = match std::mem::replace(&mut self.then, Then::Nothing) {
+            Then::Nothing => return Ok(Stepped::Return(py.None())),
+            Then::Call(then) => then.call0(py),
+            Then::Guard(mutex) => Mutex::guard(mutex.bind(py)).map(Py::into_any),
         };
-        match then.call0(py) {
-            Ok(result) => Ok(Stepped::Return(result)),
-            Err(error) => {
-                grant.give_back();
-                Err(error)
-            }
-        }
+        result
+            .map(Stepped::Return)
+            .inspect_err(|_| grant.give_back())
     }
 
     /// Resumes the awaitable with `sent`.
@@ -172,26 +185,37 @@ impl SyncWait {
     }
 }
 
+/// `_SyncWait` objects made without pyo3's generic path.
+static SYNC_WAITS: FastNew<SyncWait> = FastNew::new();
+
+/// Enables [`SyncWait::into_object`]'s fast path if the layout allows it. Call it once from
+/// module init, after the type's slots are installed.
+pub(super) fn init_fast_new(py: Python<'_>) -> PyResult<()> {
+    // A finished wait: dropping it does not warn.
+    let probe = SyncWait {
+        state: State::Done,
+        started: false,
+        then: Then::Nothing,
+        call: "",
+    };
+    SYNC_WAITS.init(py, probe)
+}
+
 /// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).
 impl Drop for SyncWait {
     fn drop(&mut self) {
-        if let State::Trying(grant) = &self.state
+        if let State::Trying(_) = &self.state
             && !self.started
         {
-            crate::unawaited::warn_never_awaited(self.call_name(grant));
+            crate::unawaited::warn_never_awaited(self.call);
         }
     }
 }
 
-/// Spends one unit of the running task's budget (T2); whether that ran it out.
-///
-/// `checkpoint_if_needed` is the step loop's one budget entry point: what it returns is a
-/// `YieldThen` trap exactly when the budget ran out. That trap is dropped unawaited; the caller
-/// yields a trap of its own.
+/// Spends one unit of the running task's budget (T2); whether it was already spent. Raises
+/// `Cancelled` instead while the task is cancelled (C1).
 fn budget_ran_out(py: Python<'_>) -> PyResult<bool> {
-    Ok(checkpoint_if_needed(py, py.None())?
-        .bind(py)
-        .is_exact_instance_of::<Trap>())
+    Ok(!step::proceed(py)?)
 }
 
 /// Yields a trap for `kind` to the driver.
@@ -233,9 +257,10 @@ impl SyncWait {
         slf.clone().unbind()
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match self.resume(py, &py.None().into_bound(py))? {
-            Stepped::Yield(trap) => Ok(trap),
+            Stepped::Yield(trap) => Ok(Some(trap)),
+            Stepped::Return(value) if value.is_none(py) => Ok(None),
             Stepped::Return(value) => Err(stop_iteration(value.into_bound(py))),
         }
     }
@@ -263,6 +288,19 @@ impl SyncWait {
 
     fn close(&mut self) {
         self.state = State::Done;
+    }
+
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        match &self.then {
+            Then::Nothing => Ok(()),
+            Then::Call(then) => visit.call(then),
+            Then::Guard(mutex) => visit.call(mutex),
+        }
+    }
+
+    fn __clear__(&mut self) {
+        let then = std::mem::replace(&mut self.then, Then::Nothing);
+        drop(then);
     }
 
     fn __repr__(&self) -> &'static str {
@@ -308,5 +346,24 @@ pub(crate) unsafe extern "C" fn sync_wait_am_send(
         // SAFETY: `presult` is writable (am_send contract); it receives a new reference.
         unsafe { *presult = result.into_ptr() };
         status
+    })
+}
+
+/// `tp_iternext` for `_SyncWait` (see `async_slots`): the same steps as `__next__`.
+///
+/// # Safety
+///
+/// CPython calls it as `tp_iternext` of `_SyncWait`, attached, with `slf` a live `_SyncWait`.
+pub(crate) unsafe extern "C" fn sync_wait_iternext(slf: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    guard_next(|py| {
+        // SAFETY: `slf` is live for the call, and the slot is only installed on `_SyncWait`.
+        let wait = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<SyncWait>() };
+        let mut wait = wait
+            .try_borrow_mut()
+            .map_err(|_| concurrent_resume_error())?;
+        Ok(match wait.resume(py, &py.None().into_bound(py))? {
+            Stepped::Yield(trap) => IterNext::Yield(trap.into_bound(py)),
+            Stepped::Return(value) => IterNext::Return(value.into_bound(py)),
+        })
     })
 }
