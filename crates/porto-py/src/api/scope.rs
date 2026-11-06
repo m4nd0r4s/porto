@@ -13,7 +13,9 @@
 //! `Scope.cancel()` cancels the node, from any thread (C10): the tasks in it and in the scopes
 //! nested in it get `Cancelled` at their next checkpoint, and the waiting ones are woken
 //! (`step.rs`). A `Cancelled` the body lets out is absorbed at the exit when this scope itself
-//! is cancelled (C3, `cancelled_caught`); one from an enclosing scope goes on.
+//! is cancelled (C3, `cancelled_caught`); one from an enclosing scope goes on. A child ended by
+//! this scope's cancel counts as absorbed too (Trio's rule: a `Cancelled` counts for the scope
+//! whose cancel raised it), so `cancelled_caught` is true when only the children were reached.
 //!
 //! Not yet: deadlines and timeouts (C9), shields (C8), names, `start()` (§3), `Task.cancel()` and
 //! awaiting a task (§4), and spawning from other lanes or threads (C10).
@@ -233,7 +235,8 @@ impl Scope {
             || self.has(ScopeFlags::CANCEL_REQUESTED)
     }
 
-    /// Whether the exit absorbed a `Cancelled` this scope's cancellation raised (C3).
+    /// Whether the exit absorbed a `Cancelled` this scope's cancellation raised (C3), in the body
+    /// or in a child task.
     #[getter]
     fn cancelled_caught(&self) -> bool {
         self.has(ScopeFlags::CANCELLED_CAUGHT)
@@ -366,16 +369,15 @@ impl Scope {
 
     /// Closes the scope and raises the children's failures, after `exc` unless the scope
     /// absorbs it. Returns whether it absorbs `exc`: a `Cancelled` while this scope itself is
-    /// cancelled (C3; one from an enclosing scope's cancellation goes on).
+    /// cancelled (C3; one from an enclosing scope's cancellation goes on). `cancelled_caught`
+    /// turns true then, or when a child ended by this scope's cancel was dropped here.
     pub(super) fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         let py = exc.py();
+        let node = self.node.get();
         let absorbed = !exc.is_none()
             && exc.is_instance_of::<Cancelled>()
-            && self
-                .node
-                .get()
-                .is_some_and(|node| node.cancel_called().is_some());
-        if absorbed {
+            && node.is_some_and(|node| node.cancel_called().is_some());
+        if absorbed || node.is_some_and(|node| node.lock_state().cancel_absorbed) {
             self.flags
                 .fetch_or(ScopeFlags::CANCELLED_CAUGHT, Ordering::AcqRel);
         }

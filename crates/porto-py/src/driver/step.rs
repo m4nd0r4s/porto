@@ -307,16 +307,22 @@ pub(super) fn poll(
 }
 
 /// `outcome`, or `Cancelled` if it is a `porto.Cancelled` raised while the task's scope is
-/// cancelling: the cancellation ended the task, which did not fail (spec 11 §4).
+/// cancelling: the cancellation ended the task, which did not fail (spec 11 §4). The scope
+/// whose cancel that was learns it absorbed one (C3, `cancelled_caught`): the one the walk
+/// reaches first, so an enclosing scope's cancel counts for the enclosing scope, as in Trio.
 fn cancelled_by_its_scope(py: Python<'_>, task: &PyTask, outcome: TaskOutcome) -> TaskOutcome {
     match outcome {
-        TaskOutcome::Err(exception)
-            if exception.bind(py).is_instance_of::<Cancelled>()
-                && task
-                    .innermost_scope()
-                    .is_some_and(|scope| scope.effective_cancellation().is_some()) =>
-        {
-            TaskOutcome::Cancelled(Some(exception))
+        TaskOutcome::Err(exception) if exception.bind(py).is_instance_of::<Cancelled>() => {
+            let cause = task
+                .innermost_scope()
+                .and_then(|scope| scope.effective_cancellation());
+            match cause {
+                Some(cause) => {
+                    cause.scope.lock_state().cancel_absorbed = true;
+                    TaskOutcome::Cancelled(Some(exception))
+                }
+                None => TaskOutcome::Err(exception),
+            }
         }
         outcome => outcome,
     }

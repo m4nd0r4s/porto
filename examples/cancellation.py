@@ -63,8 +63,9 @@ async def first_answer_wins() -> str:
     async with porto.scope() as s:
         for mirror, seconds in [("eu", 0.03), ("us", 0.01), ("asia", 5.0)]:
             s.spawn(ask, mirror, seconds, s)
-        await porto.sleep(10)  # the body waits too; the cancel ends the wait
-    # The cancel was ours, and the exit absorbed the Cancelled it raised in the body.
+        # The body is done; the exit waits for the race.
+    # The cancel was ours, and it ended the losers: the scope absorbed their Cancelled, so
+    # cancelled_caught is true although the body itself was never cancelled.
     assert s.cancel_called and s.cancelled_caught
     return answers[0]
 
