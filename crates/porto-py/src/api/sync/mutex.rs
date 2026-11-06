@@ -10,7 +10,9 @@
 //! while the lock is held for its block. Only the current guard reaches the value. The value is
 //! read and replaced in the mutex's critical section (`with_critical_section`: nothing on a GIL
 //! build, where being attached already serializes them; the object's lock on 3.14t), so a guard
-//! shared between threads by mistake cannot tear it.
+//! shared between threads by mistake cannot tear it. The guard checks the generation, and the
+//! exit bumps it, in that same section: an access that found its guard current finishes before
+//! the block's exit releases the lock.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -48,22 +50,34 @@ pub(super) struct Mutex {
 }
 
 impl Mutex {
-    /// A new reference to the value.
-    fn value(slf: &Bound<'_, Self>) -> Py<PyAny> {
+    /// A new reference to the value, if `generation` is current (else `None`).
+    fn value(slf: &Bound<'_, Self>, generation: u64) -> Option<Py<PyAny>> {
         let py = slf.py();
+        let this = slf.get();
         with_critical_section(slf.as_any(), || {
-            // SAFETY: in the critical section (see `ValueCell`); only a shared read.
-            unsafe { (*slf.get().value.0.get()).clone_ref(py) }
+            // In the section, so no exit can end the block between the check and the read.
+            (this.generation.load(Ordering::Relaxed) == generation)
+                // SAFETY: in the critical section (see `ValueCell`); only a shared read.
+                .then(|| unsafe { (*this.value.0.get()).clone_ref(py) })
         })
     }
 
-    /// Replaces the value; returns the old one, for the caller to drop outside the critical
-    /// section (dropping an object can run arbitrary code).
-    fn replace_value(slf: &Bound<'_, Self>, value: Py<PyAny>) -> Py<PyAny> {
+    /// Replaces the value if `generation` is current; returns the old one, for the caller to
+    /// drop outside the critical section (dropping an object can run arbitrary code), or gives
+    /// `value` back if the generation is not current.
+    fn replace_value(
+        slf: &Bound<'_, Self>,
+        generation: u64,
+        value: Py<PyAny>,
+    ) -> Result<Py<PyAny>, Py<PyAny>> {
+        let this = slf.get();
         with_critical_section(slf.as_any(), || {
+            if this.generation.load(Ordering::Relaxed) != generation {
+                return Err(value);
+            }
             // SAFETY: in the critical section (see `ValueCell`), which excludes every other
             // access for this write.
-            unsafe { std::mem::replace(&mut *slf.get().value.0.get(), value) }
+            Ok(unsafe { std::mem::replace(&mut *this.value.0.get(), value) })
         })
     }
 
@@ -82,9 +96,13 @@ impl Mutex {
 
     /// The end of the block: its guard stops working before another task can take the lock,
     /// then the lock is released and the exit's checkpoint runs (`release_then_checkpoint`).
-    fn exit(&self, py: Python<'_>, exc: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        release_then_checkpoint(py, &self.lock, exc)
+    fn exit(slf: &Bound<'_, Self>, exc: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let this = slf.get();
+        // In the section, so a guard that checked the generation finishes its access first.
+        with_critical_section(slf.as_any(), || {
+            this.generation.fetch_add(1, Ordering::Relaxed);
+        });
+        release_then_checkpoint(slf.py(), &this.lock, exc)
     }
 
     /// The guard for the block that now holds the lock.
@@ -209,7 +227,7 @@ unsafe extern "C" fn mutex_aexit(
         let [_, exc, _] = unsafe { raw_methods::aexit_args(py, c"Mutex.__aexit__", args, nargs)? };
         // SAFETY: the caller's contract (the method descriptor checked the type).
         let mutex = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<Mutex>() };
-        mutex.get().exit(py, &exc)
+        Mutex::exit(&mutex, &exc)
     })
 }
 
@@ -221,19 +239,13 @@ pub(super) struct MutexGuard {
     generation: u64,
 }
 
-impl MutexGuard {
-    /// The mutex, if this guard's block is still open.
-    fn held<'py>(&self, py: Python<'py>) -> PyResult<&Bound<'py, Mutex>> {
-        let mutex = self.mutex.bind(py);
-        if mutex.get().generation.load(Ordering::Acquire) == self.generation {
-            return Ok(mutex);
-        }
-        Err(PyRuntimeError::new_err(
-            "porto: this Mutex guard was used after its `async with` block exited; the value is \
-             only reachable while the lock is held, so use it inside the block (or enter the \
-             mutex again)",
-        ))
-    }
+/// The error for a guard used after its block exited.
+fn released_error() -> PyErr {
+    PyRuntimeError::new_err(
+        "porto: this Mutex guard was used after its `async with` block exited; the value is \
+         only reachable while the lock is held, so use it inside the block (or enter the \
+         mutex again)",
+    )
 }
 
 #[pymethods]
@@ -241,15 +253,22 @@ impl MutexGuard {
     /// The value the mutex owns.
     #[getter]
     fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(Mutex::value(self.held(py)?))
+        Mutex::value(self.mutex.bind(py), self.generation).ok_or_else(released_error)
     }
 
     /// Replaces the value the mutex owns.
     #[pyo3(signature = (value, /))]
     fn set(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
-        let old = Mutex::replace_value(self.held(py)?, value);
-        drop(old);
-        Ok(())
+        match Mutex::replace_value(self.mutex.bind(py), self.generation, value) {
+            Ok(old) => {
+                drop(old);
+                Ok(())
+            }
+            Err(value) => {
+                drop(value);
+                Err(released_error())
+            }
+        }
     }
 
     /// `MutexGuard[int]` at runtime, for annotations that are evaluated.
@@ -266,10 +285,9 @@ impl MutexGuard {
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let Ok(mutex) = self.held(py) else {
+        let Some(value) = Mutex::value(self.mutex.bind(py), self.generation) else {
             return Ok("<porto.MutexGuard released>".to_owned());
         };
-        let value = Mutex::value(mutex);
         Ok(format!(
             "<porto.MutexGuard value={}>",
             value.bind(py).repr()?
