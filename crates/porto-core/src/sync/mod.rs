@@ -25,6 +25,7 @@
 //!   `blocking_*` method. On a lane thread it returns [`BlockingOnLane`] instead of stalling
 //!   the lane.
 //! - [`mpsc`]: bounded and unbounded multi-producer multi-consumer channels.
+//! - [`SetOnce`]: an `Arc` set at most once and read with one atomic load.
 //!
 //! The grant-versus-cancel race is model-checked with [loom](https://docs.rs/loom):
 //!
@@ -39,6 +40,7 @@ pub mod mpsc;
 mod mutex;
 mod notify;
 pub(crate) mod primitives;
+mod set_once;
 mod wait_queue;
 
 #[cfg(all(test, not(loom)))]
@@ -67,4 +69,5 @@ pub use event::{Event, EventWait};
 pub use join_waiters::JoinWaiters;
 pub use mutex::{Mutex, MutexGuard, MutexLock};
 pub use notify::{Notified, Notify};
+pub use set_once::SetOnce;
 pub use wait_queue::{Locked, Wait, WaitNode, WaitQueue, WaitState};
