@@ -86,7 +86,7 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 | Free-threaded | N > 1 | all N | — |
 | Free-threaded, GIL-degraded (§8) | N | lane 0 | 1..N-1 |
 
-`"auto"` = number of physical cores (fallback: logical), capped at 64. On GIL builds `"auto"` resolves to `min(2, cores)`, because Python cannot use more.
+`"auto"` = number of physical cores (fallback: logical), capped at 64. On GIL builds `"auto"` resolves to `min(2, cores)`, because Python cannot use more. Until multi-lane scheduling lands (M2), `porto.run` accepts `"auto"` and runs on one lane, while an int above 1 raises `NotImplementedError` (`20`). Code that passes `"auto"` gets more lanes once M2 lands, with no change.
 
 ## 8. GIL-degraded mode (ST-6)
 - At runtime start on a free-threaded build, the runtime installs a `sys.meta_path` finder wrapper. After each extension-module import, it checks `sys._is_gil_enabled()`.

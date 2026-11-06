@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import sysconfig
+import threading
 import warnings
 from typing import Any
 
@@ -172,6 +173,31 @@ def test_run_refuses_more_than_one_lane_from_the_environment(
     assert porto.run(answer, lanes=1) == 42
     with pytest.raises(NotImplementedError, match=r"lanes=2 is not supported yet"):
         porto.run(answer, lanes=2)
+
+
+def test_run_accepts_auto_lanes_from_every_source_and_runs_on_one_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # "auto" is porto's choice: one lane until multi-lane scheduling lands, more after, with
+    # no change for the caller. Every task runs on the calling thread for now.
+    async def main() -> set[int]:
+        threads: set[int] = set()
+
+        async def child() -> None:
+            await porto.sleep(0)
+            threads.add(threading.get_ident())
+
+        async with porto.scope() as s:
+            for _ in range(8):
+                s.spawn(child)
+        threads.add(threading.get_ident())
+        return threads
+
+    here = {threading.get_ident()}
+    assert porto.run(main, lanes="auto") == here
+    assert porto.run(main, config=porto.RuntimeConfig(lanes="auto")) == here
+    monkeypatch.setenv("PORTO_LANES", "auto")
+    assert porto.run(main) == here
 
 
 def test_run_refuses_a_refused_lane_count_without_a_never_awaited_warning() -> None:
