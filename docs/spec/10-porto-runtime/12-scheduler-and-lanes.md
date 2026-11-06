@@ -99,7 +99,7 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 ## 9. Parking & the driver
 - There is exactly one driver per runtime (§13). At most one parked lane at a time **owns the driver** (`driver_lock: TryLock`). It blocks in `epoll_wait` with a timeout equal to the next timer deadline. Other parked lanes block on their futex.
 - On `unpark(lane)`: if that lane owns the driver, wake the driver via its waker (eventfd/kqueue user event). Otherwise, wake the futex.
-- Maintenance (`event_interval`) polls the driver non-blocking (timeout 0) if no lane is currently blocked in it.
+- Maintenance (`event_interval`) polls the driver non-blocking (timeout 0) if no lane is currently blocked in it and anything is registered with it (`Driver::has_registrations`). With no registration there is no event to find, and an empty poll is a syscall (about 12 µs for `kevent` on macOS, against tens of nanoseconds per task). A wake of the driver's waker left pending meanwhile makes the next park return at once.
 - No wake is lost between a lane deciding to park and a wake from another thread. Each lane has a parking word, EMPTY, PARKED or NOTIFIED (Tokio's parker). A waker publishes its work, then swaps the word to NOTIFIED, and unparks the lane (thread or driver waker) only if the word was PARKED. The lane moves EMPTY to PARKED with a compare-exchange before it blocks. If it finds NOTIFIED instead, it consumes it with a swap (never a store, which could erase a second waker's notification) and looks at its queues again. A loom model covers this (`sched::loom_tests`).
 
 ## 10. Cooperative budget

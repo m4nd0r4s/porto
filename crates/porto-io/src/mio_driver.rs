@@ -82,11 +82,6 @@ impl MioDriver {
         Ok((Self::new()?, selection.fallback))
     }
 
-    /// The slots holding each registration's readiness, for the tasks that wait on it.
-    pub const fn slab(&self) -> &IoSlab {
-        &self.slab
-    }
-
     fn sources(&self) -> std::sync::MutexGuard<'_, HashMap<RegistrationId, RawOsHandle>> {
         self.sources.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -147,6 +142,10 @@ impl Driver for MioDriver {
 
     fn waker(&self) -> &DriverWaker {
         &self.waker
+    }
+
+    fn slab(&self) -> &IoSlab {
+        &self.slab
     }
 
     fn kind(&self) -> DriverKind {

@@ -75,12 +75,21 @@ pub struct ReadyEvent {
     ready: Ready,
     tick: usize,
     generation: usize,
+    /// The registration was released: closed, deregistered, or the driver shut down.
+    released: bool,
 }
 
 impl ReadyEvent {
     /// The readiness observed, restricted to the waiter's interest.
     pub const fn ready(self) -> Ready {
         self.ready
+    }
+
+    /// Whether the registration was released (closed, deregistered, or its driver shut down)
+    /// rather than observed ready: its readiness is then [`Ready::CLOSED`] and no operation on
+    /// it can succeed.
+    pub const fn is_released(self) -> bool {
+        self.released
     }
 
     /// The same event, restricted to `ready`, to clear only part of it (one direction of a
@@ -99,6 +108,7 @@ impl ReadyEvent {
             ready: Ready::from_bits_truncate(Ready::CLOSED.bits() & mask.bits()),
             tick: 0,
             generation,
+            released: true,
         }
     }
 }
@@ -227,6 +237,7 @@ impl ScheduledIo {
             ready: Ready::EMPTY,
             tick: unpack_tick(word),
             generation: id.generation(),
+            released: false,
         })
     }
 
@@ -328,6 +339,7 @@ fn event_if_ready(word: usize, id: RegistrationId, mask: Ready) -> Option<ReadyE
         ready,
         tick: unpack_tick(word),
         generation: id.generation(),
+        released: false,
     })
 }
 

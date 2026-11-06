@@ -7,6 +7,11 @@
 //! Detaching around parks lets other Python threads run, and on free-threaded builds lets a
 //! stop-the-world GC proceed.
 //!
+//! Each run owns an I/O driver (the `io_backend` the config selects, through mio): the idle lane
+//! blocks in its `turn` until the next timer is due, detached, and a wake from another thread
+//! (a spawn, an `Event.set()`, any wake of a task) interrupts it through the driver's
+//! waker (12-scheduler-and-lanes.md §9).
+//!
 //! The lane also keeps what belongs to one run and must not outlive it: an error that stops the
 //! run (see [`fail`]), the interrupts a test hook files for waiting tasks (see [`interrupt`]),
 //! and the wakers of tasks whose wait would otherwise keep them alive forever once the run ends
@@ -17,6 +22,7 @@ use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::pin::pin;
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -24,7 +30,8 @@ use porto_core::config::RuntimeConfig;
 use porto_core::task::Header;
 use porto_core::time::{Deadline, sleep_until};
 use porto_core::{Handle, ParkHook, Runtime};
-use pyo3::exceptions::PyBaseException;
+use porto_io::MioDriver;
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyRuntimeWarning};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
@@ -88,20 +95,27 @@ struct LaneState {
 }
 
 /// Runs `body` with a fresh single-lane Python runtime configured by `config` (of which it uses
-/// `timer_resolution` and `coop_budget`), on this (attached) thread. The runtime is dropped
-/// before returning, still attached, so the tasks it frees release their Python objects
-/// directly. Then every task still in a linked wait (a join, a sync primitive, a scope exit) is
-/// cancelled: its wait is given up and its coroutine closed (spec 11 §3.2), so no task of the
-/// run outlives it.
+/// `io_backend`, `io_backend_strict`, `timer_resolution` and `coop_budget`), on this
+/// (attached) thread. The runtime is dropped before returning, still attached, so the tasks it
+/// frees release their Python objects directly. Then every task still in a linked wait (a join,
+/// a sync primitive, a scope exit) is cancelled: its wait is given up and its coroutine closed
+/// (spec 11 §3.2), so no task of the run outlives it.
+///
+/// # Errors
+///
+/// When the I/O driver cannot be opened: the `io_backend` is unavailable and
+/// `io_backend_strict` is set (`RuntimeError`), or the OS refused the poller (`OSError`). A
+/// `RuntimeWarning` for an unavailable `io_backend` that fell back, if warnings are errors.
 pub(crate) fn run<T>(
-    _attached: Python<'_>,
+    py: Python<'_>,
     config: &RuntimeConfig,
     body: impl FnOnce(&Runtime) -> T,
-) -> T {
+) -> PyResult<T> {
     let runtime = Runtime::builder()
         .park_hook(DetachWhileParked)
         .timer_resolution(config.timer_resolution())
         .coop_budget(config.coop_budget())
+        .driver(open_driver(py, config)?)
         .build();
     let output = {
         let _lane = OnPythonLane::enter();
@@ -113,7 +127,34 @@ pub(crate) fn run<T>(
     // Python code that may reach the lane state again.
     let state = LANE.take();
     drop(state);
-    output
+    Ok(output)
+}
+
+/// The I/O driver `config` selects, after warning about a fallback from an unavailable
+/// `io_backend`.
+fn open_driver(py: Python<'_>, config: &RuntimeConfig) -> PyResult<Arc<MioDriver>> {
+    let (driver, fallback) = MioDriver::open(config.io_backend_config()).map_err(|error| {
+        match error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<porto_io::UnavailableBackend>())
+        {
+            Some(unavailable) => PyRuntimeError::new_err(format!("porto: {unavailable}")),
+            None => PyErr::from(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "porto: could not open the I/O driver ({error}); the runtime needs one \
+                     poller and one wake handle: raise the open-file limit (`ulimit -n`) or \
+                     close unused files"
+                ),
+            )),
+        }
+    })?;
+    if let Some(fallback) = fallback {
+        let message = std::ffi::CString::new(format!("porto: {fallback}"))
+            .expect("the warning has no NUL byte");
+        PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &message, 1)?;
+    }
+    Ok(Arc::new(driver))
 }
 
 /// Whether this thread is running a Python lane.

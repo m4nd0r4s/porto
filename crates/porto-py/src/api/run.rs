@@ -83,6 +83,7 @@ fn run_in_root_scope(
 ) -> PyResult<Py<PyAny>> {
     let py = coro.py();
     let cancel_timeout = config.cancel_timeout();
+    let unstarted = coro.clone();
     let (outcome, errors) = lane::run(py, config, |runtime| {
         // Owned by no task: nobody enters or exits it.
         let node = PyScopeNode::new_root(0);
@@ -106,7 +107,12 @@ fn run_in_root_scope(
             warn_abandoned(py, abandoned.get(), cancel_timeout)?;
         }
         PyResult::Ok((outcome, root.get().close()))
-    })?;
+    })
+    .inspect_err(|_| {
+        // The runtime did not start (its I/O driver did not open): close the coroutine, so
+        // the caller sees that error and no "never awaited" warning.
+        close_coroutine(&unstarted);
+    })??;
     root_outcome(py, outcome, errors)
 }
 
@@ -236,10 +242,16 @@ fn private_run(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     }
     expect_coroutine(&coro, "_run")?;
     let py = coro.py();
+    let unstarted = coro.clone();
     let outcome = lane::run(py, &RuntimeConfig::default(), |runtime| {
         let main = pytask::spawn(runtime.handle(), coro, Spawned::Joined)?;
         PyResult::Ok(runtime.block_on(lane::main_or_interrupt(pytask::join(main))))
-    })?;
+    })
+    .inspect_err(|_| {
+        // The runtime did not start (its I/O driver did not open): close the coroutine, so
+        // the caller sees that error and no "never awaited" warning.
+        close_coroutine(&unstarted);
+    })??;
     outcome.into_result(py)
 }
 

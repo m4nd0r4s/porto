@@ -5,6 +5,10 @@
 //! it consumed with [`ScheduledIo::clear_readiness`] and retries. See
 //! [13-io-driver.md](https://github.com/m4nd0r4s/porto/blob/main/docs/spec/10-porto-runtime/13-io-driver.md).
 //!
+//! A [`Registration`] owns a registered source for its whole life: it deregisters on drop,
+//! and its `close` wakes every waiter with a [`ClosedResource`] error and closes the handle
+//! once the operations using it are done (§4).
+//!
 //! This crate MUST build and pass its tests without Python (rule A1).
 //!
 //! ```
@@ -23,9 +27,12 @@
 //! ```
 
 mod backend;
+mod close_gate;
 mod driver;
 mod mio_driver;
+mod primitives;
 mod ready;
+mod registration;
 mod scheduled_io;
 mod slab;
 mod waiters;
@@ -40,5 +47,6 @@ pub use backend::{
 pub use driver::{Driver, DriverKind, DriverWaker, RawOsHandle, RawSource, RegistrationId};
 pub use mio_driver::MioDriver;
 pub use ready::{Interest, Ready};
+pub use registration::{ClosedResource, IoSource, Registration, RegistrationReadiness, SourceRef};
 pub use scheduled_io::{Direction, Readiness, ReadyEvent, ScheduledIo};
 pub use slab::IoSlab;

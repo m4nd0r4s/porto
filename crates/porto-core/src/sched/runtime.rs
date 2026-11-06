@@ -88,8 +88,9 @@ impl Builder {
         self
     }
 
-    /// Gives the runtime an I/O driver (`13-io-driver.md`). The lane polls it without
-    /// blocking every 61 tasks and before parking, and parks in it (unparks wake it). A
+    /// Gives the runtime an I/O driver (`13-io-driver.md`). While anything is registered with
+    /// it, the lane polls it without blocking every 61 tasks and before parking; it always
+    /// parks in it (unparks wake it). A
     /// custom [`clock`](Builder::clock) is then only read, not parked on: the driver waits in
     /// wall-clock time.
     ///

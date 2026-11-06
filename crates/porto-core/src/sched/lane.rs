@@ -3,8 +3,9 @@
 //! The lane-owned half lives here and is touched only by the thread running the lane; what
 //! other threads reach is in `shared`. Each turn of the loop is one *tick*:
 //!
-//! - every [`EVENT_INTERVAL`] ticks, *maintenance*: poll the I/O driver without blocking, fire
-//!   the expired timers, and run the work deferred to this lane;
+//! - every [`EVENT_INTERVAL`] ticks, *maintenance*: poll the I/O driver without blocking (if
+//!   anything is registered with it), fire the expired timers, and run the work deferred to
+//!   this lane;
 //! - every [`GLOBAL_QUEUE_INTERVAL`] ticks the injector is tried before the local queue, so
 //!   tasks that keep waking themselves on the lane cannot starve wakes from other threads;
 //! - otherwise the local queue, then a batch from the injector.
@@ -134,7 +135,7 @@ impl Lane {
     /// Polls the driver without blocking, fires the expired timers and runs the deferred work.
     /// Returns whether any of it did something: woken tasks are on the local queue by then.
     pub(crate) fn maintenance(&self) -> bool {
-        let events = self.turn_driver(Some(Duration::ZERO));
+        let events = self.poll_driver();
         let fired = self.fire_expired_timers();
         let deferred = self.run_deferred();
         events + fired + deferred > 0
@@ -154,6 +155,17 @@ impl Lane {
             panic::resume_unwind(payload);
         }
         ran
+    }
+
+    /// Polls the driver without blocking, unless nothing is registered with it: then it has no
+    /// event to report, and the poll would only cost a syscall (an empty `kevent` is about
+    /// 12 µs on macOS, against tens of nanoseconds per task). A pending wake of its waker is
+    /// consumed by the next park instead, which then returns at once.
+    fn poll_driver(&self) -> usize {
+        match &self.shared().driver {
+            Some(driver) if driver.has_registrations() => self.turn_driver(Some(Duration::ZERO)),
+            _ => 0,
+        }
     }
 
     /// Turns the driver for at most `timeout`, dispatching readiness (the woken tasks land on

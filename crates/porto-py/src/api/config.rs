@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use porto_core::config::{Lanes, RuntimeConfig, physical_cores};
+use porto_core::config::{IoBackend, Lanes, RuntimeConfig, physical_cores};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -24,9 +24,9 @@ static RESOLVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 /// `config` over the `PORTO_*` variables over the defaults. Raises what `RuntimeConfig` raises
 /// for an invalid value.
 ///
-/// The M1 single-lane runtime uses `timer_resolution`, `coop_budget` and `cancel_timeout` (how
-/// long `porto.run` waits for the root scope's tasks, C12) only; the other fields are checked
-/// (in Python) and not carried yet.
+/// The M1 single-lane runtime uses `io_backend`, `io_backend_strict`, `timer_resolution`,
+/// `coop_budget` and `cancel_timeout` (how long `porto.run` waits for the root scope's tasks,
+/// C12) only; the other fields are checked (in Python) and not carried yet.
 pub(crate) fn resolve(
     py: Python<'_>,
     config: Option<&Bound<'_, PyAny>>,
@@ -58,7 +58,21 @@ pub(crate) fn resolve(
         .getattr(pyo3::intern!(py, "cancel_timeout"))?
         .extract()?;
     let cancel_timeout = Duration::try_from_secs_f64(cancel_timeout).unwrap_or(Duration::MAX);
+    let io_backend: String = resolved
+        .getattr(pyo3::intern!(py, "io_backend"))?
+        .extract()?;
+    let io_backend: IoBackend =
+        io_backend
+            .parse()
+            .map_err(|error: porto_core::config::UnknownName| {
+                PyValueError::new_err(error.to_string())
+            })?;
+    let io_backend_strict: bool = resolved
+        .getattr(pyo3::intern!(py, "io_backend_strict"))?
+        .extract()?;
     RuntimeConfig::builder()
+        .io_backend(io_backend)
+        .io_backend_strict(io_backend_strict)
         .timer_resolution(Duration::from_secs_f64(timer_resolution))
         .coop_budget(coop_budget)
         .cancel_timeout(cancel_timeout)
