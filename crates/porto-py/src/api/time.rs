@@ -27,7 +27,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction]
 fn checkpoint() -> PyResult<Trap> {
     require_lane("checkpoint")?;
-    Ok(Trap::yield_now())
+    Ok(Trap::yield_now().watched())
 }
 
 /// `porto.sleep(seconds)`: an awaitable that resumes the task `seconds` from now, never earlier.
@@ -36,7 +36,7 @@ fn checkpoint() -> PyResult<Trap> {
 #[pyo3(signature = (seconds, /))]
 fn sleep(seconds: f64) -> PyResult<Trap> {
     require_lane("sleep")?;
-    sleep_trap(seconds)
+    Ok(sleep_trap(seconds)?.watched())
 }
 
 /// Fails unless a porto task is running on this thread: porto awaitables only work there.

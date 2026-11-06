@@ -108,9 +108,13 @@ def test_precedence(
 
 def test_a_config_keeps_its_other_fields_under_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PORTO_STEAL", "eager")
-    config = porto.RuntimeConfig(lanes=3)
+    config = porto.RuntimeConfig(timer_resolution=0.005)
     resolved = _config.resolve(config, {"coop_budget": 7})
-    assert (resolved.lanes, resolved.steal, resolved.coop_budget) == (3, "eager", 7)
+    assert (resolved.timer_resolution, resolved.steal, resolved.coop_budget) == (
+        0.005,
+        "eager",
+        7,
+    )
 
 
 def test_the_environment_is_read_when_the_config_is_created(
@@ -133,7 +137,49 @@ def test_run_accepts_a_config_and_overrides() -> None:
     config = porto.RuntimeConfig(timer_resolution=0.005)
     assert porto.run(answer, config=config) == 42
     assert porto.run(answer, config=config, timer_resolution=0.0001, lanes="auto") == 42
-    assert porto.run(answer(), lanes=2) == 42
+    assert porto.run(answer(), lanes=1) == 42
+
+
+# More than one lane: not implemented yet, so refused rather than run on one lane
+
+
+def test_a_config_may_hold_more_lanes_than_run_accepts() -> None:
+    assert porto.RuntimeConfig(lanes=4).lanes == 4
+
+
+def test_run_refuses_more_than_one_lane_from_the_keyword() -> None:
+    ran: list[bool] = []
+
+    async def main() -> None:
+        ran.append(True)
+
+    with pytest.raises(NotImplementedError, match=r"lanes=4 is not supported yet") as caught:
+        porto.run(main, lanes=4)
+    assert "leave lanes out, or pass lanes=1" in str(caught.value)
+    with pytest.raises(NotImplementedError, match=r"lanes=2 is not supported yet"):
+        porto.run(main, config=porto.RuntimeConfig(lanes=2))
+    assert ran == [], "main must not run with an unsupported lane count"
+
+
+def test_run_refuses_more_than_one_lane_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PORTO_LANES", "4")
+    with pytest.raises(NotImplementedError, match=r"PORTO_LANES='4' asks for 4 lanes") as caught:
+        porto.run(answer)
+    assert "unset PORTO_LANES, or set PORTO_LANES=1" in str(caught.value)
+    # The keyword wins over the variable, and is the one named when it is refused too.
+    assert porto.run(answer, lanes=1) == 42
+    with pytest.raises(NotImplementedError, match=r"lanes=2 is not supported yet"):
+        porto.run(answer, lanes=2)
+
+
+def test_run_refuses_a_refused_lane_count_without_a_never_awaited_warning() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(NotImplementedError):
+            porto.run(answer(), lanes=4)
+    assert [str(warning.message) for warning in caught] == []
 
 
 # Parsing each type from the environment

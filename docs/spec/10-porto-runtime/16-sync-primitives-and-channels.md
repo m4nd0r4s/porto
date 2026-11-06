@@ -20,7 +20,7 @@ Waiting tasks use intrusive `WaitNode`s embedded in the task (PyTask: `wait_node
 
 Cancellation: a cancelled waiter is removed from the queue. If a cancelled waiter had **already been granted** the lock or permit (a race between grant and cancel), it passes the grant on to the next waiter. This invariant is tested with loom.
 
-Awaiting: `wait()`, `notified()` and `acquire()` return lazy awaitables; nothing is taken until they are awaited, so one created and never awaited holds no lock and consumes no permit. A grant is taken only in the step that resumes the coroutine with it: a wait that completes at once but finds the task's budget spent (T2) yields first and takes the grant afterwards, never the other way round. A task closed or cancelled at any suspension point therefore never holds a grant it did not observe.
+Awaiting: `wait()`, `notified()` and `acquire()` return lazy awaitables; nothing is taken until they are awaited, so one created and never awaited holds no lock and consumes no permit (it emits `RuntimeWarning` when freed, `11` §10). A grant is taken only in the step that resumes the coroutine with it: a wait that completes at once but finds the task's budget spent (T2) yields first and takes the grant afterwards, never the other way round. A task closed or cancelled at any suspension point therefore never holds a grant it did not observe.
 
 ## 2. Channels
 

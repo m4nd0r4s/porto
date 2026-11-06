@@ -12,6 +12,7 @@ pub mod errors;
 mod py_compat;
 pub mod testing;
 mod throw_args;
+mod unawaited;
 
 pub use driver::ready::Ready;
 pub use driver::trap::Trap;

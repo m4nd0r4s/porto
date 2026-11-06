@@ -28,7 +28,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyList, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
-use super::run::coroutine_from;
+use super::run::{closing_on_error, coroutine_from};
 use crate::driver::lane;
 use crate::driver::pytask::{self, PyScopeRef, Spawned, TaskOutcome};
 use crate::driver::ready::Ready;
@@ -102,41 +102,8 @@ impl Scope {
     /// child task of this scope, in a copy of the current context, and returns its `Task`.
     #[pyo3(signature = (coro_or_fn, /, *args))]
     fn spawn(&self, coro_or_fn: Bound<'_, PyAny>, args: Bound<'_, PyTuple>) -> PyResult<Py<Task>> {
-        let py = coro_or_fn.py();
-        let Some(handle) = lane::current() else {
-            return Err(NoRuntimeError::new_err(
-                "porto: Scope.spawn() must be called from a task running under porto.run(); \
-                 start the program with porto.run(main) and open the scope inside main",
-            ));
-        };
-        let node = match (self.phase(), self.node.get()) {
-            (Phase::Open, Some(node)) => node.clone(),
-            (Phase::Closed, _) => {
-                return Err(PyRuntimeError::new_err(
-                    "porto: scope is closed: its `async with` block has exited, so it cannot \
-                     spawn more tasks; spawn from inside the block, or open a new scope",
-                ));
-            }
-            _ => {
-                return Err(PyRuntimeError::new_err(
-                    "porto: the scope is not entered yet; spawn inside its block: \
-                     `async with porto.scope() as s: s.spawn(...)`",
-                ));
-            }
-        };
-        let coro = coroutine_from(&coro_or_fn, &args, "Scope.spawn")?;
-        let task = Py::new(
-            py,
-            Task {
-                outcome: Mutex::new(None),
-            },
-        )?;
-        let spawned = Spawned::Child {
-            task: task.clone_ref(py),
-            scope: node,
-        };
-        pytask::spawn(&handle, coro, spawned)?;
-        Ok(task)
+        // A rejected coroutine object is closed: the error is the one thing reported.
+        closing_on_error(&coro_or_fn, || self.spawn_child(&coro_or_fn, &args))
     }
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -310,6 +277,49 @@ impl Scope {
 }
 
 impl Scope {
+    /// [`Scope::spawn`], without closing a rejected coroutine.
+    fn spawn_child(
+        &self,
+        coro_or_fn: &Bound<'_, PyAny>,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<Py<Task>> {
+        let py = coro_or_fn.py();
+        let Some(handle) = lane::current() else {
+            return Err(NoRuntimeError::new_err(
+                "porto: Scope.spawn() must be called from a task running under porto.run(); \
+                 start the program with porto.run(main) and open the scope inside main",
+            ));
+        };
+        let node = match (self.phase(), self.node.get()) {
+            (Phase::Open, Some(node)) => node.clone(),
+            (Phase::Closed, _) => {
+                return Err(PyRuntimeError::new_err(
+                    "porto: scope is closed: its `async with` block has exited, so it cannot \
+                     spawn more tasks; spawn from inside the block, or open a new scope",
+                ));
+            }
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "porto: the scope is not entered yet; spawn inside its block: \
+                     `async with porto.scope() as s: s.spawn(...)`",
+                ));
+            }
+        };
+        let coro = coroutine_from(coro_or_fn, args, "Scope.spawn")?;
+        let task = Py::new(
+            py,
+            Task {
+                outcome: Mutex::new(None),
+            },
+        )?;
+        let spawned = Spawned::Child {
+            task: task.clone_ref(py),
+            scope: node,
+        };
+        pytask::spawn(&handle, coro, spawned)?;
+        Ok(task)
+    }
+
     fn phase(&self) -> Phase {
         if self.has(ScopeFlags::CLOSED) {
             Phase::Closed

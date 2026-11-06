@@ -20,6 +20,8 @@ def runtime() -> Runtime                     # current runtime or NoRuntimeError
 def in_runtime() -> bool
 ```
 
+An entry point that takes a coroutine object and refuses it (`run` inside a running runtime or with an invalid config, `Scope.spawn` on a scope that is closed or not entered, a coroutine with arguments) MUST close it before raising, so the error is the only thing reported: no later "coroutine ... was never awaited".
+
 ### RuntimeConfig (frozen dataclass; also settable via env `PORTO_<UPPER_NAME>`)
 | Field | Type | Default |
 |---|---|---|
@@ -44,10 +46,12 @@ def in_runtime() -> bool
 | `graceful_timeout` | `float` | `10.0` |
 | `cancel_timeout` | `float` | `5.0` |
 
+Until multi-lane scheduling lands (M2, `12`), the runtime runs one lane: `porto.run` MUST refuse an int `lanes` above 1, from any source, with `NotImplementedError` that names the source (`lanes=4`, or `PORTO_LANES='4'`) and says to leave it out or use 1, rather than silently run on one lane. `RuntimeConfig(lanes=4)` itself stays valid, and `"auto"` runs on one lane.
+
 ### Time
 `current_time() -> float`, `monotonic() -> float`, `sleep(seconds: float, /) -> Awaitable[None]`, `async sleep_until(t: float)`, `async sleep_forever() -> NoReturn`, `checkpoint() -> Awaitable[None]`, `interval(period, *, missed="skip") -> AsyncIterator[float]`.
 
-`sleep` and `checkpoint` return a trap (§11 §5, T1), not a coroutine: they are the hottest awaits, and a trap costs one freelisted object where a coroutine costs a frame. Await the result right away.
+`sleep` and `checkpoint` return a trap (§11 §5, T1), not a coroutine: they are the hottest awaits, and a trap costs one freelisted object where a coroutine costs a frame. Await the result right away. A trap freed without ever being awaited emits `RuntimeWarning` naming the call (§11 §10).
 
 ### Structured concurrency
 ```python

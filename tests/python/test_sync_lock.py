@@ -373,11 +373,13 @@ def test_acquire_does_nothing_until_awaited() -> None:
     async def main() -> None:
         lock = porto.Lock()
         not_awaited = lock.acquire()
-        del not_awaited
+        with pytest.warns(RuntimeWarning, match=r"Lock\.acquire\(\) was never awaited"):
+            del not_awaited
         assert not lock.locked()
         mutex = porto.Mutex(0)
         entering = mutex.__aenter__()
-        del entering
+        with pytest.warns(RuntimeWarning, match=r"Mutex\.__aenter__\(\) was never awaited"):
+            del entering
         assert not mutex.locked()
 
     porto.run(main)
