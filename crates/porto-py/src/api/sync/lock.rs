@@ -68,13 +68,13 @@ impl LockSource {
 /// from a task that does not hold it, or a second one, releases it from under the holder.
 #[pyclass(frozen, module = "porto", name = "Lock")]
 pub(super) struct Lock {
-    lock: Arc<Waitable<LockSource>>,
+    pub(super) lock: Arc<Waitable<LockSource>>,
 }
 
 #[pymethods]
 impl Lock {
     #[new]
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             lock: LockSource::waitable(),
         }
@@ -141,7 +141,7 @@ impl Lock {
     /// takes a free lock without suspending (T2: `Cancelled` first if the task is cancelled,
     /// one unit of the budget). Nothing is taken in this call: an exception between it and the
     /// await leaves the lock free. Outside a porto runtime the await raises `NoRuntimeError`.
-    fn enter(slf: &Bound<'_, Self>) -> PyResult<Py<LockEntry>> {
+    pub(super) fn enter(slf: &Bound<'_, Self>) -> PyResult<Py<LockEntry>> {
         LOCK_ENTRIES.object(
             slf.py(),
             LockEntry {
@@ -352,7 +352,7 @@ unsafe extern "C" fn lock_aexit(
 
 /// Releases `lock`, handing it to the task that has waited longest; `RuntimeError` if it is not
 /// held.
-fn release(lock: &LockSource) -> PyResult<()> {
+pub(super) fn release(lock: &LockSource) -> PyResult<()> {
     if lock.unlock() {
         return Ok(());
     }

@@ -22,13 +22,18 @@ print(porto.run(main))
 from porto._channel import channel, unbounded_channel
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
+    Barrier,
+    CapacityLimiter,
+    Condition,
     Event,
     Lock,
     Mutex,
     MutexGuard,
     Notify,
     Receiver,
+    RwLock,
     Scope,
+    Semaphore,
     Sender,
     Task,
     __version__,
@@ -57,9 +62,12 @@ from porto.errors import (
 )
 
 __all__ = [
+    "Barrier",
     "BrokenResourceError",
     "Cancelled",
+    "CapacityLimiter",
     "ClosedResourceError",
+    "Condition",
     "DeterministicConfig",
     "EndOfChannel",
     "Event",
@@ -77,7 +85,9 @@ __all__ = [
     "RuntimeClosed",
     "RuntimeConfig",
     "RustPanic",
+    "RwLock",
     "Scope",
+    "Semaphore",
     "Sender",
     "Task",
     "Terminated",
