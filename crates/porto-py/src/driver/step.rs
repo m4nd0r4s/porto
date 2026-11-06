@@ -52,7 +52,7 @@ use std::task::{Context, Poll, Waker};
 
 use porto_core::coop;
 use porto_core::scope::CancelReason;
-use porto_core::task::Header;
+use porto_core::task::{Header, TaskFlags};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::{ffi, intern};
@@ -121,6 +121,18 @@ pub(crate) fn is_running(header: &Header) -> bool {
     running().is_some_and(|running| {
         // SAFETY: `poll` borrows the waker for as long as it publishes it.
         unsafe { &*running.waker }.data() == std::ptr::from_ref(header).cast()
+    })
+}
+
+/// Whether the task running on this thread is pinned (its header's `PIN` flag): what a task it
+/// spawns inherits when the spawn does not say (spec 03: pinning is inherited by the subtree).
+/// `false` outside a task.
+pub(crate) fn running_is_pinned() -> bool {
+    running().is_some_and(|running| {
+        // SAFETY: `poll` borrows the waker for as long as it publishes it, and the data of a
+        // porto-core task waker is the task's header (see `is_running`), alive while it runs.
+        let header = unsafe { &*(*running.waker).data().cast::<Header>() };
+        header.flags().contains(TaskFlags::PIN)
     })
 }
 

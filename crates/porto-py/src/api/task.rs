@@ -3,7 +3,7 @@
 
 use parking_lot::{Mutex, MutexGuard};
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyString, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
 use crate::driver::pytask::TaskOutcome;
@@ -21,13 +21,35 @@ pub struct Task {
     /// `None` until the task finishes. Only held to store, read or take the outcome. A
     /// parking_lot lock: std's allocates a pthread mutex per task on macOS (porto-itr.7).
     outcome: Mutex<Option<TaskOutcome>>,
+    /// The name given to `spawn` (a `str`), else what was spawned (the async function or the
+    /// coroutine object), whose `__qualname__` is the name: read when the name is, so a spawn
+    /// pays one reference for it.
+    label: Py<PyAny>,
+    /// Spawned with `pin=True`, or by a pinned task (the header's `PIN` flag).
+    pinned: bool,
 }
 
 impl Task {
-    /// A handle for a task about to be spawned.
-    pub(crate) fn new() -> Self {
+    /// A handle for a task about to be spawned. `label` is its name (a `str`), or the object it
+    /// is spawned from, whose `__qualname__` names it.
+    pub(crate) fn new(label: Py<PyAny>, pinned: bool) -> Self {
         Self {
             outcome: Mutex::new(None),
+            label,
+            pinned,
+        }
+    }
+
+    /// The task's name: the one given to `spawn`, else the `__qualname__` of what was spawned
+    /// (as Trio names tasks), else its type's.
+    fn resolve_name<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyString>> {
+        let label = self.label.bind(py);
+        if let Ok(name) = label.cast::<PyString>() {
+            return Ok(name.clone());
+        }
+        match label.getattr(pyo3::intern!(py, "__qualname__")) {
+            Ok(name) => name.str(),
+            Err(_) => label.get_type().qualname(),
         }
     }
 
@@ -73,18 +95,38 @@ impl Task {
             .call1((cls, item))
     }
 
-    fn __repr__(&self) -> &'static str {
-        match &*self.lock() {
-            None => "<porto.Task running>",
-            Some(TaskOutcome::Ok(_)) => "<porto.Task returned>",
-            Some(TaskOutcome::Err(_)) => "<porto.Task raised>",
-            Some(TaskOutcome::Cancelled(_)) => "<porto.Task cancelled>",
-        }
+    /// The task's name: `spawn(..., name=...)`, else the `__qualname__` of the async function
+    /// or coroutine it runs.
+    #[getter]
+    fn name<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyString>> {
+        self.resolve_name(py)
     }
 
-    // The outcome may reference the task again (an exception's traceback, a returned object):
-    // let the cycle collector see through it.
+    /// Whether the task may never move to another lane: spawned with `pin=True`, or with no
+    /// `pin` by a pinned task.
+    #[getter]
+    fn pinned(&self) -> bool {
+        self.pinned
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let state = match &*self.lock() {
+            None => "running",
+            Some(TaskOutcome::Ok(_)) => "returned",
+            Some(TaskOutcome::Err(_)) => "raised",
+            Some(TaskOutcome::Cancelled(_)) => "cancelled",
+        };
+        let name = self.resolve_name(py)?.repr()?;
+        let pinned = if self.pinned { ", pinned" } else { "" };
+        Ok(format!("<porto.Task {name} {state}{pinned}>"))
+    }
+
+    // The outcome may reference the task again (an exception's traceback, a returned object),
+    // and so may what it was spawned from (a closure): let the cycle collector see through
+    // them. The label is never cleared (the type is frozen); clearing the outcome, or the
+    // function or coroutine the cycle goes through, breaks the cycle.
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.label)?;
         // Never block in the collector; a held lock means the outcome is being stored or read.
         let Some(outcome) = self.outcome.try_lock() else {
             return Ok(());

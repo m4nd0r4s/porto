@@ -98,11 +98,19 @@ class Scope:
         coro_or_fn: Coroutine[Any, Any, _T] | Callable[[*_Ts], Awaitable[_T]],
         /,
         *args: *_Ts,
+        name: str | None = None,
+        pin: bool | None = None,
+        context: contextvars.Context | None = None,
     ) -> Task[_T]:
-        """Starts a child task, in a copy of the current context: a coroutine object, or an
-        async function called with ``args``. Raises ``RuntimeError`` outside the block
-        (``porto.NoRuntimeError`` outside ``porto.run``); a refused coroutine object is
-        closed."""
+        """Starts a child task: a coroutine object, or an async function called with ``args``
+        (only positional ones: use ``functools.partial`` for keywords). It runs in a copy of the
+        current context, or in ``context`` itself if given. ``name`` names it (default: the
+        function's ``__qualname__``). ``pin=True`` keeps it on the lane it starts on; without
+        ``pin`` it is pinned if the spawning task is.
+
+        Raises ``RuntimeError`` outside the block (``porto.NoRuntimeError`` outside
+        ``porto.run``), ``TypeError`` for an option of the wrong type or an unknown keyword; a
+        refused coroutine object is closed."""
 
     def cancel(self, reason: str | None = None) -> None:
         """Cancels the scope: every task in it, and in the scopes nested in it, gets
@@ -136,6 +144,16 @@ class Scope:
 @final
 class Task(Generic[_T_co]):
     """A child task of a scope. Its result is readable once its scope's block exited."""
+
+    @property
+    def name(self) -> str:
+        """The name given to ``spawn``, else the ``__qualname__`` of the async function or
+        coroutine the task runs."""
+
+    @property
+    def pinned(self) -> bool:
+        """Whether the task stays on its lane: spawned with ``pin=True``, or without ``pin``
+        by a pinned task."""
 
     def done(self) -> bool:
         """Whether the task finished (returned or raised)."""

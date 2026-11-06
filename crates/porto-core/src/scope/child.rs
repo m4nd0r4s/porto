@@ -89,21 +89,34 @@ impl TaskScope {
     /// holds until it ends.
     ///
     /// # Panics
-    /// If the scope already has `u32::MAX` live children.
+    /// If the scope already has `u32::MAX` live children, or is closed (see
+    /// [`TaskScope::try_attach`]).
     pub fn attach<E: Send + 'static>(scope: &Arc<ScopeNode<E>>) -> Self {
+        Self::try_attach(scope).expect("porto: attached a task to a closed scope")
+    }
+
+    /// [`TaskScope::attach`], or `None`, counting nothing, if the scope is closed (C7): its
+    /// block exited, so nothing would wait for the task.
+    ///
+    /// # Panics
+    /// If the scope already has `u32::MAX` live children.
+    pub fn try_attach<E: Send + 'static>(scope: &Arc<ScopeNode<E>>) -> Option<Self> {
         {
             let mut state = scope.lock_state();
+            if state.closed {
+                return None;
+            }
             state.live_children = state.live_children.checked_add(1).expect(
                 "porto: a scope has 4 billion live tasks; wait for some to finish before \
                  spawning more into it",
             );
         }
         let ptr = Arc::into_raw(Arc::clone(scope));
-        Self {
+        Some(Self {
             // SAFETY: `Arc::into_raw` never returns null. A `ScopeNode` is `repr(C)` with its
             // vtable reference first, so the node's address is the field's.
             node: unsafe { NonNull::new_unchecked(ptr.cast_mut().cast::<ChildVTableRef>()) },
-        }
+        })
     }
 
     /// Tells the scope how its child ended and releases the child's reference to it.
@@ -124,6 +137,27 @@ impl TaskScope {
         unsafe { (vtable.child_ended)(node, end) }
     }
 }
+
+/// A spawn into a closed scope was refused (C7): the scope's block exited, so nothing would wait
+/// for the task. Holds what was to be spawned, unrun, for the caller to drop where it chooses.
+pub struct ScopeClosed<T>(pub T);
+
+impl<T> fmt::Debug for ScopeClosed<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ScopeClosed(..)")
+    }
+}
+
+impl<T> fmt::Display for ScopeClosed<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "porto: the scope is closed: its block exited, so it cannot spawn more tasks; \
+             spawn from inside the block, or open a new scope",
+        )
+    }
+}
+
+impl<T> std::error::Error for ScopeClosed<T> {}
 
 impl Drop for TaskScope {
     fn drop(&mut self) {

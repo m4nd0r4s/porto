@@ -25,10 +25,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use porto_core::scope::{CancelReason, ScopeNode};
 use porto_core::sync::SetOnce;
-use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError};
+use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError, PyTypeError};
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyBool, PyList, PyTuple, PyType};
+use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
 
 use super::run::{closing_on_error, coroutine_from};
 use super::scope_exit;
@@ -108,11 +109,30 @@ static BASE_EXCEPTION_GROUP: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 #[pymethods]
 impl Scope {
     /// Starts `coro_or_fn` (a coroutine object, or an async function called with `args`) as a
-    /// child task of this scope, in a copy of the current context, and returns its `Task`.
-    #[pyo3(signature = (coro_or_fn, /, *args))]
-    fn spawn(&self, coro_or_fn: Bound<'_, PyAny>, args: Bound<'_, PyTuple>) -> PyResult<Py<Task>> {
+    /// child task of this scope, and returns its `Task`. It runs in a copy of the current
+    /// context, or in `context` itself; `name` names it (default: the function's
+    /// `__qualname__`); `pin=True` keeps it on its lane, and without `pin` it is pinned if the
+    /// spawning task is.
+    #[pyo3(signature = (coro_or_fn, /, *args, name=None, pin=None, context=None, **kwargs))]
+    fn spawn(
+        &self,
+        coro_or_fn: Bound<'_, PyAny>,
+        args: Bound<'_, PyTuple>,
+        name: Option<Bound<'_, PyAny>>,
+        pin: Option<Bound<'_, PyAny>>,
+        context: Option<Bound<'_, PyAny>>,
+        kwargs: Option<Bound<'_, PyDict>>,
+    ) -> PyResult<Py<Task>> {
         // A rejected coroutine object is closed: the error is the one thing reported.
-        closing_on_error(&coro_or_fn, || self.spawn_child(&coro_or_fn, &args))
+        closing_on_error(&coro_or_fn, || {
+            let options =
+                if name.is_none() && pin.is_none() && context.is_none() && kwargs.is_none() {
+                    SpawnOptions::default()
+                } else {
+                    SpawnOptions::parse(name, pin, context, kwargs)?
+                };
+            self.spawn_child(&coro_or_fn, &args, options)
+        })
     }
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -286,6 +306,7 @@ impl Scope {
         &self,
         coro_or_fn: &Bound<'_, PyAny>,
         args: &Bound<'_, PyTuple>,
+        options: SpawnOptions<'_>,
     ) -> PyResult<Py<Task>> {
         let py = coro_or_fn.py();
         let Some(handle) = lane::current() else {
@@ -296,12 +317,7 @@ impl Scope {
         };
         let node = match (self.phase(), self.node.get_arc()) {
             (Phase::Open, Some(node)) => node,
-            (Phase::Closed, _) => {
-                return Err(PyRuntimeError::new_err(
-                    "porto: scope is closed: its `async with` block has exited, so it cannot \
-                     spawn more tasks; spawn from inside the block, or open a new scope",
-                ));
-            }
+            (Phase::Closed, _) => return Err(scope_closed()),
             _ => {
                 return Err(PyRuntimeError::new_err(
                     "porto: the scope is not entered yet; spawn inside its block: \
@@ -310,12 +326,18 @@ impl Scope {
             }
         };
         let coro = coroutine_from(coro_or_fn, args, "Scope.spawn")?;
-        let task = Py::new(py, Task::new())?;
+        let pinned = options.pin.unwrap_or_else(step::running_is_pinned);
+        let label = options.name.unwrap_or_else(|| coro_or_fn.clone()).unbind();
+        let task = Py::new(py, Task::new(label, pinned))?;
         let spawned = Spawned::Child {
             task: task.clone_ref(py),
             scope: node,
+            pinned,
         };
-        pytask::spawn(&handle, coro, spawned)?;
+        match options.context {
+            None => pytask::spawn(&handle, coro, spawned)?,
+            Some(context) => pytask::spawn_in_context(&handle, coro, context.unbind(), spawned)?,
+        };
         Ok(task)
     }
 
@@ -350,14 +372,15 @@ impl Scope {
             .map_or(0, |node| node.lock_state().live_children)
     }
 
-    /// Closes the scope and returns the children's failures.
-    fn close(&self) -> Vec<Py<PyBaseException>> {
+    /// Closes the scope, here and in its node (where a spawn from anywhere is refused, C7), and
+    /// returns the children's failures.
+    pub(crate) fn close(&self) -> Vec<Py<PyBaseException>> {
         self.flags.fetch_or(ScopeFlags::CLOSED, Ordering::AcqRel);
         let Some(node) = self.node.get() else {
             return Vec::new();
         };
         // Taken out under the lock, dropped by the caller after it.
-        std::mem::take(&mut node.lock_state().errors)
+        node.close()
     }
 
     /// Closes the scope and raises the children's failures, after `exc` unless the scope
@@ -385,13 +408,95 @@ impl Scope {
         for error in errors {
             exceptions.append(error)?;
         }
-        // `BaseExceptionGroup(...)` returns an `ExceptionGroup` when every member is an
-        // `Exception`.
-        let group = BASE_EXCEPTION_GROUP
-            .import(py, "builtins", "BaseExceptionGroup")?
-            .call1(("porto scope failed", exceptions))?;
-        Err(PyErr::from_value(group))
+        Err(exception_group(py, "porto scope failed", &exceptions)?)
     }
+}
+
+/// A strict exception group of `exceptions` (ADR-009): `BaseExceptionGroup(...)` returns an
+/// `ExceptionGroup` when every member is an `Exception`.
+pub(crate) fn exception_group(
+    py: Python<'_>,
+    message: &str,
+    exceptions: &Bound<'_, PyList>,
+) -> PyResult<PyErr> {
+    let group = BASE_EXCEPTION_GROUP
+        .import(py, "builtins", "BaseExceptionGroup")?
+        .call1((message, exceptions))?;
+    Ok(PyErr::from_value(group))
+}
+
+/// The keyword options of [`Scope::spawn`], checked.
+#[derive(Default)]
+struct SpawnOptions<'py> {
+    /// A `str`.
+    name: Option<Bound<'py, PyAny>>,
+    pin: Option<bool>,
+    /// A `contextvars.Context`.
+    context: Option<Bound<'py, PyAny>>,
+}
+
+impl<'py> SpawnOptions<'py> {
+    /// Checks the options `Scope.spawn` got, with an error that says what to pass instead.
+    fn parse(
+        name: Option<Bound<'py, PyAny>>,
+        pin: Option<Bound<'py, PyAny>>,
+        context: Option<Bound<'py, PyAny>>,
+        kwargs: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Self> {
+        if let Some(kwargs) = kwargs.filter(|kwargs| !kwargs.is_empty()) {
+            let names = kwargs.keys().str()?;
+            return Err(PyTypeError::new_err(format!(
+                "porto: Scope.spawn() got keyword arguments it does not take: {names}; it \
+                 passes only positional arguments to the function: spawn a coroutine object, \
+                 s.spawn(work(key=value)), or a partial, \
+                 s.spawn(functools.partial(work, key=value)) (spawn itself takes name=, pin= \
+                 and context=)"
+            )));
+        }
+        if let Some(name) = &name
+            && !name.is_instance_of::<PyString>()
+        {
+            return Err(PyTypeError::new_err(format!(
+                "porto: Scope.spawn() name= must be a str, got {}; pass name=str(...), or \
+                 leave it out to name the task after its function",
+                name.get_type().fully_qualified_name()?
+            )));
+        }
+        let pin = match pin {
+            None => None,
+            Some(pin) => match pin.cast::<PyBool>() {
+                Ok(pin) => Some(pin.is_true()),
+                Err(_) => {
+                    return Err(PyTypeError::new_err(format!(
+                        "porto: Scope.spawn() pin= must be True, False or None, got {}; pass \
+                         pin=True to keep the task on its lane, or leave it out to inherit the \
+                         spawning task's pinning",
+                        pin.get_type().fully_qualified_name()?
+                    )));
+                }
+            },
+        };
+        if let Some(context) = &context
+            // SAFETY: attached (we hold a `Bound`); the check only reads the object's type.
+            && unsafe { ffi::PyContext_CheckExact(context.as_ptr()) } == 0
+        {
+            return Err(PyTypeError::new_err(format!(
+                "porto: Scope.spawn() context= must be a contextvars.Context, got {}; pass \
+                 contextvars.copy_context(), or leave it out to run the task in a copy of the \
+                 current context",
+                context.get_type().fully_qualified_name()?
+            )));
+        }
+        Ok(Self { name, pin, context })
+    }
+}
+
+/// What spawning into a closed scope raises (C7).
+fn scope_closed() -> PyErr {
+    PyRuntimeError::new_err(
+        "porto: scope is closed: its `async with` block has exited, so it cannot spawn more \
+         tasks; spawn from inside the block, or open a new scope",
+    )
 }
 
 fn entered_twice() -> PyErr {

@@ -276,7 +276,7 @@ def test_C3_first_answer_wins_counts_the_children_cancelled_by_the_winner() -> N
         assert s.cancel_called
         assert s.cancelled_caught
         assert tasks[0].result() == 0.01
-        assert [repr(task) for task in tasks[1:]] == ["<porto.Task cancelled>"] * 2
+        assert [repr(task).endswith(".ask' cancelled>") for task in tasks[1:]] == [True] * 2
 
     porto.run(main)
 
@@ -390,8 +390,8 @@ def test_C6_a_child_spawned_into_a_cancelled_scope_raises_at_its_first_checkpoin
     async def main() -> None:
         async with porto.scope() as s:
             s.cancel()
-            task = s.spawn(child)
-        assert repr(task) == "<porto.Task cancelled>"
+            task = s.spawn(child, name="child")
+        assert repr(task) == "<porto.Task 'child' cancelled>"
 
     porto.run(main)
     assert events == ["started"]

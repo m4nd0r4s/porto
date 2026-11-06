@@ -202,7 +202,7 @@ A cancellable wait that does not resolve at once is registered with the task's i
 The Python-visible `Task[T]` is created lazily: `scope.spawn` returns it, but internal spawns (Douro request tasks) never create it. It holds a `TaskRef`. Its methods are listed in §20. `await task` produces `TrapKind::Join` (or the ready fast path if already complete).
 
 ## 8. contextvars
-- `scope.spawn(coro)` copies the *current* context (`PyContext_CopyCurrent`) by default, matching asyncio semantics. `context=` overrides it.
+- `scope.spawn(coro)` copies the *current* context (`PyContext_CopyCurrent`) by default, matching asyncio semantics. `context=` overrides it: the task runs in that context itself, not a copy, so its changes are visible to whoever holds it.
 - Each step runs inside `PyContext_Enter/Exit` for the task's context. Contexts are not thread-bound, so migration is safe.
 
 ## 9. Async generators

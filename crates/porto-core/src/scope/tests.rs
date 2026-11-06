@@ -342,14 +342,44 @@ fn tasks_spawned_into_a_scope_on_a_runtime_end_in_it() {
     let rt = crate::Runtime::new();
     let scope = Scope::new_root(0);
     let handle = rt.handle();
-    let ok = handle.spawn_in(&scope, async { 1 });
-    let failed = handle.spawn_in(&scope, async { panic!("child failed") });
+    let ok = handle.spawn_in(&scope, async { 1 }).unwrap();
+    let failed = handle
+        .spawn_in(&scope, async { panic!("child failed") })
+        .unwrap();
     assert_eq!(scope.lock_state().live_children, 2);
     assert_eq!(rt.block_on(ok).unwrap(), 1);
     assert!(rt.block_on(failed).unwrap_err().is_panic());
     assert_eq!(scope.lock_state().live_children, 0);
     assert_eq!(scope.cancel_called(), Some(CancelReason::ChildFailed));
     assert_eq!(Arc::strong_count(&scope), 1);
+}
+
+#[test]
+fn a_closed_scope_refuses_new_tasks_and_hands_them_back() {
+    let rt = crate::Runtime::new();
+    let scope = Scope::new_root(0);
+    TaskScope::attach(&scope).end(TaskEnd::Failed(Some(Box::new("boom"))));
+    let errors = scope.close();
+    assert_eq!(errors.len(), 1, "close hands the recorded failures over");
+    assert!(scope.lock_state().closed);
+    assert!(
+        scope.close().is_empty(),
+        "closing again returns nothing more"
+    );
+    assert!(TaskScope::try_attach(&scope).is_none());
+    let refused = rt.handle().spawn_in(&scope, async { 1 }).unwrap_err();
+    assert!(refused.to_string().contains("scope is closed"), "{refused}");
+    assert_eq!(rt.block_on(refused.0), 1, "the future comes back unrun");
+    assert_eq!(scope.lock_state().live_children, 0);
+    assert_eq!(Arc::strong_count(&scope), 1);
+}
+
+#[test]
+#[should_panic(expected = "closed scope")]
+fn attaching_to_a_closed_scope_panics() {
+    let scope = Scope::new_root(0);
+    drop(scope.close());
+    let _child = TaskScope::attach(&scope);
 }
 
 mod waiters {

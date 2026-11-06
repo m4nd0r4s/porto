@@ -102,7 +102,7 @@ def test_C4_a_cancelled_absorbed_by_its_cancelled_scope_is_not_a_failure() -> No
         assert [repr(error) for error in raised.value.exceptions] == ["ValueError('first')"]
         scope, task = seen
         # The sibling reports how it ended, and the body's `Cancelled` is not in the group.
-        assert repr(task) == "<porto.Task cancelled>"
+        assert repr(task) == "<porto.Task 'Blocked.run' cancelled>"
         with pytest.raises(porto.Cancelled):
             task.result()
         assert scope.cancel_called
