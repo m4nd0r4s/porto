@@ -357,7 +357,9 @@ class RuntimeConfig:
     field, or the variable, and a valid value.
 
     Multi-lane scheduling is not implemented yet: a config may hold ``lanes=4``, but
-    ``porto.run`` refuses it with ``NotImplementedError``; ``lanes="auto"`` runs on one lane.
+    ``porto.run`` refuses it with ``NotImplementedError``. ``lanes="auto"`` is accepted and runs
+    on one lane for now; once multi-lane scheduling lands it picks more lanes for the machine,
+    with no change to code that passes it.
     """
 
     lanes: int | Literal["auto"] = field(default_factory=_from_env("lanes", lambda: 1))

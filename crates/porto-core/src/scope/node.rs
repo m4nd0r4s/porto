@@ -98,6 +98,10 @@ pub struct ScopeState<E> {
     pub live_children: u32,
     /// Failures collected from the body and the children, raised as a group at exit.
     pub errors: Vec<E>,
+    /// A task ended because this scope's own cancellation reached it (not an enclosing
+    /// scope's): the scope's exit counts that as a cancel it absorbed (C3, `cancelled_caught`).
+    /// Set by the binding, which alone tells how a task's body ended.
+    pub cancel_absorbed: bool,
     /// The owner task, waiting in `ScopeExit` for `live_children` to reach zero.
     pub exit_waiter: Option<Waker>,
     /// Nested scopes, for propagating a cancel down the tree.
@@ -229,6 +233,7 @@ impl<E: Send + 'static> ScopeNode<E> {
             state: Mutex::new(ScopeState {
                 live_children: 0,
                 errors: Vec::new(),
+                cancel_absorbed: false,
                 exit_waiter: None,
                 child_scopes: ChildList { head: ptr::null() },
                 waiters: None,

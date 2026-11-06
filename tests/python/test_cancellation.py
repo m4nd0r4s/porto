@@ -7,6 +7,7 @@ also when the cancel comes from another thread. ``_WaitProbe().wait()`` is a ``N
 ``_spawn_joinable(coro).join()`` a ``Join`` trap.
 """
 
+import contextlib
 import threading
 import time
 from collections.abc import Callable
@@ -259,6 +260,93 @@ def test_C3_an_outer_cancel_goes_through_an_inner_scope_and_is_absorbed_by_the_o
 
     porto.run(main)
     assert events == ["inner body cancelled", "outer caught True, inner False"]
+
+
+def test_C3_first_answer_wins_counts_the_children_cancelled_by_the_winner() -> None:
+    # Children race and the winner calls s.cancel(). The body finished before the cancel, so
+    # only the losers get Cancelled: the scope absorbed them, and cancelled_caught says so.
+    async def ask(seconds: float, s: porto.Scope) -> float:
+        await porto.sleep(seconds)
+        s.cancel("got an answer")
+        return seconds
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            tasks = [s.spawn(ask, seconds, s) for seconds in (0.01, 3600, 3600)]
+        assert s.cancel_called
+        assert s.cancelled_caught
+        assert tasks[0].result() == 0.01
+        assert [repr(task) for task in tasks[1:]] == ["<porto.Task cancelled>"] * 2
+
+    porto.run(main)
+
+
+def test_C3_a_cancel_only_the_body_gets_is_caught() -> None:
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.cancel()
+            await porto.checkpoint()
+            pytest.fail("not reached")
+        assert s.cancelled_caught
+
+    porto.run(main)
+
+
+def test_C3_a_cancel_nobody_lets_out_is_not_caught() -> None:
+    # The body and the child both swallow their Cancelled (a bug, shown here only for the
+    # flag): nothing reached the exit or ended a task, so nothing was absorbed.
+    async def stubborn() -> None:
+        with contextlib.suppress(porto.Cancelled):
+            await porto.sleep(3600)
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.spawn(stubborn)
+            await checkpoint()
+            s.cancel()
+            with contextlib.suppress(porto.Cancelled):
+                await porto.checkpoint()
+        assert s.cancel_called
+        assert not s.cancelled_caught
+
+    porto.run(main)
+
+
+def test_C3_children_ended_by_an_outer_cancel_count_for_the_outer_scope_only() -> None:
+    # The inner body never awaits: only the inner scope's children get the outer's Cancelled.
+    # They count for the scope whose cancel caused them (the outer), never for the inner one.
+    async def sleeper() -> None:
+        await porto.sleep(3600)
+
+    async def canceller(outer: porto.Scope) -> None:
+        await checkpoint()
+        outer.cancel()
+
+    async def main() -> None:
+        async with porto.scope() as outer, porto.scope() as inner:
+            inner.spawn(sleeper)
+            inner.spawn(canceller, outer)
+        assert outer.cancelled_caught
+        assert not inner.cancel_called
+        assert not inner.cancelled_caught
+
+    porto.run(main)
+
+
+def test_C3_a_child_ended_by_an_inner_cancel_does_not_count_for_the_outer_scope() -> None:
+    async def sleeper() -> None:
+        await porto.sleep(3600)
+
+    async def main() -> None:
+        async with porto.scope() as outer, porto.scope() as inner:
+            inner.spawn(sleeper)
+            await checkpoint()
+            inner.cancel()
+        assert inner.cancelled_caught
+        assert not outer.cancel_called
+        assert not outer.cancelled_caught
+
+    porto.run(main)
 
 
 def test_a_cancel_reaches_tasks_spawned_into_nested_scopes() -> None:

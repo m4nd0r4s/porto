@@ -46,7 +46,7 @@ An entry point that takes a coroutine object and refuses it (`run` inside a runn
 | `graceful_timeout` | `float` | `10.0` |
 | `cancel_timeout` | `float` | `5.0` |
 
-Until multi-lane scheduling lands (M2, `12`), the runtime runs one lane: `porto.run` MUST refuse an int `lanes` above 1, from any source, with `NotImplementedError` that names the source (`lanes=4`, or `PORTO_LANES='4'`) and says to leave it out or use 1, rather than silently run on one lane. `RuntimeConfig(lanes=4)` itself stays valid, and `"auto"` runs on one lane.
+Until multi-lane scheduling lands (M2, `12`), the runtime runs one lane: `porto.run` MUST refuse an int `lanes` above 1, from any source, with `NotImplementedError` that names the source (`lanes=4`, or `PORTO_LANES='4'`) and says to leave it out or use 1, rather than silently run on one lane. `RuntimeConfig(lanes=4)` itself stays valid. `"auto"` is accepted from any source and runs on one lane for now. Once multi-lane scheduling lands it resolves as in `12` §7, with no change for callers that pass it.
 
 ### Time
 `current_time() -> float`, `monotonic() -> float`, `sleep(seconds: float, /) -> Awaitable[None]`, `async sleep_until(t: float)`, `async sleep_forever() -> NoReturn`, `checkpoint() -> Awaitable[None]`, `interval(period, *, missed="skip") -> AsyncIterator[float]`.

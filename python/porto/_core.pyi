@@ -37,7 +37,9 @@ def run(
     the ``PORTO_*`` environment variables over the defaults; see ``porto.RuntimeConfig``. They
     are checked before ``main`` is called. Unknown ``PORTO_*`` variables warn. Multi-lane
     scheduling is not implemented yet: ``lanes`` above 1 (from the keyword, the config or
-    ``PORTO_LANES``) raises ``NotImplementedError``, and ``lanes="auto"`` runs on one lane.
+    ``PORTO_LANES``) raises ``NotImplementedError``. ``lanes="auto"`` is accepted and runs on
+    one lane for now; once multi-lane scheduling lands it picks more lanes for the machine,
+    with no change to code that passes it.
 
     Ctrl-C raises ``KeyboardInterrupt`` out of it within about 50 ms, also while every task
     sleeps. A ``KeyboardInterrupt`` or ``SystemExit`` raised by a task nobody waits for also
@@ -115,8 +117,11 @@ class Scope:
 
     @property
     def cancelled_caught(self) -> bool:
-        """Whether the exit absorbed a ``porto.Cancelled`` raised by this scope's
-        cancellation."""
+        """Whether this scope's cancellation was delivered and absorbed: a ``porto.Cancelled``
+        it raised left the block, or ended a child task. True also when only the children got
+        it, for example when the winner of a race calls ``cancel()`` after the block finished.
+        A ``Cancelled`` raised by an enclosing scope's cancellation counts for that scope, not
+        this one; one the block catches and swallows does not count."""
 
     async def __aenter__(self) -> Self: ...
     async def __aexit__(

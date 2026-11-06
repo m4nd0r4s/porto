@@ -429,9 +429,13 @@ def test_sleeps_wake_in_deadline_order_never_early() -> None:
     woke: list[str] = []
 
     async def sleeper(name: str, delay: float) -> None:
-        start = time.monotonic()
+        # "Never early" is promised on porto's clock, which sleep deadlines are measured on
+        # (std's Instant: QueryPerformanceCounter on Windows, as time.perf_counter). Python
+        # 3.11's time.monotonic on Windows reads GetTickCount64, which moves in ~15.6 ms
+        # ticks, so it can measure a 40 ms sleep as 31 ms (porto-4a9).
+        start = porto.current_time()
         await porto.sleep(delay)
-        assert time.monotonic() - start >= delay, f"{name} woke early"
+        assert porto.current_time() - start >= delay, f"{name} woke early"
         woke.append(name)
 
     async def main() -> None:
