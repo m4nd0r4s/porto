@@ -39,7 +39,7 @@ use super::scope_exit::ScopeExit;
 use crate::async_slots;
 use crate::driver::pytask::{self, PyScopeNode, Spawned, TaskOutcome};
 use crate::driver::ready::{Ready, ready_none};
-use crate::driver::step::{self, checkpoint_if_needed};
+use crate::driver::step::{self, checkpoint_if_needed, checkpoint_if_needed_none};
 use crate::driver::trap::TrapKind;
 use crate::driver::{freelist, lane};
 use crate::errors::{Cancelled, InvalidStateError, NoRuntimeError};
@@ -195,7 +195,7 @@ impl Scope {
                 return Ok(Bound::new(py, Ready::new(absorbed))?.into_any());
             }
             // T2: no child to wait for, so the exit completes synchronously.
-            return Ok(checkpoint_if_needed(py, py.None())?.into_bound(py));
+            return Ok(checkpoint_if_needed_none(py)?.into_bound(py));
         }
         // The waiting part: a native awaitable, not a coroutine (porto-itr.7), from a freelist.
         Ok(freelist::new_tracked(

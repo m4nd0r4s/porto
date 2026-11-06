@@ -60,7 +60,7 @@ use pyo3::{ffi, intern};
 use super::lane;
 use super::pending::{Kind, Pending};
 use super::pytask::{CancelStack, PyScopeNode, PyScopeRef, PyTask, Resume, TaskOutcome};
-use super::ready::ready;
+use super::ready::{ready, ready_none};
 use super::trap::{Trap, TrapKind};
 use crate::errors::Cancelled;
 use crate::py_compat::{Sent, names, release_spare_value, send, take_exception};
@@ -161,24 +161,40 @@ pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult
     ready(py, value)
 }
 
+/// [`checkpoint_if_needed`] for a `None` result, which holds no `Py` to drop on the fast path
+/// (dropping one reads pyo3's thread-local GIL count).
+pub(crate) fn checkpoint_if_needed_none(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    if !proceed(py)? {
+        return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(py.None())))?.into_any());
+    }
+    ready_none(py)
+}
+
 /// The T2 decision of [`checkpoint_if_needed`] with no result object: raises `Cancelled` while
 /// the running task is cancelled (before spending anything), else spends one unit of its budget
 /// and returns `true`, or returns `false` if the budget was already spent (the caller then
 /// suspends instead of completing). Always `true` outside a porto task.
 #[inline]
 pub(crate) fn proceed(py: Python<'_>) -> PyResult<bool> {
+    Ok(proceed_in_task(py)?.unwrap_or(true))
+}
+
+/// [`proceed`], or `None` (spending nothing) if no porto task is running on this thread: for
+/// an awaitable that checks where it runs only then, with no thread local of its own.
+#[inline]
+pub(crate) fn proceed_in_task(py: Python<'_>) -> PyResult<Option<bool>> {
     let Some(running) = running() else {
-        return Ok(true);
+        return Ok(None);
     };
     if let Some(cancelled) = running_cancellation(py, running) {
         return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
     }
     let budget = &running.budget;
     match budget.get() {
-        0 => Ok(false),
+        0 => Ok(Some(false)),
         left => {
             budget.set(left - 1);
-            Ok(true)
+            Ok(Some(true))
         }
     }
 }

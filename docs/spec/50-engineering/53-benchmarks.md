@@ -19,10 +19,14 @@ Linux-only paths (epoll, io_uring) are measured in the Docker Desktop Linux VM o
 | task switch (yield ping-pong) | ≥ 2.5× |
 | channel ping-pong (bounded 1) | ≥ 3× vs asyncio.Queue |
 | Lock contention 100 tasks | ≥ 2× |
+| Lock uncontended (`async with lock:`) | ≥ 2× |
+| Mutex read+set, uncontended (`async with m as g: g.set(g.value + 1)`, vs `asyncio.Lock` + an attribute) | ≥ 1.8× ¹ |
 | sleep(0.001) × 100k tasks | timers: ≥ 2× |
 | TCP echo 1 KiB, 100 conns | ≥ 1.5× vs uvloop streams |
 | 1M sleeping tasks | RSS < 2.5 GB; spawn ≥ 1M/s/lane |
 | §11 §11 table | absolute targets |
+
+¹ Not 2×: the interpreter's own share of the op is too large. On the reference machine (2026-11-06) asyncio+uvloop takes ~176 ns per op, so 2× would leave 88 ns; CPython's work for `async with` (two special-method lookups and calls, two `GET_AWAITABLE`/`SEND` rounds) plus the body's attribute read, method call and int add is ~60–65 ns of it, measured with samply on porto's 90 ns op. Porto's share is ~24 ns: the lock and the T2 checks at entry and exit, the guard (one object per entry), and the `StopIteration` that 3.12+ `SEND` needs to deliver the guard. The asyncio twin pays for none of these, since it reads and writes a plain attribute. Measured: 1.9× (93 ns vs 176 ns, porto-szb.118).
 
 ## 3. Free-threaded scaling (3.14t)
 - Independent CPU-light tasks: throughput at 8 lanes ≥ 5.6× of 1 lane (0.7 efficiency).

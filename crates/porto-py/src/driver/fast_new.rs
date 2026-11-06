@@ -112,6 +112,12 @@ impl<T: PyClass + Into<PyClassInitializer<T>> + Unawaited> FastNew<T> {
         Ok(())
     }
 
+    /// Whether [`FastNew::init`] enabled the fast path: `T`'s value sits right after the object
+    /// header, and nothing after it needs initializing.
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.type_ptr.load(Ordering::Acquire).is_null()
+    }
+
     /// `value` as a new `T` object.
     pub(crate) fn object(&self, py: Python<'_>, value: T) -> PyResult<Py<T>> {
         let type_ptr = self.type_ptr.load(Ordering::Acquire);

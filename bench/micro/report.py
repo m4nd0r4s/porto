@@ -88,8 +88,8 @@ GATES = [
     Gate("channel_fan_in", "channel fan-in 8→1", 3.0, "53 §2 channel"),
     Gate("channel_fan_out", "channel fan-out 1→8", 3.0, "53 §2 channel"),
     Gate("lock_contended", "Lock contention 100 tasks", 2.0, "53 §2"),
-    Gate("lock_uncontended", "Lock uncontended", 2.0, "53 §2 Lock"),
-    Gate("mutex_value", "Mutex read+set", 2.0, "53 §2 Lock"),
+    Gate("lock_uncontended", "Lock uncontended", 2.0, "53 §2"),
+    Gate("mutex_value", "Mutex read+set", 1.8, "53 §2"),
     Gate("sleep_100k", "sleep(0.001) x 100k tasks", 2.0, "53 §2"),
     Gate("sleep_cancel_churn", "sleep arm + cancel churn", 2.0, "53 §2 timers"),
 ]

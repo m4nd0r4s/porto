@@ -2,12 +2,14 @@
 //! (16-sync-primitives-and-channels.md §1).
 //!
 //! The mutex is a `porto.Lock` (the same `LockSource`) plus the value. `async with mutex as
-//! guard:` takes the lock like `async with lock:` (the lazy `_SyncWait`, which takes a free lock
-//! on its first resume) and evaluates to a fresh guard, made in the step that takes the lock.
+//! guard:` takes the lock like `async with lock:`: `__aenter__()` returns a fresh guard that is
+//! also the lazy entry (`entry`), which takes a free lock on its first resume and evaluates to
+//! itself. One object per entry, its `value` and `set` raw slots (porto-szb.118).
 //!
-//! A guard works while its block is open: it records the mutex's `generation` when it is made,
-//! and every exit bumps the generation before releasing the lock, so a guard is current exactly
-//! while the lock is held for its block. Only the current guard reaches the value. The value is
+//! A guard works while its block is open: it records the mutex's `generation` in the step that
+//! takes the lock, and every exit bumps the generation before releasing the lock, so a guard is
+//! current exactly while the lock is held for its block (an entry not yet entered holds a
+//! generation no mutex reaches). Only the current guard reaches the value. The value is
 //! read and replaced in the mutex's critical section (`with_critical_section`: nothing on a GIL
 //! build, where being attached already serializes them; the object's lock on 3.14t), so a guard
 //! shared between threads by mistake cannot tear it. The guard checks the generation, and the
@@ -26,12 +28,14 @@ use pyo3::prelude::*;
 use pyo3::sync::critical_section::with_critical_section;
 use pyo3::types::PyType;
 
+use super::entry::{Entry, Step, Strong, install_dealloc};
 use super::lock::{LockSource, release_then_checkpoint};
-use super::wait_op::{Grant, SyncWait, Then};
-use crate::api::time::require_lane;
+use crate::async_slots::{self, IterNext, guard_next, guard_send, stop_iteration};
+use crate::driver::fast_new::{FastNew, Unawaited};
 use crate::driver::freelist;
 use crate::driver::thin::Waitable;
-use crate::raw_methods::{self, MethodDef};
+use crate::raw_methods::{self, GetterDef, MethodDef};
+use crate::throw_args::thrown_exception;
 
 /// The value a mutex owns, reached only in the mutex's critical section (see the module docs).
 struct ValueCell(UnsafeCell<Py<PyAny>>);
@@ -82,17 +86,10 @@ impl Mutex {
         })
     }
 
-    /// `async with mutex as guard:`: a lazy wait for the lock, like `Lock.__aenter__`, that
-    /// evaluates to a fresh guard made in the step that takes the lock (a free one on its
-    /// first resume, without suspending). If making the guard fails, the lock is released.
-    fn enter(slf: &Bound<'_, Self>) -> PyResult<Py<SyncWait>> {
-        require_lane("Mutex.__aenter__")?;
-        SyncWait::with(
-            Grant::Locked(Arc::clone(&slf.get().lock)),
-            Then::Guard(slf.clone().unbind()),
-            "Mutex.__aenter__()",
-        )
-        .into_object(slf.py())
+    /// `async with mutex as guard:`: a fresh guard, which is also the lazy entry (see the module
+    /// docs), named `Mutex.__aenter__()` for the warning if it is dropped unawaited.
+    fn enter(slf: &Bound<'_, Self>) -> PyResult<Py<MutexGuard>> {
+        GUARDS.object(slf.py(), MutexGuard::new(slf))
     }
 
     /// The end of the block: its guard stops working before another task can take the lock,
@@ -100,21 +97,12 @@ impl Mutex {
     fn exit(slf: &Bound<'_, Self>, exc: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let this = slf.get();
         // In the section, so a guard that checked the generation finishes its access first.
+        // Every bump is made in the section, which serializes them: no read-modify-write needed.
         with_critical_section(slf.as_any(), || {
-            this.generation.fetch_add(1, Ordering::Relaxed);
+            let generation = this.generation.load(Ordering::Relaxed);
+            this.generation.store(generation + 1, Ordering::Release);
         });
         release_then_checkpoint(slf.py(), &this.lock, exc)
-    }
-
-    /// The guard for the block that now holds the lock, from a freelist.
-    pub(super) fn guard(slf: &Bound<'_, Self>) -> PyResult<Py<MutexGuard>> {
-        freelist::new_tracked(
-            slf.py(),
-            MutexGuard {
-                mutex: slf.clone().unbind(),
-                generation: slf.get().generation.load(Ordering::Acquire),
-            },
-        )
     }
 }
 
@@ -232,13 +220,18 @@ unsafe extern "C" fn mutex_aexit(
     })
 }
 
-/// Access to a `porto.Mutex`'s value while its lock is held; what `async with` gives.
+/// Access to a `porto.Mutex`'s value while its lock is held; what `async with` gives. It is
+/// also the entry `async with` awaits (see the module docs).
 #[pyclass(frozen, freelist = 64, module = "porto", name = "MutexGuard")]
 pub(super) struct MutexGuard {
-    mutex: Py<Mutex>,
-    /// The mutex's generation for the block this guard belongs to.
-    generation: u64,
+    mutex: Strong<Mutex>,
+    entry: Entry,
+    /// The mutex's generation for the block this guard belongs to, once entered.
+    generation: AtomicU64,
 }
+
+/// The generation of a guard that was not entered: no mutex reaches it.
+const NOT_ENTERED: u64 = u64::MAX;
 
 /// The error for a guard used after its block exited.
 fn released_error() -> PyErr {
@@ -249,27 +242,136 @@ fn released_error() -> PyErr {
     )
 }
 
-#[pymethods]
+/// The error for a guard used before its entry was awaited.
+fn not_entered_error() -> PyErr {
+    PyRuntimeError::new_err(
+        "porto: this Mutex guard was used before the mutex was entered; use the guard that \
+         `async with mutex as guard:` gives (or await `mutex.__aenter__()` first)",
+    )
+}
+
 impl MutexGuard {
-    /// The value the mutex owns.
-    #[getter]
-    fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Mutex::value(self.mutex.bind(py), self.generation).ok_or_else(released_error)
+    /// A guard for `mutex` that is not entered yet.
+    fn new(mutex: &Bound<'_, Mutex>) -> Self {
+        Self {
+            mutex: Strong::new(mutex),
+            entry: Entry::new(),
+            generation: AtomicU64::new(NOT_ENTERED),
+        }
     }
 
-    /// Replaces the value the mutex owns.
-    #[pyo3(signature = (value, /))]
+    /// Resumes the entry; once the lock is taken, the guard belongs to the block.
+    fn resume(&self, py: Python<'_>, sent: &Bound<'_, PyAny>) -> PyResult<Step> {
+        let mutex = self.mutex.py().get();
+        let step = self
+            .entry
+            .resume(py, &mutex.lock, sent, "Mutex.__aenter__")?;
+        if let Step::Entered = step {
+            self.generation
+                .store(mutex.generation.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+        Ok(step)
+    }
+
+    /// The error for an access that found the guard not current.
+    fn stale_error(&self) -> PyErr {
+        if self.generation.load(Ordering::Relaxed) == NOT_ENTERED {
+            not_entered_error()
+        } else {
+            released_error()
+        }
+    }
+
+    /// `guard.value`.
+    fn value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Mutex::value(
+            self.mutex.py().bind(py),
+            self.generation.load(Ordering::Relaxed),
+        )
+        .ok_or_else(|| self.stale_error())
+    }
+
+    /// `guard.set(value)`.
     fn set(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
-        match Mutex::replace_value(self.mutex.bind(py), self.generation, value) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        // Dropped as `Bound`s: a plain `Py_DECREF`, not `Py`'s check of the attached thread.
+        match Mutex::replace_value(self.mutex.py().bind(py), generation, value) {
             Ok(old) => {
-                drop(old);
+                drop(old.into_bound(py));
                 Ok(())
             }
             Err(value) => {
-                drop(value);
-                Err(released_error())
+                drop(value.into_bound(py));
+                Err(self.stale_error())
             }
         }
+    }
+}
+
+impl Unawaited for MutexGuard {
+    fn unwatch(&mut self) {
+        // Finished rather than forgotten; nothing was taken.
+        self.entry.finish();
+    }
+}
+
+/// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).
+impl Drop for MutexGuard {
+    fn drop(&mut self) {
+        if self.entry.never_awaited() {
+            crate::unawaited::warn_never_awaited("Mutex.__aenter__()");
+        }
+    }
+}
+
+#[pymethods]
+impl MutexGuard {
+    /// The value the mutex owns (replaced by a raw getter, `GUARD_VALUE`).
+    #[getter(value)]
+    fn py_value(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.value(py)
+    }
+
+    /// Replaces the value the mutex owns (replaced by a raw method, `GUARD_SET`).
+    #[pyo3(name = "set", signature = (value, /))]
+    fn py_set(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
+        self.set(py, value)
+    }
+
+    fn __await__(slf: &Bound<'_, Self>) -> Py<Self> {
+        slf.clone().unbind()
+    }
+
+    fn __next__(slf: &Bound<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
+        let py = slf.py();
+        match slf.get().resume(py, &py.None().into_bound(py))? {
+            Step::Yield(trap) => Ok(Some(trap)),
+            Step::Entered => Err(stop_iteration(slf.clone().into_any())),
+        }
+    }
+
+    #[pyo3(signature = (value, /))]
+    fn send(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        match slf.get().resume(slf.py(), value)? {
+            Step::Yield(trap) => Ok(trap),
+            Step::Entered => Err(stop_iteration(slf.clone().into_any())),
+        }
+    }
+
+    /// The driver gave the wait up before throwing in (T3); the entry is over.
+    #[pyo3(signature = (typ, val = None, tb = None, /))]
+    fn throw(
+        &self,
+        typ: &Bound<'_, PyAny>,
+        val: Option<&Bound<'_, PyAny>>,
+        tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.entry.finish();
+        Err(thrown_exception(typ, val, tb))
+    }
+
+    fn close(&self) {
+        self.entry.finish();
     }
 
     /// `MutexGuard[int]` at runtime, for annotations that are evaluated.
@@ -282,11 +384,15 @@ impl MutexGuard {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        visit.call(&self.mutex)
+        visit.call(self.mutex.py())
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let Some(value) = Mutex::value(self.mutex.bind(py), self.generation) else {
+        let generation = self.generation.load(Ordering::Relaxed);
+        if generation == NOT_ENTERED {
+            return Ok("<porto.MutexGuard not entered>".to_owned());
+        }
+        let Some(value) = Mutex::value(self.mutex.py().bind(py), generation) else {
             return Ok("<porto.MutexGuard released>".to_owned());
         };
         Ok(format!(
@@ -294,6 +400,134 @@ impl MutexGuard {
             value.bind(py).repr()?
         ))
     }
+}
+
+/// `MutexGuard` objects made without pyo3's generic path.
+static GUARDS: FastNew<MutexGuard> = FastNew::tracked();
+
+/// `MutexGuard`'s raw slots and fast constructor. Call it once from module init, right after
+/// `add_class::<MutexGuard>()`.
+pub(super) fn init_guard_type(py: Python<'_>) -> PyResult<()> {
+    async_slots::install_am_send::<MutexGuard>(py, guard_am_send)?;
+    async_slots::install_iter_slots::<MutexGuard>(py, guard_iternext)?;
+    freelist::install::<MutexGuard>(py, &guard_freelist::SLOTS)?;
+    raw_methods::install_getter::<MutexGuard>(py, &GUARD_VALUE)?;
+    raw_methods::install::<MutexGuard>(py, &GUARD_SET)?;
+    // A finished entry: dropping it does not warn.
+    let probe = MutexGuard::new(&Bound::new(py, Mutex::new(py.None()))?);
+    probe.entry.finish();
+    GUARDS.init(py, probe)?;
+    install_dealloc::<MutexGuard>(py, &GUARDS)
+}
+
+freelist::gil_freelist!(guard_freelist, 64);
+
+/// `am_send` for `MutexGuard`: the same steps as `send`; the await evaluates to the guard, with
+/// no `StopIteration`.
+///
+/// # Safety
+/// CPython calls it as `tp_as_async->am_send` of `MutexGuard`, attached, with `slf` a live
+/// `MutexGuard`, `arg` a live object and `presult` writable.
+unsafe extern "C" fn guard_am_send(
+    slf: *mut ffi::PyObject,
+    arg: *mut ffi::PyObject,
+    presult: *mut *mut ffi::PyObject,
+) -> ffi::PySendResult {
+    guard_send(|| {
+        // SAFETY: the caller is attached (am_send contract).
+        let py = unsafe { Python::assume_attached() };
+        // SAFETY: `slf` and `arg` are live for the call, and the slot is only installed on
+        // `MutexGuard`.
+        let (guard, arg) = unsafe {
+            (
+                Borrowed::from_ptr(py, slf).cast_unchecked::<MutexGuard>(),
+                Borrowed::from_ptr(py, arg),
+            )
+        };
+        let (result, status) = match guard.get().resume(py, &arg) {
+            Ok(Step::Yield(trap)) => (trap, ffi::PySendResult::PYGEN_NEXT),
+            Ok(Step::Entered) => (
+                guard.to_owned().into_any().unbind(),
+                ffi::PySendResult::PYGEN_RETURN,
+            ),
+            Err(error) => {
+                error.restore(py);
+                return ffi::PySendResult::PYGEN_ERROR;
+            }
+        };
+        // SAFETY: `presult` is writable (am_send contract); it receives a new reference.
+        unsafe { *presult = result.into_ptr() };
+        status
+    })
+}
+
+/// `tp_iternext` for `MutexGuard` (see `async_slots`): the same steps as `__next__`.
+///
+/// # Safety
+/// CPython calls it as `tp_iternext` of `MutexGuard`, attached, with `slf` a live `MutexGuard`.
+unsafe extern "C" fn guard_iternext(slf: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    guard_next(|py| {
+        // SAFETY: `slf` is live for the call, and the slot is only installed on `MutexGuard`.
+        let guard = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<MutexGuard>() };
+        Ok(match guard.get().resume(py, &py.None().into_bound(py))? {
+            Step::Yield(trap) => IterNext::Yield(trap.into_bound(py)),
+            Step::Entered => IterNext::Return(guard.to_owned().into_any()),
+        })
+    })
+}
+
+static GUARD_VALUE: GetterDef = GetterDef(ffi::PyGetSetDef {
+    name: c"value".as_ptr(),
+    get: Some(guard_value),
+    set: None,
+    doc: c"The value the mutex owns.".as_ptr(),
+    closure: core::ptr::null_mut(),
+});
+
+static GUARD_SET: MethodDef = MethodDef(ffi::PyMethodDef {
+    ml_name: c"set".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: guard_set,
+    },
+    ml_flags: ffi::METH_O,
+    ml_doc: c"set($self, value, /)\n--\n\nReplaces the value the mutex owns.".as_ptr(),
+});
+
+/// `MutexGuard.value` (a getter).
+///
+/// # Safety
+/// CPython calls it as the getter of `MutexGuard.value`, attached: `slf` is a live `MutexGuard`.
+unsafe extern "C" fn guard_value(
+    slf: *mut ffi::PyObject,
+    _closure: *mut core::ffi::c_void,
+) -> *mut ffi::PyObject {
+    raw_methods::guard(|py| {
+        // SAFETY: the caller's contract (the descriptor checked the type).
+        let guard = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<MutexGuard>() };
+        guard.get().value(py)
+    })
+}
+
+/// `MutexGuard.set(value)` (`METH_O`).
+///
+/// # Safety
+/// CPython calls it as a `METH_O` method of `MutexGuard`, attached: `slf` is a live
+/// `MutexGuard` and `value` a live object.
+unsafe extern "C" fn guard_set(
+    slf: *mut ffi::PyObject,
+    value: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    raw_methods::guard(|py| {
+        // SAFETY: the caller's contract (the descriptor checked the type).
+        let (guard, value) = unsafe {
+            (
+                Borrowed::from_ptr(py, slf).cast_unchecked::<MutexGuard>(),
+                Borrowed::from_ptr(py, value),
+            )
+        };
+        guard.get().set(py, value.to_owned().unbind())?;
+        Ok(py.None())
+    })
 }
 
 /// `types.GenericAlias(cls, item)`: what `cls[item]` is for a generic class.

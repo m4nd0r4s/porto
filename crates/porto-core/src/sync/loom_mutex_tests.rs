@@ -117,6 +117,44 @@ fn unlock_vs_link_never_loses_the_wakeup() {
     });
 }
 
+/// The holder unlocks (without the queue lock when nobody waits) while a queued waiter waits
+/// and another thread tries to take the lock: the waiter is handed the lock, and the
+/// `try_lock` never barges ahead of it; nobody else holds it meanwhile.
+#[test]
+fn try_lock_never_barges_ahead_of_a_queued_waiter() {
+    loom::model(|| {
+        let mutex = Arc::new(Mutex::new(()));
+        MutexGuard::leak(mutex.try_lock().expect("free"));
+        let node = Box::pin(WaitNode::new(0));
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        // SAFETY: the node is pinned, used with this mutex only, and resolved below.
+        assert!(unsafe { mutex.poll_lock_node(node.as_ref(), &mut cx) }.is_pending());
+        let unlocker = {
+            let mutex = mutex.clone();
+            // SAFETY: the leaked guard gave access to `()` only.
+            thread::spawn(move || assert!(unsafe { mutex.force_unlock() }))
+        };
+        let barger = {
+            let mutex = mutex.clone();
+            thread::spawn(move || mutex.try_lock().map(MutexGuard::leak).is_some())
+        };
+        unlocker.join().unwrap();
+        assert!(
+            !barger.join().unwrap(),
+            "try_lock took the lock from a queued waiter"
+        );
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1, "lost wakeup");
+        // SAFETY: as above.
+        assert!(unsafe { mutex.poll_lock_node(node.as_ref(), &mut cx) }.is_ready());
+        // The handoff left nobody queued: this release takes the fast path.
+        // SAFETY: the node's grant gave access to `()` only.
+        assert!(unsafe { mutex.force_unlock() });
+        assert!(!mutex.is_locked());
+        assert!(mutex.try_lock().is_some());
+    });
+}
+
 /// A granted waiter `a` is cancelled on one thread while the holder unlocks on another and a
 /// late waiter `b` links on a third: `b` ends up holding the lock, nobody is stranded.
 #[test]

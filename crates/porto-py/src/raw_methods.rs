@@ -1,5 +1,6 @@
-//! Methods of a pyclass as plain `METH_NOARGS` / `METH_FASTCALL` C functions, for the calls on
-//! the hottest paths (`async with lock:`'s `__aenter__` and `__aexit__`, porto-itr.7).
+//! Methods of a pyclass as plain `METH_NOARGS` / `METH_O` / `METH_FASTCALL` C functions, and
+//! getters as plain C functions, for the calls on the hottest paths (`async with lock:`'s
+//! `__aenter__` and `__aexit__`, porto-itr.7; `MutexGuard.value` and `set`, porto-szb.118).
 //!
 //! pyo3's method trampoline counts the GIL (a thread local that macOS reaches through a function
 //! call) and looks the type object up to check `self`; a `METH_FASTCALL` method also parses its
@@ -38,6 +39,48 @@ pub(crate) fn install<T: PyTypeInfo>(py: Python<'_>, def: &'static MethodDef) ->
             py,
             ffi::PyDescr_NewMethod(type_ptr, (&raw const def.0).cast_mut()),
         )?;
+        set_in_dict(py, &type_object, def.0.ml_name, &descriptor)
+    }
+}
+
+/// A `PyGetSetDef` with a getter only, which CPython requires to be a static.
+pub(crate) struct GetterDef(pub(crate) ffi::PyGetSetDef);
+
+// SAFETY: as for `MethodDef`: immutable, pointers to statics, only read by CPython.
+unsafe impl Sync for GetterDef {}
+
+/// Makes `def` a read-only attribute of `T` with a raw getter, in place of the pyo3 property of
+/// the same name. Call it once from module init, after `add_class::<T>`.
+pub(crate) fn install_getter<T: PyTypeInfo>(
+    py: Python<'_>,
+    def: &'static GetterDef,
+) -> PyResult<()> {
+    let type_object = T::type_object(py);
+    let type_ptr = type_object.as_type_ptr();
+    // SAFETY: as in `install`; `PyDescr_NewGetSet` requires a static definition.
+    unsafe {
+        let descriptor = Bound::from_owned_ptr_or_err(
+            py,
+            ffi::PyDescr_NewGetSet(type_ptr, (&raw const def.0).cast_mut()),
+        )?;
+        set_in_dict(py, &type_object, def.0.name, &descriptor)
+    }
+}
+
+/// Puts `descriptor` in `type_object`'s dict under `name`.
+///
+/// # Safety
+/// Attached; `type_object` is a live heap type that nothing outside module init can reach yet,
+/// and `name` a NUL-terminated string.
+unsafe fn set_in_dict(
+    py: Python<'_>,
+    type_object: &Bound<'_, pyo3::types::PyType>,
+    name: *const core::ffi::c_char,
+    descriptor: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let type_ptr = type_object.as_type_ptr();
+    // SAFETY: the caller's contract; the type owns its dict.
+    unsafe {
         let dict = (*type_ptr).tp_dict;
         if dict.is_null() {
             return Err(PyImportError::new_err(format!(
@@ -46,7 +89,7 @@ pub(crate) fn install<T: PyTypeInfo>(py: Python<'_>, def: &'static MethodDef) ->
                 type_object.name()?
             )));
         }
-        if ffi::PyDict_SetItemString(dict, def.0.ml_name, descriptor.as_ptr()) < 0 {
+        if ffi::PyDict_SetItemString(dict, name, descriptor.as_ptr()) < 0 {
             return Err(PyErr::fetch(py));
         }
         ffi::PyType_Modified(type_ptr);

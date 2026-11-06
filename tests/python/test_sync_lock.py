@@ -563,3 +563,79 @@ def test_aexit_with_the_wrong_arguments_is_a_type_error(kind: str) -> None:
     with pytest.raises(TypeError, match="doesn't apply to a 'object' object"):
         unbound(object(), None, None, None)
     assert not primitive.locked()
+
+
+@pytest.mark.parametrize("kind", ["Lock", "Mutex"])
+def test_entering_outside_a_runtime_says_where_to_await(kind: str) -> None:
+    # The entry checks where it runs when awaited (porto-szb.115): outside porto.run() that is
+    # a NoRuntimeError naming the call, and the lock stays free.
+    primitive = porto.Lock() if kind == "Lock" else porto.Mutex(0)
+    entering = primitive.__aenter__()
+    with pytest.raises(porto.NoRuntimeError, match=rf"porto\.{kind}\.__aenter__\(\)"):
+        completes_at_once(entering)
+    assert not primitive.locked()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        del entering  # it was awaited: no never-awaited warning
+
+
+@pytest.mark.parametrize("kind", ["Lock", "Mutex"])
+def test_an_entry_awaited_twice_says_to_enter_again(kind: str) -> None:
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "Lock" else porto.Mutex(0)
+        entering = primitive.__aenter__()
+        await entering
+        with pytest.raises(RuntimeError, match=r"awaited again after it finished"):
+            await entering
+        await primitive.__aexit__(None, None, None)
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["Lock", "Mutex"])
+def test_an_entry_refuses_a_first_send_that_is_not_none(kind: str) -> None:
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "Lock" else porto.Mutex(0)
+        steps = primitive.__aenter__().__await__()
+        with pytest.raises(TypeError, match=r"first resume of an awaitable must be send\(None\)"):
+            steps.send(1)
+        steps.close()
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+def test_a_mutex_guard_used_before_its_entry_was_awaited_says_so() -> None:
+    async def main() -> None:
+        mutex = porto.Mutex("value")
+        entering = mutex.__aenter__()
+        assert isinstance(entering, porto.MutexGuard)
+        with pytest.raises(RuntimeError, match=r"used before the mutex was entered"):
+            _ = entering.value
+        with pytest.raises(RuntimeError, match=r"used before the mutex was entered"):
+            entering.set("other")
+        assert repr(entering) == "<porto.MutexGuard not entered>"
+        guard = await entering
+        assert guard is entering
+        assert guard.value == "value"
+        assert repr(guard) == "<porto.MutexGuard value='value'>"
+        await mutex.__aexit__(None, None, None)
+
+    porto.run(main)
+
+
+def test_mutex_guard_set_takes_one_value() -> None:
+    async def main() -> None:
+        mutex = porto.Mutex(0)
+        async with mutex as guard:
+            set_value: Callable[..., object] = guard.set
+            with pytest.raises(TypeError, match=r"set\(\) takes exactly one argument"):
+                set_value()
+            with pytest.raises(TypeError, match=r"set\(\) takes exactly one argument"):
+                set_value(1, 2)
+            with pytest.raises(AttributeError):
+                guard.value = 1  # pyright: ignore[reportAttributeAccessIssue]
+            assert guard.value == 0
+
+    porto.run(main)

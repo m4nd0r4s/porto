@@ -10,12 +10,17 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use super::blocking;
+use super::entry::{Entry, Step, Strong, install_dealloc};
 use super::wait_op::{Grant, SyncWait, Then};
 use crate::api::time::require_lane;
+use crate::async_slots::{self, IterNext, guard_next, guard_send, stop_iteration};
+use crate::driver::fast_new::{FastNew, Unawaited};
+use crate::driver::freelist;
 use crate::driver::ready::ready_none;
-use crate::driver::step::checkpoint_if_needed;
+use crate::driver::step::checkpoint_if_needed_none;
 use crate::driver::thin::{WaitSource, Waitable};
 use crate::raw_methods::{self, MethodDef};
+use crate::throw_args::thrown_exception;
 
 /// The lock: a `Mutex<()>` held without guards, since a Python holder is not a Rust scope.
 pub(super) struct LockSource(Mutex<()>);
@@ -131,20 +136,159 @@ impl Lock {
 }
 
 impl Lock {
-    /// `async with lock:`: `acquire()`'s lazy wait, named for the warning if it is dropped
-    /// unawaited. `async with` awaits it in the same step, and its first resume takes a free
-    /// lock without suspending (T2: `Cancelled` first if the task is cancelled, one unit of
-    /// the budget). Nothing is taken in this call: an exception between it and the await
-    /// leaves the lock free.
-    fn enter(&self, py: Python<'_>) -> PyResult<Py<SyncWait>> {
-        require_lane("Lock.__aenter__")?;
-        SyncWait::with(
-            Grant::Locked(Arc::clone(&self.lock)),
-            Then::Nothing,
-            "Lock.__aenter__()",
+    /// `async with lock:`: a lazy entry (`entry`), named `Lock.__aenter__()` for the warning if
+    /// it is dropped unawaited. `async with` awaits it in the same step, and its first resume
+    /// takes a free lock without suspending (T2: `Cancelled` first if the task is cancelled,
+    /// one unit of the budget). Nothing is taken in this call: an exception between it and the
+    /// await leaves the lock free. Outside a porto runtime the await raises `NoRuntimeError`.
+    fn enter(slf: &Bound<'_, Self>) -> PyResult<Py<LockEntry>> {
+        LOCK_ENTRIES.object(
+            slf.py(),
+            LockEntry {
+                lock: Strong::new(slf),
+                entry: Entry::new(),
+            },
         )
-        .into_object(py)
     }
+}
+
+/// The awaitable of `async with lock:` (`Lock.__aenter__()`): see `entry`.
+#[pyclass(frozen, freelist = 64, module = "porto._core", name = "_LockEntry")]
+pub(super) struct LockEntry {
+    lock: Strong<Lock>,
+    entry: Entry,
+}
+
+impl LockEntry {
+    fn resume(&self, py: Python<'_>, sent: &Bound<'_, PyAny>) -> PyResult<Step> {
+        self.entry
+            .resume(py, &self.lock.py().get().lock, sent, "Lock.__aenter__")
+    }
+}
+
+impl Unawaited for LockEntry {
+    fn unwatch(&mut self) {
+        // Finished rather than forgotten; nothing was taken.
+        self.entry.finish();
+    }
+}
+
+/// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).
+impl Drop for LockEntry {
+    fn drop(&mut self) {
+        if self.entry.never_awaited() {
+            crate::unawaited::warn_never_awaited("Lock.__aenter__()");
+        }
+    }
+}
+
+#[pymethods]
+impl LockEntry {
+    fn __await__(slf: &Bound<'_, Self>) -> Py<Self> {
+        slf.clone().unbind()
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.resume(py, &py.None().into_bound(py))? {
+            Step::Yield(trap) => Ok(Some(trap)),
+            Step::Entered => Ok(None),
+        }
+    }
+
+    #[pyo3(signature = (value, /))]
+    fn send(&self, value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        match self.resume(value.py(), value)? {
+            Step::Yield(trap) => Ok(trap),
+            Step::Entered => Err(stop_iteration(value.py().None().into_bound(value.py()))),
+        }
+    }
+
+    /// The driver gave the wait up before throwing in (T3); the entry is over.
+    #[pyo3(signature = (typ, val = None, tb = None, /))]
+    fn throw(
+        &self,
+        typ: &Bound<'_, PyAny>,
+        val: Option<&Bound<'_, PyAny>>,
+        tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.entry.finish();
+        Err(thrown_exception(typ, val, tb))
+    }
+
+    fn close(&self) {
+        self.entry.finish();
+    }
+}
+
+/// `_LockEntry` objects made without pyo3's generic path.
+static LOCK_ENTRIES: FastNew<LockEntry> = FastNew::new();
+
+/// `_LockEntry`'s raw slots and fast constructor. Call it once from module init, right after
+/// `add_class::<LockEntry>()`.
+pub(super) fn init_entry_type(py: Python<'_>) -> PyResult<()> {
+    async_slots::install_am_send::<LockEntry>(py, lock_entry_am_send)?;
+    async_slots::install_iter_slots::<LockEntry>(py, lock_entry_iternext)?;
+    freelist::install::<LockEntry>(py, &lock_entry_freelist::SLOTS)?;
+    // A finished entry: dropping it does not warn.
+    let probe = LockEntry {
+        lock: Strong::new(&Bound::new(py, Lock::new())?),
+        entry: Entry::new(),
+    };
+    probe.entry.finish();
+    LOCK_ENTRIES.init(py, probe)?;
+    install_dealloc::<LockEntry>(py, &LOCK_ENTRIES)
+}
+
+freelist::gil_freelist!(lock_entry_freelist, 64);
+
+/// `am_send` for `_LockEntry`: the same steps as `send`, with no `StopIteration`.
+///
+/// # Safety
+/// CPython calls it as `tp_as_async->am_send` of `_LockEntry`, attached, with `slf` a live
+/// `_LockEntry`, `arg` a live object and `presult` writable.
+unsafe extern "C" fn lock_entry_am_send(
+    slf: *mut ffi::PyObject,
+    arg: *mut ffi::PyObject,
+    presult: *mut *mut ffi::PyObject,
+) -> ffi::PySendResult {
+    guard_send(|| {
+        // SAFETY: the caller is attached (am_send contract).
+        let py = unsafe { Python::assume_attached() };
+        // SAFETY: `slf` and `arg` are live for the call, and the slot is only installed on
+        // `_LockEntry`.
+        let (entry, arg) = unsafe {
+            (
+                Borrowed::from_ptr(py, slf).cast_unchecked::<LockEntry>(),
+                Borrowed::from_ptr(py, arg),
+            )
+        };
+        let (result, status) = match entry.get().resume(py, &arg) {
+            Ok(Step::Yield(trap)) => (trap, ffi::PySendResult::PYGEN_NEXT),
+            Ok(Step::Entered) => (py.None(), ffi::PySendResult::PYGEN_RETURN),
+            Err(error) => {
+                error.restore(py);
+                return ffi::PySendResult::PYGEN_ERROR;
+            }
+        };
+        // SAFETY: `presult` is writable (am_send contract); it receives a new reference.
+        unsafe { *presult = result.into_ptr() };
+        status
+    })
+}
+
+/// `tp_iternext` for `_LockEntry` (see `async_slots`): the same steps as `__next__`.
+///
+/// # Safety
+/// CPython calls it as `tp_iternext` of `_LockEntry`, attached, with `slf` a live `_LockEntry`.
+unsafe extern "C" fn lock_entry_iternext(slf: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    guard_next(|py| {
+        // SAFETY: `slf` is live for the call, and the slot is only installed on `_LockEntry`.
+        let entry = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<LockEntry>() };
+        Ok(match entry.get().resume(py, &py.None().into_bound(py))? {
+            Step::Yield(trap) => IterNext::Yield(trap.into_bound(py)),
+            Step::Entered => IterNext::Return(py.None().into_bound(py)),
+        })
+    })
 }
 
 /// `Lock.__aenter__` and `Lock.__aexit__`, as raw methods (`raw_methods`).
@@ -182,7 +326,7 @@ unsafe extern "C" fn lock_aenter(
     raw_methods::guard(|py| {
         // SAFETY: the caller's contract (the method descriptor checked the type).
         let lock = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<Lock>() };
-        Ok(lock.get().enter(py)?.into_any())
+        Ok(Lock::enter(&lock)?.into_any())
     })
 }
 
@@ -234,5 +378,5 @@ pub(super) fn release_then_checkpoint(
     if !exc.is_none() {
         return ready_none(py);
     }
-    checkpoint_if_needed(py, py.None())
+    checkpoint_if_needed_none(py)
 }
