@@ -4,7 +4,9 @@
 //!
 //! - [`take_exception`]: the raised exception, normalized, on every version;
 //! - [`names`]: interned attribute names, created once per interpreter;
-//! - [`send`]: `PyIter_Send` that takes ownership of the value it sends.
+//! - [`send`]: `PyIter_Send` that takes ownership of the value it sends;
+//! - [`raise_stop_iteration`]: `StopIteration(value)` for a raw `tp_iternext`, reusing a spare
+//!   exception on GIL builds.
 //!
 //! Rules for the rest of the crate, which free-threaded builds make load-bearing:
 //!
@@ -25,7 +27,9 @@
 mod exception;
 pub mod interned;
 mod send;
+mod stop_iteration;
 
 pub(crate) use exception::take_exception;
 pub use interned::names;
 pub(crate) use send::{Sent, send};
+pub(crate) use stop_iteration::raise_stop_iteration;

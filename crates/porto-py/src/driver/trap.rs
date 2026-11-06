@@ -30,7 +30,7 @@ use pyo3::prelude::*;
 use super::pending::{AbiFuture, IoWait, Kind, Payload, Pending};
 use super::pytask::{PyScopeRef, PyTask, Resume};
 use super::thin::{BoxedFuture, WaitTarget};
-use crate::async_slots::{guard_send, stop_iteration};
+use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
 use crate::throw_args::thrown_exception;
 
 /// Not awaited yet: the next resume suspends.
@@ -370,6 +370,94 @@ pub(crate) unsafe extern "C" fn trap_am_send(
         // SAFETY: `presult` is writable (am_send contract); it receives a new reference.
         unsafe { *presult = result };
         status
+    })
+}
+
+/// Building `_Trap` objects without pyo3's generic path, on GIL builds (porto-szb.117).
+///
+/// `Py::new` reaches the type's `tp_alloc` through `object.__new__` (an argument check and an
+/// empty tuple) after looking the type object up; for the trap of every `porto.checkpoint()`
+/// that was a few ns of a 60 ns budget. [`object`] calls `tp_alloc` (the lock-free freelist,
+/// `freelist.rs`) and writes the trap where pyo3 keeps a `_Trap`'s value, then hands the object
+/// to pyo3, which drops and frees it as one of its own. [`init`] measures where that is on a
+/// probe object made by `Py::new`, and only enables the fast path when the value is all the
+/// object holds past its header (`tp_basicsize` is the value's end: no borrow flag, dict or
+/// weak-reference slot to initialize). Otherwise, and on free-threaded builds, it is `Py::new`.
+pub(crate) mod fast_new {
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+    use pyo3::ffi;
+    use pyo3::prelude::*;
+    use pyo3::type_object::PyTypeInfo;
+
+    use super::Trap;
+
+    /// The `_Trap` type, once [`init`] enabled the fast path.
+    static TYPE: AtomicPtr<ffi::PyTypeObject> = AtomicPtr::new(core::ptr::null_mut());
+    /// Where a `_Trap` object keeps its value, in bytes from its start.
+    static VALUE_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+    /// Enables [`object`]'s fast path if the layout allows it (see the module docs). Call it
+    /// once from module init, after the type's slots are installed.
+    pub(crate) fn init(py: Python<'_>) -> PyResult<()> {
+        if cfg!(Py_GIL_DISABLED) {
+            return Ok(());
+        }
+        let probe = Py::new(py, Trap::yield_now())?;
+        let object = probe.as_ptr();
+        let offset = core::ptr::from_ref(probe.get()).addr() - object.addr();
+        // SAFETY: attached; `probe` is a live `_Trap`, so its type is live.
+        let basic_size = unsafe { (*ffi::Py_TYPE(object)).tp_basicsize };
+        if usize::try_from(basic_size).ok() == Some(offset + size_of::<Trap>()) {
+            VALUE_OFFSET.store(offset, Ordering::Relaxed);
+            TYPE.store(Trap::type_object_raw(py), Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// `trap` as a new `_Trap` object.
+    pub(crate) fn object(py: Python<'_>, trap: Trap) -> PyResult<Py<Trap>> {
+        let type_ptr = TYPE.load(Ordering::Acquire);
+        if type_ptr.is_null() {
+            return Py::new(py, trap);
+        }
+        // SAFETY: attached; `init` checked that a `_Trap` object is its header followed by the
+        // value at `VALUE_OFFSET`, which pyo3 reads, drops and frees like any `_Trap` it made:
+        // `tp_alloc` returns a fresh object of the type with one reference, the write moves
+        // the trap in, and the new reference becomes the `Py`.
+        unsafe {
+            let alloc = (*type_ptr).tp_alloc.unwrap_or(ffi::PyType_GenericAlloc);
+            let object = alloc(type_ptr, 0);
+            if object.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            let offset = VALUE_OFFSET.load(Ordering::Relaxed);
+            object.byte_add(offset).cast::<Trap>().write(trap);
+            Ok(Bound::from_owned_ptr(py, object)
+                .cast_into_unchecked()
+                .unbind())
+        }
+    }
+}
+
+/// `tp_iternext` for `_Trap` (see `async_slots`): the same steps as `__next__`.
+///
+/// # Safety
+///
+/// CPython calls it as `tp_iternext` of `_Trap`, attached, with `slf` a live `_Trap`.
+pub(crate) unsafe extern "C" fn trap_iternext(slf: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    guard_next(|py| {
+        // SAFETY: `slf` is live for the call, and the slot is only installed on `_Trap`.
+        let slf = unsafe { Borrowed::from_ptr(py, slf) };
+        // SAFETY: see above.
+        let trap = unsafe { slf.cast_unchecked::<Trap>() };
+        match trap.get().resume(true) {
+            Step::Suspend => Ok(IterNext::Yield(slf.to_owned())),
+            // `next()` sends None, so the await evaluates to None.
+            Step::Complete => Ok(IterNext::Return(py.None().into_bound(py))),
+            Step::NotStarted => Err(not_started_error()),
+            Step::Reused => Err(reused_error()),
+        }
     })
 }
 
