@@ -143,7 +143,7 @@ porto follows [kinemo](https://github.com/m4nd0r4s/kinemo) and
   which inherit the global git identity: set the same name and email in each
   cache's local config (or scope it with a global `includeIf "gitdir:<repo path>/"`,
   which also covers caches Dolt creates later).
-- **`main` is protected:** changes land through a PR with the eight CI checks green
+- **`main` is protected:** changes land through a PR with the nine required CI checks green (the eight test and lint jobs plus `py-test-debug`)
   (the repository admin may push the beads export directly).
 - **English everywhere:** code, comments, docs, commit messages, beads.
 - **Descriptive names**, **small modules**, **typed public API** (pyright
