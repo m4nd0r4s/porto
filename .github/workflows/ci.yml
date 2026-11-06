@@ -103,7 +103,9 @@ jobs:
   # porto built without --release, so the debug_asserts of porto-core and porto-py run under
   # the Python tests (porto-szb.114: a waiter left filed with its scope only panicked there).
   # tests/python/test_examples.py fails on any stderr output, which is where a panic in a drop
-  # shows up.
+  # shows up. It runs on a debug CPython (Py_DEBUG), whose assertions validate every object the
+  # collector starts tracking (porto-txa: a reused freelist object tracked before its new value
+  # was written only crashed there).
   py-test-debug:
     name: py-test-debug (ubuntu-latest, 3.14)
     runs-on: ubuntu-latest
@@ -112,14 +114,15 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: py3.14-debug
+          key: py3.14-pydebug
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          python-version: "3.14"
+          python-version: "3.14+debug"
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
       # The dev tools without porto: `uv sync` would build it in release.
       - run: uv sync --no-install-package porto
+      - run: uv run --no-sync python -c 'import sys; assert hasattr(sys, "gettotalrefcount"), "not a debug CPython"'
       - run: uv run --no-sync --directory packaging/porto maturin develop
       # --no-sync: a sync would replace the debug build with a release one.
       - run: uv run --no-sync pytest -q

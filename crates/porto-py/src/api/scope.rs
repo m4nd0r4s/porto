@@ -55,7 +55,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(scope, module)?)
 }
 
-freelist::gil_freelist!(exit_freelist, 64, traversed: true);
+freelist::gil_freelist!(exit_freelist, 64);
 
 /// `porto.scope()`: a new scope, to enter with `async with`.
 #[pyfunction]
@@ -197,11 +197,12 @@ impl Scope {
             // T2: no child to wait for, so the exit completes synchronously.
             return Ok(checkpoint_if_needed(py, py.None())?.into_bound(py));
         }
-        // The waiting part: a native awaitable, not a coroutine (porto-itr.7).
-        Ok(Bound::new(
+        // The waiting part: a native awaitable, not a coroutine (porto-itr.7), from a freelist.
+        Ok(freelist::new_tracked(
             py,
             ScopeExit::new(slf.clone().unbind(), exc.clone().unbind()),
         )?
+        .into_bound(py)
         .into_any())
     }
 

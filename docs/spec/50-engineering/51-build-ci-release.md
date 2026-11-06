@@ -15,7 +15,7 @@
 | loom | `RUSTFLAGS="--cfg loom" cargo test -p porto-core --features loom` (nightly-scheduled heavy run) |
 | sanitizers | TSAN/ASAN builds of porto-core + Python free-threaded TSAN build of CPython for the porto-py tests (nightly) |
 | py-test | pytest matrix: 3.11–3.14, 3.14t; Linux epoll, Linux io_uring (privileged runner), macOS, Windows |
-| py-test-debug | pytest (Linux, 3.14) against a debug build of porto, so the `debug_assert`s of porto-core and porto-py run under the Python tests; the examples test fails on any stderr output, where a panic in a drop shows |
+| py-test-debug | pytest (Linux, 3.14) against a debug build of porto on a debug CPython (Py_DEBUG), so the `debug_assert`s of porto-core and porto-py and CPython's own object checks (the collector validates every object it starts tracking) run under the Python tests; the examples test fails on any stderr output, where a panic in a drop shows |
 | deterministic | 1000 seeds of the deterministic suite |
 | compat | asyncpg/redis/httpx/aiohttp test suites under porto (services in containers) |
 | conformance | h2spec, Autobahn |

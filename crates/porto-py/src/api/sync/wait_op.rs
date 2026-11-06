@@ -33,7 +33,7 @@ use super::event::{EventSource, NotifySource};
 use super::lock::LockSource;
 use super::mutex::Mutex;
 use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
-use crate::driver::fast_new::FastNew;
+use crate::driver::fast_new::{FastNew, Unawaited};
 use crate::driver::step;
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
@@ -186,7 +186,7 @@ impl SyncWait {
 }
 
 /// `_SyncWait` objects made without pyo3's generic path.
-static SYNC_WAITS: FastNew<SyncWait> = FastNew::new();
+static SYNC_WAITS: FastNew<SyncWait> = FastNew::tracked();
 
 /// Enables [`SyncWait::into_object`]'s fast path if the layout allows it. Call it once from
 /// module init, after the type's slots are installed.
@@ -199,6 +199,13 @@ pub(super) fn init_fast_new(py: Python<'_>) -> PyResult<()> {
         call: "",
     };
     SYNC_WAITS.init(py, probe)
+}
+
+impl Unawaited for SyncWait {
+    fn unwatch(&mut self) {
+        // Finished rather than forgotten; the grant was never taken.
+        self.state = State::Done;
+    }
 }
 
 /// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).

@@ -6,7 +6,10 @@
 //! for the trap of every `porto.checkpoint()` and the wait of every `async with lock:` that was
 //! a few ns of a budget of tens. [`FastNew::object`] calls `tp_alloc` (the lock-free freelist,
 //! `freelist.rs`), writes the value where pyo3 keeps it and zeroes what pyo3 keeps after it,
-//! then hands the object to pyo3, which borrows, drops and frees it as one of its own.
+//! then hands the object to pyo3, which borrows, drops and frees it as one of its own. For a
+//! class with a `__traverse__` ([`FastNew::tracked`]) it then tracks the object by the
+//! collector, which the freelist leaves to whoever writes the value (`freelist.rs`); so does the
+//! fallback to `Py::new`.
 //!
 //! [`FastNew::init`] measures the layout on a probe object made by `Py::new`, and only enables
 //! the fast path if it is the one this relies on: the value right after the object header (at
@@ -14,6 +17,11 @@
 //! `tp_basicsize` (a borrow flag, nothing for a frozen class) zero in a fresh object, so zeroing
 //! it is pyo3's own initialization. A pyo3 upgrade that changes either falls back to `Py::new`
 //! instead of corrupting memory, and so does a free-threaded build.
+//!
+//! If the allocation fails, the value is dropped without its never-awaited warning
+//! ([`Unawaited::unwatch`]): the caller gets the `MemoryError`, never an awaitable it could
+//! forget. The fallback cannot do that (`Py::new` drops the value itself), so a free-threaded
+//! build out of memory may still warn there.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -23,24 +31,45 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::pyclass_init::PyClassInitializer;
 
+use super::freelist;
+
 /// The fast constructor of one pyclass `T`: a `static`, enabled by [`FastNew::init`].
 pub(crate) struct FastNew<T> {
     /// `T`'s type object, once `init` enabled the fast path; null until then.
     type_ptr: AtomicPtr<ffi::PyTypeObject>,
     /// How many bytes follow the value up to `tp_basicsize`, all zero in a fresh object.
     tail: AtomicUsize,
+    /// Whether a new object is tracked by the collector (`T` has a `__traverse__`).
+    tracked: bool,
     _value: PhantomData<fn(T)>,
 }
 
-impl<T: PyClass + Into<PyClassInitializer<T>>> FastNew<T> {
+/// A value whose `Drop` warns when its awaitable was never awaited (`unawaited.rs`).
+pub(crate) trait Unawaited {
+    /// Stops that warning: the object for the value could not be made.
+    fn unwatch(&mut self);
+}
+
+impl<T: PyClass + Into<PyClassInitializer<T>> + Unawaited> FastNew<T> {
     /// Where the value starts: right after the object header.
     const VALUE_OFFSET: usize = size_of::<ffi::PyObject>().next_multiple_of(align_of::<T>());
 
-    /// Disabled until [`FastNew::init`].
+    /// For a `T` without a `__traverse__`; disabled until [`FastNew::init`].
     pub(crate) const fn new() -> Self {
+        Self::with_tracking(false)
+    }
+
+    /// For a `T` with a `__traverse__`, whose objects the collector tracks; disabled until
+    /// [`FastNew::init`].
+    pub(crate) const fn tracked() -> Self {
+        Self::with_tracking(true)
+    }
+
+    const fn with_tracking(tracked: bool) -> Self {
         Self {
             type_ptr: AtomicPtr::new(core::ptr::null_mut()),
             tail: AtomicUsize::new(0),
+            tracked,
             _value: PhantomData,
         }
     }
@@ -87,18 +116,27 @@ impl<T: PyClass + Into<PyClassInitializer<T>>> FastNew<T> {
     pub(crate) fn object(&self, py: Python<'_>, value: T) -> PyResult<Py<T>> {
         let type_ptr = self.type_ptr.load(Ordering::Acquire);
         if type_ptr.is_null() {
-            return Py::new(py, value);
+            return if self.tracked {
+                freelist::new_tracked(py, value)
+            } else {
+                Py::new(py, value)
+            };
         }
         // SAFETY: attached; `init` checked that a `T` object is its header, the value at
         // `VALUE_OFFSET` and `tail` bytes that a fresh object has zeroed (see the module docs),
         // which pyo3 reads, drops and frees like any `T` it made: `tp_alloc` returns a fresh
         // object of the type with one reference, the writes initialize all of it past the
-        // header, and the new reference becomes the `Py`.
+        // header, and the new reference becomes the `Py`. Only then may the collector track it
+        // (`freelist.rs`), and nothing else can reach it yet.
         unsafe {
             let alloc = (*type_ptr).tp_alloc.unwrap_or(ffi::PyType_GenericAlloc);
             let object = alloc(type_ptr, 0);
             if object.is_null() {
-                return Err(PyErr::fetch(py));
+                let error = PyErr::fetch(py);
+                let mut value = value;
+                value.unwatch();
+                drop(value);
+                return Err(error);
             }
             let value_ptr = object.byte_add(Self::VALUE_OFFSET).cast::<T>();
             value_ptr.write(value);
@@ -106,6 +144,9 @@ impl<T: PyClass + Into<PyClassInitializer<T>>> FastNew<T> {
                 .add(1)
                 .cast::<u8>()
                 .write_bytes(0, self.tail.load(Ordering::Relaxed));
+            if self.tracked {
+                freelist::track_reused(object);
+            }
             Ok(Bound::from_owned_ptr(py, object)
                 .cast_into_unchecked()
                 .unbind())
