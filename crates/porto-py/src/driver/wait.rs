@@ -259,14 +259,19 @@ impl PyTask {
         }
     }
 
-    #[cold]
     fn forget_links(&self, links: u8) {
-        if links & WaitLinks::SCOPE != 0
-            && let Some(scope) = self.innermost_scope()
-        {
+        if links & WaitLinks::SCOPE != 0 {
             // The scope filed with is still the innermost one: scopes are entered and exited
-            // only while the coroutine runs, never during a wait.
-            scope.unregister_waiter(self.key());
+            // only while the coroutine runs, never during a wait. An unlink while the cancel
+            // stack is moved out (during `resume`) would leak the entry, so it is a bug.
+            let scope = self.innermost_scope();
+            debug_assert!(
+                scope.is_some(),
+                "a filed wait unlinked with no innermost scope"
+            );
+            if let Some(scope) = scope {
+                scope.unregister_waiter(self.key());
+            }
         }
         if links & WaitLinks::LANE != 0 {
             lane::forget_linked_wait(self.key());

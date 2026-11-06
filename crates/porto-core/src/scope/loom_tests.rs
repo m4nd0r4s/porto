@@ -210,6 +210,8 @@ fn normal_wake_vs_cancel_unregisters_once() {
         canceller.join().unwrap();
         assert_eq!(scope.lock_state().waiter_count(), 0);
         assert!(wakes.0.load(Ordering::SeqCst) <= 1);
+        // A cancel that missed the entry is still seen by the next check (level-triggered).
+        assert!(scope.is_cancelled());
         drop(waker);
         assert_eq!(
             std::sync::Arc::strong_count(&wakes),
