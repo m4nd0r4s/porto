@@ -642,6 +642,7 @@ dependencies = [
 name = "porto-io"
 version = "0.0.0"
 dependencies = [
+ "loom",
  "mio",
 ]
 
@@ -651,6 +652,7 @@ version = "0.0.0"
 dependencies = [
  "parking_lot",
  "porto-core",
+ "porto-io",
  "pyo3",
  "pyo3-build-config",
 ]

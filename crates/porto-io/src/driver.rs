@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use crate::Interest;
+use crate::{Interest, IoSlab};
 
 /// A backend that waits for readiness of registered OS resources and dispatches it to their
 /// [`ScheduledIo`](crate::ScheduledIo) entries.
@@ -42,7 +42,17 @@ pub trait Driver: Send + Sync {
     /// Unblocks [`turn`](Driver::turn) from another thread.
     fn waker(&self) -> &DriverWaker;
 
-    /// Releases every live registration, waking its waiters with [`Ready::CLOSED`]: the runtime
+    /// The slots holding each registration's readiness, which the tasks waiting on it poll.
+    fn slab(&self) -> &IoSlab;
+
+    /// Whether any resource is registered, so a non-blocking [`turn`](Driver::turn) could
+    /// find an event. The lane skips its periodic non-blocking poll otherwise: an empty
+    /// `kevent` costs about 12 µs on macOS (12-scheduler-and-lanes.md §9).
+    fn has_registrations(&self) -> bool {
+        self.slab().live() > 0
+    }
+
+    /// Releases every live registration, waking its waiters with [`Ready::CLOSED`](crate::Ready::CLOSED): the runtime
     /// calls it when it shuts down, so the wakers parked here (which keep their tasks, and
     /// through them the runtime that owns this driver, alive) are dropped.
     fn shutdown(&self);
@@ -244,6 +254,10 @@ mod tests {
             &self.waker
         }
 
+        fn slab(&self) -> &IoSlab {
+            &self.slab
+        }
+
         fn kind(&self) -> DriverKind {
             DriverKind::Sim
         }
@@ -265,9 +279,11 @@ mod tests {
                 Ok(())
             }),
         });
+        assert!(!driver.has_registrations());
         let id = driver
             .register(RawSource::new(0), Interest::READABLE)
             .unwrap();
+        assert!(driver.has_registrations());
         driver.reregister(id, Interest::WRITABLE).unwrap();
         driver.waker().wake().unwrap();
         assert_eq!(wakes.load(Ordering::Relaxed), 1);

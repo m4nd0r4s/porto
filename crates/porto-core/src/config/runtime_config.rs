@@ -85,6 +85,22 @@ impl RuntimeConfig {
         self.io_backend_strict
     }
 
+    /// `io_backend` and `io_backend_strict` as the I/O driver takes them
+    /// ([`MioDriver::open`](porto_io::MioDriver::open)).
+    pub fn io_backend_config(&self) -> porto_io::IoBackendConfig {
+        let backend = match self.io_backend {
+            IoBackend::Auto => porto_io::IoBackend::Auto,
+            IoBackend::Epoll => porto_io::IoBackend::Epoll,
+            IoBackend::Kqueue => porto_io::IoBackend::Kqueue,
+            IoBackend::Iocp => porto_io::IoBackend::Iocp,
+            IoBackend::IoUring => porto_io::IoBackend::IoUring,
+        };
+        porto_io::IoBackendConfig {
+            backend,
+            strict: self.io_backend_strict,
+        }
+    }
+
     /// How idle lanes steal work.
     pub fn steal(&self) -> Steal {
         self.steal

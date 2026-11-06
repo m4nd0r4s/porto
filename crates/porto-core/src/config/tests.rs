@@ -235,3 +235,19 @@ fn unknown_enum_names_list_the_valid_ones() {
         "porto: \"Eager\" is not a valid steal; use one of: adaptive, off, eager"
     );
 }
+
+#[test]
+fn io_backend_config_carries_the_backend_and_strictness() {
+    let config = RuntimeConfig::builder()
+        .io_backend(IoBackend::Kqueue)
+        .io_backend_strict(true)
+        .build()
+        .unwrap();
+    let io = config.io_backend_config();
+    assert_eq!(io.backend, porto_io::IoBackend::Kqueue);
+    assert!(io.strict);
+    assert_eq!(
+        RuntimeConfig::default().io_backend_config(),
+        porto_io::IoBackendConfig::default()
+    );
+}

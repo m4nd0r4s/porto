@@ -13,3 +13,6 @@ mio.workspace = true
 
 [lints]
 workspace = true
+
+[target."cfg(loom)".dev-dependencies]
+loom = "0.7.2"

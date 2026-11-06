@@ -31,3 +31,60 @@ impl Wake for CountingWaker {
         self.wakes.fetch_add(1, Ordering::SeqCst);
     }
 }
+
+/// A driver with no OS behind it: registrations only take slab slots, and readiness comes
+/// from [`IoSlab::dispatch`](crate::IoSlab::dispatch). Lets miri run the registration code.
+pub(crate) struct SlabDriver {
+    slab: crate::IoSlab,
+    waker: crate::DriverWaker,
+}
+
+impl SlabDriver {
+    pub(crate) fn new() -> Self {
+        Self {
+            slab: crate::IoSlab::new(),
+            waker: crate::DriverWaker::new(|| Ok(())),
+        }
+    }
+}
+
+impl crate::Driver for SlabDriver {
+    fn register(
+        &self,
+        _src: crate::RawSource,
+        _interest: crate::Interest,
+    ) -> std::io::Result<crate::RegistrationId> {
+        self.slab.allocate()
+    }
+
+    fn reregister(
+        &self,
+        _id: crate::RegistrationId,
+        _interest: crate::Interest,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn deregister(&self, id: crate::RegistrationId) -> std::io::Result<()> {
+        self.slab.release(id);
+        Ok(())
+    }
+
+    fn turn(&self, _timeout: Option<std::time::Duration>) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    fn waker(&self) -> &crate::DriverWaker {
+        &self.waker
+    }
+
+    fn slab(&self) -> &crate::IoSlab {
+        &self.slab
+    }
+
+    fn shutdown(&self) {}
+
+    fn kind(&self) -> crate::DriverKind {
+        crate::DriverKind::Sim
+    }
+}

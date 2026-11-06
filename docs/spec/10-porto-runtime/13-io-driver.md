@@ -13,6 +13,11 @@ pub trait Driver: Send + Sync {
     /// Block for at most `timeout`, dispatching readiness to ScheduledIo entries.
     fn turn(&self, timeout: Option<Duration>) -> io::Result<usize>;
     fn waker(&self) -> &DriverWaker;  // unblocks `turn` from another thread
+    fn slab(&self) -> &IoSlab;        // the ScheduledIo entries (§2.1)
+    /// Whether anything is registered; the lane skips its non-blocking poll otherwise (12 §9).
+    fn has_registrations(&self) -> bool { self.slab().live() > 0 }
+    /// Release every registration, waking its waiters (runtime shutdown).
+    fn shutdown(&self);
     fn kind(&self) -> DriverKind;
 }
 ```
@@ -48,9 +53,11 @@ Edge-triggered registration (EPOLLET) is used. Readiness bits are **cleared by t
 - Memory: `RLIMIT_MEMLOCK` issues → fall back with a clear message.
 
 ## 4. Registration lifecycle
-- `Registration::new(source, interest)` → driver.register.
+- `Registration::new(source, interest)` → driver.register. The registration owns the source (an FD on Unix, a socket on Windows).
 - Drop → deregister. The slab entry is kept until the generation is bumped, so stale wakers are ignored.
 - Closing an FD while another task waits on it: `close()` first deregisters, wakes all waiters with `READ_CLOSED|WRITE_CLOSED|ERROR`, then closes the FD. Waiters observe `porto.ClosedResourceError` (a subclass of `OSError`, errno `EBADF`).
+- Close while another task operates on it: each operation holds a reference to the source for the duration of its syscall, and `close()` holds one while it deregisters. `close()` marks the registration closed (no new operation starts), and the FD is closed when the last reference is dropped (Go's `fdMutex` scheme). So the driver never deregisters, and no operation ever uses, an FD number that the close freed and the OS gave to another resource. A loom model covers the race (`close_gate::loom_tests`).
+- A closed registration never reads its slab entry again: its own closed state is checked first, so neither a reused slot nor the 8-bit generation wrapping lets a later owner's readiness reach it. A registration released by the driver (runtime shutdown) fails the same way, with an error that says the runtime shut down.
 
 ## 5. The IoOp enum (used by Trap::Io)
 

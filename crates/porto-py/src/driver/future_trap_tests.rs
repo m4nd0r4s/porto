@@ -38,7 +38,8 @@ fn run_main(trap: TrapKind) -> (String, String) {
         let outcome = lane::run(py, &RuntimeConfig::default(), |runtime| {
             let main = pytask::spawn(runtime.handle(), coro, Spawned::Joined).unwrap();
             runtime.block_on(pytask::join(main))
-        });
+        })
+        .expect("the I/O driver opens");
         let (tag, value): (String, Bound<'_, PyAny>) = outcome
             .into_result(py)
             .unwrap()

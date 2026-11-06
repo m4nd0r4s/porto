@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use porto_io::{Driver, DriverKind, DriverWaker, Interest, RawSource, RegistrationId};
+use porto_io::{Driver, DriverKind, DriverWaker, Interest, IoSlab, RawSource, RegistrationId};
 
 use super::context::current_tick;
 use super::lane::GLOBAL_QUEUE_INTERVAL;
@@ -270,11 +270,13 @@ fn run_until_idle_runs_deferred_work() {
 }
 
 /// A driver with no OS behind it: counts its turns, and blocks a turn with a timeout until it
-/// is woken or the timeout passes.
+/// is woken or the timeout passes. It reports registrations only if built `registered`.
 #[derive(Default)]
 struct CountingDriver {
     state: Arc<(Mutex<DriverState>, Condvar)>,
     waker: Option<DriverWaker>,
+    slab: IoSlab,
+    registered: bool,
 }
 
 #[derive(Default)]
@@ -287,6 +289,15 @@ struct DriverState {
 
 impl CountingDriver {
     fn new() -> Arc<Self> {
+        Self::build(false)
+    }
+
+    /// One that claims a live registration, so the lane polls it at maintenance.
+    fn registered() -> Arc<Self> {
+        Self::build(true)
+    }
+
+    fn build(registered: bool) -> Arc<Self> {
         let state: Arc<(Mutex<DriverState>, Condvar)> = Arc::default();
         let waker_state = state.clone();
         Arc::new(Self {
@@ -299,6 +310,8 @@ impl CountingDriver {
                 condvar.notify_all();
                 Ok(())
             })),
+            slab: IoSlab::new(),
+            registered,
         })
     }
 
@@ -346,6 +359,12 @@ impl Driver for CountingDriver {
     fn waker(&self) -> &DriverWaker {
         self.waker.as_ref().unwrap()
     }
+    fn slab(&self) -> &IoSlab {
+        &self.slab
+    }
+    fn has_registrations(&self) -> bool {
+        self.registered
+    }
     fn kind(&self) -> DriverKind {
         DriverKind::Sim
     }
@@ -353,7 +372,7 @@ impl Driver for CountingDriver {
 
 #[test]
 fn maintenance_polls_the_driver_without_blocking_every_event_interval() {
-    let driver = CountingDriver::new();
+    let driver = CountingDriver::registered();
     let rt = Runtime::builder().driver(driver.clone()).build();
     let yields = 61 * 20;
     let busy = rt.spawn(async move {
@@ -367,6 +386,23 @@ fn maintenance_polls_the_driver_without_blocking_every_event_interval() {
         zero >= 20,
         "{zero} non-blocking polls in {yields} ticks of a busy lane"
     );
+    assert_eq!(blocking, 0, "a busy lane never blocks in the driver");
+}
+
+/// An empty non-blocking poll costs about 12 µs on macOS: with nothing registered there is
+/// nothing to find, so a busy lane never pays it.
+#[test]
+fn maintenance_skips_the_driver_while_nothing_is_registered() {
+    let driver = CountingDriver::new();
+    let rt = Runtime::builder().driver(driver.clone()).build();
+    let busy = rt.spawn(async move {
+        for _ in 0..61 * 20 {
+            yield_now().await;
+        }
+    });
+    rt.block_on(busy).unwrap();
+    let (zero, blocking, _) = driver.snapshot();
+    assert_eq!(zero, 0, "no non-blocking poll without registrations");
     assert_eq!(blocking, 0, "a busy lane never blocks in the driver");
 }
 

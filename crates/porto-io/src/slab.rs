@@ -1,6 +1,7 @@
 //! [`IoSlab`]: the generation-tagged slots holding every registration's [`ScheduledIo`].
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::driver::RESERVED_INDEX;
@@ -26,6 +27,9 @@ const _: () = assert!(CAPACITY <= RESERVED_INDEX);
 pub struct IoSlab {
     pages: [OnceLock<Box<[ScheduledIo]>>; PAGES],
     allocator: Mutex<Allocator>,
+    /// Slots allocated and not released, readable without the lock: the lane skips its
+    /// non-blocking driver poll while this is 0 (12-scheduler-and-lanes.md §9).
+    live: AtomicUsize,
 }
 
 struct Allocator {
@@ -63,6 +67,7 @@ impl IoSlab {
                 next_unused: 0,
                 limit,
             }),
+            live: AtomicUsize::new(0),
         }
     }
 
@@ -92,7 +97,14 @@ impl IoSlab {
         };
         let (page, offset) = locate(index);
         let entry = &self.pages[page].get_or_init(|| new_page(page))[offset];
+        self.live.fetch_add(1, Ordering::Relaxed);
         Ok(RegistrationId::new(index, entry.generation()))
+    }
+
+    /// How many slots are allocated and not released. A snapshot: registrations made on other
+    /// threads may not be counted yet.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// The slot of a live registration, or `None` when `id` is stale or was never allocated.
@@ -118,11 +130,12 @@ impl IoSlab {
             .unwrap_or_else(PoisonError::into_inner)
             .free
             .push(id.index());
+        self.live.fetch_sub(1, Ordering::Relaxed);
         true
     }
 
     /// The slot at `id`'s index, whatever its generation.
-    fn slot(&self, id: RegistrationId) -> Option<&ScheduledIo> {
+    pub(crate) fn slot(&self, id: RegistrationId) -> Option<&ScheduledIo> {
         if id.index() >= CAPACITY {
             return None;
         }
@@ -166,7 +179,9 @@ mod tests {
         let slab = IoSlab::new();
         let first = slab.allocate().unwrap();
         assert!(slab.get(first).is_some());
+        assert_eq!(slab.live(), 1);
         assert!(slab.release(first));
+        assert_eq!(slab.live(), 0);
         assert!(slab.get(first).is_none(), "a released ID is stale");
         assert!(!slab.release(first), "releasing twice is refused");
 
