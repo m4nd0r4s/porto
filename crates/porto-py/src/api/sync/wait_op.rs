@@ -1,11 +1,12 @@
-//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()`, `Lock.acquire()` and
-//! `async with` on a `Lock` or `Mutex` (16-sync-primitives-and-channels.md §1).
+//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()` and `Lock.acquire()`
+//! (16-sync-primitives-and-channels.md §1). `async with` on a `Lock` or `Mutex` follows the
+//! same rules with a lighter object of its own (`entry`).
 //!
 //! Nothing happens until it is awaited, so a `notified()` created and never awaited consumes
-//! no permit, and an `acquire()` or `__aenter__()` never awaited takes no lock. A grant is only
-//! ever taken in the step that hands it to the coroutine, so a task closed or cancelled at any
-//! suspension point cannot hold a grant it never saw, and neither can one that an exception
-//! stops between calling `__aenter__` and awaiting it (3.14 runs hooks in between):
+//! no permit, and an `acquire()` never awaited takes no lock. A grant is only ever taken in the
+//! step that hands it to the coroutine, so a task closed or cancelled at any suspension point
+//! cannot hold a grant it never saw, and neither can one that an exception stops between the
+//! call and the await (3.14 runs hooks in between):
 //!
 //! - the first resume spends one unit of the task's budget (T2). If that ran the budget out,
 //!   it takes nothing: it yields a `Yield` trap and tries again on the next resume, after the
@@ -31,7 +32,6 @@ use pyo3::prelude::*;
 
 use super::event::{EventSource, NotifySource};
 use super::lock::LockSource;
-use super::mutex::Mutex;
 use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
 use crate::driver::fast_new::{FastNew, Unawaited};
 use crate::driver::step;
@@ -97,8 +97,6 @@ pub(super) enum Then {
     /// The result of calling this; if it raises, the grant is given back and the await raises
     /// (`Lock._acquire_then`).
     Call(Py<PyAny>),
-    /// A guard for the block that now holds this mutex (`Mutex.__aenter__`).
-    Guard(Py<Mutex>),
 }
 
 /// An awaitable wait on a sync primitive.
@@ -151,7 +149,6 @@ impl SyncWait {
         let result = match std::mem::replace(&mut self.then, Then::Nothing) {
             Then::Nothing => return Ok(Stepped::Return(py.None())),
             Then::Call(then) => then.call0(py),
-            Then::Guard(mutex) => Mutex::guard(mutex.bind(py)).map(Py::into_any),
         };
         result
             .map(Stepped::Return)
@@ -301,7 +298,6 @@ impl SyncWait {
         match &self.then {
             Then::Nothing => Ok(()),
             Then::Call(then) => visit.call(then),
-            Then::Guard(mutex) => visit.call(mutex),
         }
     }
 

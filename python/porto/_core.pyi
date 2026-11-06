@@ -245,7 +245,9 @@ class Lock:
 
         The wait does not check for signals: Ctrl-C does not interrupt it."""
 
-    def __aenter__(self) -> _SyncWait[None]: ...
+    def __aenter__(self) -> Awaitable[None]:
+        """The entry ``async with lock:`` awaits: lazy like ``acquire()``, and named
+        ``Lock.__aenter__()`` in the warning if it is never awaited."""
     def __aexit__(
         self,
         exc_type: type[BaseException] | None,
@@ -257,8 +259,12 @@ class Lock:
 @final
 class MutexGuard(Generic[_T]):
     """Access to a ``porto.Mutex``'s value while its lock is held; what ``async with`` gives.
-    It stops working when the block exits (``RuntimeError``)."""
+    It stops working when the block exits (``RuntimeError``).
 
+    ``Mutex.__aenter__()`` returns the guard itself, not entered yet: awaiting it once takes
+    the lock and evaluates to the guard (``async with`` does both)."""
+
+    def __await__(self) -> Generator[_Trap, object, Self]: ...
     @property
     def value(self) -> _T:
         """The value the mutex owns."""
@@ -281,7 +287,7 @@ class Mutex(Generic[_T]):
     def locked(self) -> bool:
         """Whether the lock is held (or being handed to a waiter)."""
 
-    def __aenter__(self) -> _SyncWait[MutexGuard[_T]]: ...
+    def __aenter__(self) -> MutexGuard[_T]: ...
     def __aexit__(
         self,
         exc_type: type[BaseException] | None,

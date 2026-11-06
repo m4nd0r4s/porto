@@ -7,14 +7,16 @@
 //! no allocation per wait, and a task that gives the wait up (T3) unlinks the node or passes an
 //! unobserved exclusive grant on. A wait that is over at once is a synchronous completion (T2),
 //! and a grant is only taken in the step that hands it to the coroutine. `async with` on a
-//! `Lock` or `Mutex` is the same lazy wait: `__aenter__` takes nothing, and the statement's
-//! await takes a free lock on the first resume, without suspending.
+//! `Lock` or `Mutex` waits the same way through a lighter, frozen entry object (`entry`; for a
+//! `Mutex`, the guard itself): `__aenter__` takes nothing, and the statement's await takes a
+//! free lock on the first resume, without suspending.
 //!
 //! The objects are thread-safe: the methods that do not wait can be called from any thread,
 //! and `blocking_*` waits from threads that do not run porto. A `blocking_*` wait runs with
 //! the thread detached from Python and does not check for signals, so Ctrl-C does not
 //! interrupt it: the `KeyboardInterrupt` is raised once the wait is over.
 
+mod entry;
 mod event;
 mod lock;
 mod mutex;
@@ -40,14 +42,15 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<event::Notify>()?;
     module.add_class::<lock::Lock>()?;
     lock::install_raw_methods(module.py())?;
+    module.add_class::<lock::LockEntry>()?;
+    lock::init_entry_type(module.py())?;
     module.add_class::<mutex::Mutex>()?;
     mutex::install_raw_methods(module.py())?;
     module.add_class::<mutex::MutexGuard>()?;
-    freelist::install::<mutex::MutexGuard>(module.py(), &guard_freelist::SLOTS)
+    mutex::init_guard_type(module.py())
 }
 
 freelist::gil_freelist!(sync_wait_freelist, 256);
-freelist::gil_freelist!(guard_freelist, 64);
 
 /// Runs a `blocking_*` wait with the thread detached from Python, after refusing a porto lane
 /// thread: waiting there would stall every task on the lane.
