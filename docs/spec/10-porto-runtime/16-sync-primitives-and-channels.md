@@ -24,6 +24,8 @@ Awaiting: `wait()`, `notified()` and `acquire()` return lazy awaitables; nothing
 
 `async with` on a `Lock` or `Mutex` follows the same rule: `__aenter__()` returns the same lazy wait as `acquire()` (for a `Mutex`, one that evaluates to the guard) and takes nothing itself. The statement awaits it at once, and its first resume takes a free lock without suspending (a T2 synchronous completion: it raises `Cancelled` first if the task is cancelled, and spends a unit of the budget). An exception between the call and the await (from 3.14 a profile or trace hook runs there, and a `KeyboardInterrupt` can land there) therefore leaves the lock free, and an `__aenter__()` dropped unawaited takes nothing and warns like `acquire()`.
 
+The result of an await can outlive the last reference the task holds, until the task next suspends or ends. On 3.12+ GIL builds, a porto awaitable that completes with a value other than `None` can return it through one reused `StopIteration` (`11` §6), which keeps the latest such result until the task gives its lane up: after `async with mutex as guard:` and `del guard` in the same step, the guard (and the mutex it references) is freed only at the task's next suspension. Code MUST NOT rely on an await's result being freed before the task next suspends. 3.11 and free-threaded builds do not keep it.
+
 ## 2. Channels
 
 ```python

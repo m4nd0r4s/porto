@@ -59,6 +59,12 @@ pub(crate) fn install<T: PyTypeInfo>(py: Python<'_>, def: &'static MethodDef) ->
 pub(crate) fn guard(body: impl FnOnce(Python<'_>) -> PyResult<Py<PyAny>>) -> *mut ffi::PyObject {
     catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: CPython calls methods attached.
+        //
+        // pyo3 does not count the thread as attached here (no trampoline raised its count), so
+        // a `Py` the body drops is not released at once: pyo3 parks it in its reference pool
+        // and releases it the next time it attaches the thread (the next pyo3 method call). A
+        // `Bound` is released at once. Neither is unsound, but an object dropped as a `Py`
+        // lives a little longer (its `__del__` or a weakref callback runs later).
         let py = unsafe { Python::assume_attached() };
         match body(py) {
             Ok(result) => result.into_ptr(),
