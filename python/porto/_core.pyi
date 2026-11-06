@@ -41,6 +41,13 @@ def run(
     one lane for now; once multi-lane scheduling lands it picks more lanes for the machine,
     with no change to code that passes it.
 
+    ``main`` is the first task of the runtime's root scope, a nursery: a task of the root
+    scope that fails cancels it, and with it ``main``. Once ``main`` ended, the tasks still in
+    the root scope are cancelled and waited for, up to ``cancel_timeout``. It then returns
+    main's result or raises main's exception; if tasks of the root scope failed, it raises an
+    ``ExceptionGroup`` (``BaseExceptionGroup`` if one is not an ``Exception``) of main's
+    exception, first, and theirs.
+
     Ctrl-C raises ``KeyboardInterrupt`` out of it within about 50 ms, also while every task
     sleeps. A ``KeyboardInterrupt`` or ``SystemExit`` raised by a task nobody waits for also
     stops the run and is raised here. Tasks still running when it returns are closed. Raises
@@ -494,6 +501,11 @@ def _run(coro: Coroutine[Any, Any, _T], /) -> _T:
 
     Tasks it spawned that are still running when it returns are closed.
     """
+
+def _root_scope() -> Scope:
+    """The root scope of the running ``porto.run`` (what ``Runtime.root_scope`` will return):
+    its tasks outlive the scopes ``main`` opens, and one that fails cancels ``main``.
+    ``porto.NoRuntimeError`` outside ``porto.run``."""
 
 def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
     """Starts ``coro`` as a task on the running runtime. An ``Exception`` it raises goes to

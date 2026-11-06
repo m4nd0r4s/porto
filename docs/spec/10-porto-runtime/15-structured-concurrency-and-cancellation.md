@@ -64,7 +64,7 @@ Optimization: each task caches `(scope_id, cancel_epoch_snapshot)` and the walk'
 - **C9 Deadlines nest:** the effective deadline is the min over unshielded ancestors. Setting `scope.deadline` later re-arms the timer.
 - **C10 Cross-lane:** scopes span lanes. `cancel()` from any lane or thread is safe. It bumps the epoch, then wakes every waiting task in the subtree whose pending trap is cancellable (the `waiters` of each scope the cancel reaches, collected under the locks and woken after them). Wakes are delivered to owning lanes via inbox.
 - **C11 Cancelled type:** `porto.Cancelled(asyncio.CancelledError)`. Users MUST NOT swallow it. The debug mode warns when a task finishes normally after having been delivered `Cancelled` inside an effectively-cancelled scope ("cancellation was swallowed").
-- **C12 Unhandled errors in the root scope:** if `main` raises, `porto.run` re-raises after shutdown. Background tasks in the root scope that fail cancel `main` (the root scope is a nursery).
+- **C12 Unhandled errors in the root scope:** if `main` raises, `porto.run` re-raises after shutdown. Background tasks in the root scope that fail cancel `main` (the root scope is a nursery). `main` is the root scope's first task, and the scopes it opens nest in the root scope, so a failure there cancels them too. Once `main` ended, the root scope is cancelled (`Shutdown`) and `porto.run` waits up to `cancel_timeout` for the tasks left in it (§26 §2), then closes it (C7). It returns main's result, or raises main's exception as is, when no other task of the root scope failed; otherwise it raises the strict group `porto root scope failed` (ADR-009) of main's exception, first, and the other failures.
 
 ## 3. `start()` protocol
 ```python

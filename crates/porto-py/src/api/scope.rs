@@ -36,7 +36,7 @@ use super::scope_exit;
 use super::scope_exit::ScopeExit;
 use super::task::Task;
 use crate::async_slots;
-use crate::driver::pytask::{self, PyScopeNode, Spawned};
+use crate::driver::pytask::{self, PyScopeNode, PyScopeRef, Spawned};
 use crate::driver::ready::{Ready, ready_none};
 use crate::driver::step::{self, checkpoint_if_needed, checkpoint_if_needed_none};
 use crate::driver::trap::TrapKind;
@@ -301,6 +301,15 @@ impl Scope {
 }
 
 impl Scope {
+    /// The `Scope` of a runtime's root scope, `node` (C12): open from the start, entered by no
+    /// task. `porto.run` closes it once its children are done.
+    pub(crate) fn root(node: PyScopeRef) -> Self {
+        let scope = scope();
+        let _unset = scope.node.set(node);
+        scope.flags.store(ScopeFlags::ENTERED, Ordering::Release);
+        scope
+    }
+
     /// [`Scope::spawn`], without closing a rejected coroutine.
     fn spawn_child(
         &self,
