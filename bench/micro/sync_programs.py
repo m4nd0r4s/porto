@@ -1,5 +1,6 @@
-"""Sync-primitive benchmarks: ``porto.Lock``, ``Mutex``, ``Event`` and ``Notify`` against
-``asyncio.Lock``, ``asyncio.Event`` and ``asyncio.Condition`` doing the same work.
+"""Sync-primitive benchmarks: ``porto.Lock``, ``Mutex``, ``Semaphore``, ``Event`` and ``Notify``
+against ``asyncio.Lock``, ``asyncio.Semaphore``, ``asyncio.Event`` and ``asyncio.Condition``
+doing the same work.
 
 53-benchmarks.md §2 "Lock contention 100 tasks" (at least 2 times asyncio+uvloop) and
 16-sync-primitives-and-channels.md §1. Each porto program and its asyncio twin run the same
@@ -59,6 +60,36 @@ async def asyncio_lock_uncontended(loops: int) -> float:
     started = time.perf_counter()
     for _ in range(loops):
         async with lock:
+            counter.value += 1
+    elapsed = time.perf_counter() - started
+    counter.check(loops)
+    return elapsed
+
+
+# semaphore_uncontended: `async with semaphore` with permits to spare, per acquire+release -----
+
+#: Permits of the uncontended-semaphore row: more than one, so it is not a lock in disguise.
+SEMAPHORE_PERMITS = 4
+
+
+async def porto_semaphore_uncontended(loops: int) -> float:
+    semaphore = porto.Semaphore(SEMAPHORE_PERMITS)
+    counter = Counter()
+    started = time.perf_counter()
+    for _ in range(loops):
+        async with semaphore:
+            counter.value += 1
+    elapsed = time.perf_counter() - started
+    counter.check(loops)
+    return elapsed
+
+
+async def asyncio_semaphore_uncontended(loops: int) -> float:
+    semaphore = asyncio.Semaphore(SEMAPHORE_PERMITS)
+    counter = Counter()
+    started = time.perf_counter()
+    for _ in range(loops):
+        async with semaphore:
             counter.value += 1
     elapsed = time.perf_counter() - started
     counter.check(loops)
@@ -241,6 +272,7 @@ async def asyncio_notify_handoff(loops: int) -> float:
 
 BENCHMARKS: list[Benchmark] = [
     *variants("lock_uncontended", porto_lock_uncontended, asyncio_lock_uncontended),
+    *variants("semaphore_uncontended", porto_semaphore_uncontended, asyncio_semaphore_uncontended),
     *variants(
         "lock_contended", porto_lock_contended, asyncio_lock_contended, inner_loops=CONTENDERS
     ),
