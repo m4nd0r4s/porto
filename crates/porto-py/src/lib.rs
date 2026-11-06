@@ -10,6 +10,7 @@ pub mod async_slots;
 pub mod driver;
 pub mod errors;
 mod py_compat;
+mod raw_methods;
 pub mod testing;
 mod throw_args;
 mod unawaited;

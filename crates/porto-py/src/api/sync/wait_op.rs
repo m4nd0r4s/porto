@@ -33,6 +33,7 @@ use super::event::{EventSource, NotifySource};
 use super::lock::LockSource;
 use super::mutex::Mutex;
 use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
+use crate::driver::fast_new::FastNew;
 use crate::driver::step;
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
@@ -140,6 +141,11 @@ impl SyncWait {
         }
     }
 
+    /// This wait as a new `_SyncWait` object, over the freelist (`fast_new.rs`).
+    pub(super) fn into_object(self, py: Python<'_>) -> PyResult<Py<Self>> {
+        SYNC_WAITS.object(py, self)
+    }
+
     /// The grant is taken: what the await evaluates to.
     fn granted(&mut self, py: Python<'_>, grant: &Grant) -> PyResult<Stepped> {
         let result = match std::mem::replace(&mut self.then, Then::Nothing) {
@@ -177,6 +183,22 @@ impl SyncWait {
             State::Done => Err(reused_error()),
         }
     }
+}
+
+/// `_SyncWait` objects made without pyo3's generic path.
+static SYNC_WAITS: FastNew<SyncWait> = FastNew::new();
+
+/// Enables [`SyncWait::into_object`]'s fast path if the layout allows it. Call it once from
+/// module init, after the type's slots are installed.
+pub(super) fn init_fast_new(py: Python<'_>) -> PyResult<()> {
+    // A finished wait: dropping it does not warn.
+    let probe = SyncWait {
+        state: State::Done,
+        started: false,
+        then: Then::Nothing,
+        call: "",
+    };
+    SYNC_WAITS.init(py, probe)
 }
 
 /// Never resumed, thrown into or closed: the `await` was forgotten (see `unawaited.rs`).

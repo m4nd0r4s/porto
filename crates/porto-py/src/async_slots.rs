@@ -150,7 +150,7 @@ pub(crate) fn guard_send(body: impl FnOnce() -> ffi::PySendResult) -> ffi::PySen
 }
 
 /// Raises a Rust panic that a raw slot caught as `porto.RustPanic`.
-fn raise_panic(payload: &(dyn std::any::Any + Send)) {
+pub(crate) fn raise_panic(payload: &(dyn std::any::Any + Send)) {
     // SAFETY: slots are called with an attached thread state.
     let py = unsafe { Python::assume_attached() };
     // Raising `RustPanic` imports `porto.errors`, which panics if the import fails (an

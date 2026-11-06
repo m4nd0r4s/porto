@@ -39,10 +39,13 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         sync_wait_freelist::alloc,
         sync_wait_freelist::free,
     )?;
+    wait_op::init_fast_new(module.py())?;
     module.add_class::<event::Event>()?;
     module.add_class::<event::Notify>()?;
     module.add_class::<lock::Lock>()?;
+    lock::install_raw_methods(module.py())?;
     module.add_class::<mutex::Mutex>()?;
+    mutex::install_raw_methods(module.py())?;
     module.add_class::<mutex::MutexGuard>()?;
     freelist::install::<mutex::MutexGuard>(module.py(), guard_freelist::alloc, guard_freelist::free)
 }

@@ -545,3 +545,21 @@ def test_acquire_then_gives_the_lock_back_if_its_callback_raises() -> None:
         assert not lock.locked()
 
     porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["Lock", "Mutex"])
+def test_aexit_with_the_wrong_arguments_is_a_type_error(kind: str) -> None:
+    primitive = porto.Lock() if kind == "Lock" else porto.Mutex(0)
+    exit_method: Callable[..., object] = primitive.__aexit__
+    with pytest.raises(
+        TypeError,
+        match=rf"{kind}\.__aexit__\(\) takes exactly 3 positional arguments "
+        r"\(exc_type, exc, traceback\), 2 given",
+    ):
+        exit_method(None, None)
+    with pytest.raises(TypeError, match="keyword arguments"):
+        exit_method(None, None, traceback=None)
+    unbound: Callable[..., object] = type(primitive).__aexit__
+    with pytest.raises(TypeError, match="doesn't apply to a 'object' object"):
+        unbound(object(), None, None, None)
+    assert not primitive.locked()

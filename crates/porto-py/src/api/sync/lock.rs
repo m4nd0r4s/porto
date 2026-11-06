@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 
 use porto_core::sync::{Mutex, MutexGuard, WaitNode};
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::ffi;
 use pyo3::prelude::*;
 
 use super::blocking;
@@ -14,6 +15,7 @@ use crate::api::time::require_lane;
 use crate::driver::ready::ready_none;
 use crate::driver::step::checkpoint_if_needed;
 use crate::driver::thin::{WaitSource, Waitable};
+use crate::raw_methods::{self, MethodDef};
 
 /// The lock: a `Mutex<()>` held without guards, since a Python holder is not a Rust scope.
 pub(super) struct LockSource(Mutex<()>);
@@ -76,21 +78,22 @@ impl Lock {
     /// An awaitable that completes once the task holds the lock: without suspending if it is
     /// free. Nothing happens until it is awaited, and the lock is only taken in the step that
     /// resumes the task with it: cancelling or closing the task never leaks it.
-    fn acquire(&self) -> PyResult<SyncWait> {
+    fn acquire(&self, py: Python<'_>) -> PyResult<Py<SyncWait>> {
         require_lane("Lock.acquire")?;
-        Ok(SyncWait::new(Grant::Locked(Arc::clone(&self.lock))))
+        SyncWait::new(Grant::Locked(Arc::clone(&self.lock))).into_object(py)
     }
 
     /// `acquire()`, then `on_acquired()` in the same step; the await evaluates to its result
     /// (if it raises, the lock is released and the await raises). Internal, for the tests: the
     /// way `porto.Mutex` makes its guard, with a Python callback.
-    fn _acquire_then(&self, on_acquired: Py<PyAny>) -> PyResult<SyncWait> {
+    fn _acquire_then(&self, py: Python<'_>, on_acquired: Py<PyAny>) -> PyResult<Py<SyncWait>> {
         require_lane("Lock._acquire_then")?;
-        Ok(SyncWait::with(
+        SyncWait::with(
             Grant::Locked(Arc::clone(&self.lock)),
             Then::Call(on_acquired),
             "Lock._acquire_then()",
-        ))
+        )
+        .into_object(py)
     }
 
     /// Takes the lock if it is free right now; returns whether it did. Never waits.
@@ -118,31 +121,6 @@ impl Lock {
         })
     }
 
-    /// `async with lock:`: `acquire()`'s lazy wait, named for the warning if it is dropped
-    /// unawaited. `async with` awaits it in the same step, and its first resume takes a free
-    /// lock without suspending (T2: `Cancelled` first if the task is cancelled, one unit of
-    /// the budget). Nothing is taken in this call: an exception between it and the await
-    /// leaves the lock free.
-    fn __aenter__(&self) -> PyResult<SyncWait> {
-        require_lane("Lock.__aenter__")?;
-        Ok(SyncWait::with(
-            Grant::Locked(Arc::clone(&self.lock)),
-            Then::Nothing,
-            "Lock.__aenter__()",
-        ))
-    }
-
-    #[pyo3(signature = (_exc_type, exc, _traceback, /))]
-    fn __aexit__(
-        &self,
-        py: Python<'_>,
-        _exc_type: &Bound<'_, PyAny>,
-        exc: &Bound<'_, PyAny>,
-        _traceback: &Bound<'_, PyAny>,
-    ) -> PyResult<Py<PyAny>> {
-        release_then_checkpoint(py, &self.lock, exc)
-    }
-
     fn __repr__(&self) -> &'static str {
         if self.lock.is_locked() {
             "<porto.Lock locked>"
@@ -150,6 +128,82 @@ impl Lock {
             "<porto.Lock unlocked>"
         }
     }
+}
+
+impl Lock {
+    /// `async with lock:`: `acquire()`'s lazy wait, named for the warning if it is dropped
+    /// unawaited. `async with` awaits it in the same step, and its first resume takes a free
+    /// lock without suspending (T2: `Cancelled` first if the task is cancelled, one unit of
+    /// the budget). Nothing is taken in this call: an exception between it and the await
+    /// leaves the lock free.
+    fn enter(&self, py: Python<'_>) -> PyResult<Py<SyncWait>> {
+        require_lane("Lock.__aenter__")?;
+        SyncWait::with(
+            Grant::Locked(Arc::clone(&self.lock)),
+            Then::Nothing,
+            "Lock.__aenter__()",
+        )
+        .into_object(py)
+    }
+}
+
+/// `Lock.__aenter__` and `Lock.__aexit__`, as raw methods (`raw_methods`).
+pub(super) fn install_raw_methods(py: Python<'_>) -> PyResult<()> {
+    raw_methods::install::<Lock>(py, &LOCK_AENTER)?;
+    raw_methods::install::<Lock>(py, &LOCK_AEXIT)
+}
+
+static LOCK_AENTER: MethodDef = MethodDef(ffi::PyMethodDef {
+    ml_name: c"__aenter__".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunction: lock_aenter,
+    },
+    ml_flags: ffi::METH_NOARGS,
+    ml_doc: c"__aenter__($self, /)\n--\n\nWaits for the lock: `async with lock:`.".as_ptr(),
+});
+
+static LOCK_AEXIT: MethodDef = MethodDef(ffi::PyMethodDef {
+    ml_name: c"__aexit__".as_ptr(),
+    ml_meth: ffi::PyMethodDefPointer {
+        PyCFunctionFast: lock_aexit,
+    },
+    ml_flags: ffi::METH_FASTCALL,
+    ml_doc: c"__aexit__($self, exc_type, exc, traceback, /)\n--\n\nReleases the lock.".as_ptr(),
+});
+
+/// `Lock.__aenter__` (`METH_NOARGS`).
+///
+/// # Safety
+/// CPython calls it as a `METH_NOARGS` method of `Lock`, attached: `slf` is a live `Lock`.
+unsafe extern "C" fn lock_aenter(
+    slf: *mut ffi::PyObject,
+    _args: *mut ffi::PyObject,
+) -> *mut ffi::PyObject {
+    raw_methods::guard(|py| {
+        // SAFETY: the caller's contract (the method descriptor checked the type).
+        let lock = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<Lock>() };
+        Ok(lock.get().enter(py)?.into_any())
+    })
+}
+
+/// `Lock.__aexit__(exc_type, exc, traceback)` (`METH_FASTCALL`): releases the lock, then the
+/// exit's checkpoint (see [`release_then_checkpoint`]).
+///
+/// # Safety
+/// CPython calls it as a `METH_FASTCALL` method of `Lock`, attached: `slf` is a live `Lock`
+/// and `args` points at `nargs` live objects.
+unsafe extern "C" fn lock_aexit(
+    slf: *mut ffi::PyObject,
+    args: *mut *mut ffi::PyObject,
+    nargs: ffi::Py_ssize_t,
+) -> *mut ffi::PyObject {
+    raw_methods::guard(|py| {
+        // SAFETY: the caller's contract.
+        let [_, exc, _] = unsafe { raw_methods::aexit_args(py, c"Lock.__aexit__", args, nargs)? };
+        // SAFETY: the caller's contract (the method descriptor checked the type).
+        let lock = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<Lock>() };
+        release_then_checkpoint(py, &lock.get().lock, &exc)
+    })
 }
 
 /// Releases `lock`, handing it to the task that has waited longest; `RuntimeError` if it is not

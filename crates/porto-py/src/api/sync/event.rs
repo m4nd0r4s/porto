@@ -55,9 +55,9 @@ impl Event {
 
     /// An awaitable that completes once the event is set: without suspending if it is.
     /// Nothing happens until it is awaited.
-    fn wait(&self) -> PyResult<SyncWait> {
+    fn wait(&self, py: Python<'_>) -> PyResult<Py<SyncWait>> {
         require_lane("Event.wait")?;
-        Ok(SyncWait::new(Grant::EventSet(Arc::clone(&self.event))))
+        SyncWait::new(Grant::EventSet(Arc::clone(&self.event))).into_object(py)
     }
 
     /// Blocks the calling thread until the event is set. Only for threads that do not run
@@ -122,9 +122,9 @@ impl Notify {
     /// An awaitable that completes when notified: at once if a permit is stored (consuming
     /// it), otherwise when a `notify_one` or `notify_all` comes after the `await` started.
     /// Nothing happens until it is awaited: an un-awaited one consumes no permit.
-    fn notified(&self) -> PyResult<SyncWait> {
+    fn notified(&self, py: Python<'_>) -> PyResult<Py<SyncWait>> {
         require_lane("Notify.notified")?;
-        Ok(SyncWait::new(Grant::Notified(Arc::clone(&self.notify))))
+        SyncWait::new(Grant::Notified(Arc::clone(&self.notify))).into_object(py)
     }
 
     /// Blocks the calling thread until notified. Only for threads that do not run porto: on a

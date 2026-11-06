@@ -373,70 +373,25 @@ pub(crate) unsafe extern "C" fn trap_am_send(
     })
 }
 
-/// Building `_Trap` objects without pyo3's generic path, on GIL builds (porto-szb.117).
-///
-/// `Py::new` reaches the type's `tp_alloc` through `object.__new__` (an argument check and an
-/// empty tuple) after looking the type object up; for the trap of every `porto.checkpoint()`
-/// that was a few ns of a 60 ns budget. [`object`] calls `tp_alloc` (the lock-free freelist,
-/// `freelist.rs`) and writes the trap where pyo3 keeps a `_Trap`'s value, then hands the object
-/// to pyo3, which drops and frees it as one of its own. [`init`] measures where that is on a
-/// probe object made by `Py::new`, and only enables the fast path when the value is all the
-/// object holds past its header (`tp_basicsize` is the value's end: no borrow flag, dict or
-/// weak-reference slot to initialize). Otherwise, and on free-threaded builds, it is `Py::new`.
+/// Building `_Trap` objects over the freelist without pyo3's generic path (`fast_new.rs`): the
+/// trap of every `porto.checkpoint()`.
 pub(crate) mod fast_new {
-    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-
-    use pyo3::ffi;
     use pyo3::prelude::*;
-    use pyo3::type_object::PyTypeInfo;
 
     use super::Trap;
+    use crate::driver::fast_new::FastNew;
 
-    /// The `_Trap` type, once [`init`] enabled the fast path.
-    static TYPE: AtomicPtr<ffi::PyTypeObject> = AtomicPtr::new(core::ptr::null_mut());
-    /// Where a `_Trap` object keeps its value, in bytes from its start.
-    static VALUE_OFFSET: AtomicUsize = AtomicUsize::new(0);
+    static TRAPS: FastNew<Trap> = FastNew::new();
 
-    /// Enables [`object`]'s fast path if the layout allows it (see the module docs). Call it
-    /// once from module init, after the type's slots are installed.
+    /// Enables [`object`]'s fast path if the layout allows it. Call it once from module init,
+    /// after the type's slots are installed.
     pub(crate) fn init(py: Python<'_>) -> PyResult<()> {
-        if cfg!(Py_GIL_DISABLED) {
-            return Ok(());
-        }
-        let probe = Py::new(py, Trap::yield_now())?;
-        let object = probe.as_ptr();
-        let offset = core::ptr::from_ref(probe.get()).addr() - object.addr();
-        // SAFETY: attached; `probe` is a live `_Trap`, so its type is live.
-        let basic_size = unsafe { (*ffi::Py_TYPE(object)).tp_basicsize };
-        if usize::try_from(basic_size).ok() == Some(offset + size_of::<Trap>()) {
-            VALUE_OFFSET.store(offset, Ordering::Relaxed);
-            TYPE.store(Trap::type_object_raw(py), Ordering::Release);
-        }
-        Ok(())
+        TRAPS.init(py, Trap::yield_now())
     }
 
     /// `trap` as a new `_Trap` object.
     pub(crate) fn object(py: Python<'_>, trap: Trap) -> PyResult<Py<Trap>> {
-        let type_ptr = TYPE.load(Ordering::Acquire);
-        if type_ptr.is_null() {
-            return Py::new(py, trap);
-        }
-        // SAFETY: attached; `init` checked that a `_Trap` object is its header followed by the
-        // value at `VALUE_OFFSET`, which pyo3 reads, drops and frees like any `_Trap` it made:
-        // `tp_alloc` returns a fresh object of the type with one reference, the write moves
-        // the trap in, and the new reference becomes the `Py`.
-        unsafe {
-            let alloc = (*type_ptr).tp_alloc.unwrap_or(ffi::PyType_GenericAlloc);
-            let object = alloc(type_ptr, 0);
-            if object.is_null() {
-                return Err(PyErr::fetch(py));
-            }
-            let offset = VALUE_OFFSET.load(Ordering::Relaxed);
-            object.byte_add(offset).cast::<Trap>().write(trap);
-            Ok(Bound::from_owned_ptr(py, object)
-                .cast_into_unchecked()
-                .unbind())
-        }
+        TRAPS.object(py, trap)
     }
 }
 
