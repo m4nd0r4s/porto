@@ -60,7 +60,7 @@ use pyo3::{ffi, intern};
 use super::lane;
 use super::pending::{Kind, Pending};
 use super::pytask::{CancelStack, PyScopeNode, PyScopeRef, PyTask, Resume, TaskOutcome};
-use super::ready::Ready;
+use super::ready::ready;
 use super::trap::{Trap, TrapKind};
 use crate::errors::Cancelled;
 use crate::py_compat::{Sent, names, send, take_exception};
@@ -154,17 +154,57 @@ impl Drop for RunningTask {
 /// back when this raises. The `YieldThen` result is always delivered: once the value is
 /// stashed, the coroutine gets it, and the cancellation comes at its next checkpoint.
 pub(crate) fn checkpoint_if_needed(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
-    if let Some(running) = running() {
-        if let Some(cancelled) = running_cancellation(py, running) {
-            return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
-        }
-        let budget = &running.budget;
-        match budget.get() {
-            0 => return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any()),
-            left => budget.set(left - 1),
+    if !proceed(py)? {
+        return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any());
+    }
+    // A `None` result is the shared `_Ready(None)`: no allocation.
+    ready(py, value)
+}
+
+/// The T2 decision of [`checkpoint_if_needed`] with no result object: raises `Cancelled` while
+/// the running task is cancelled (before spending anything), else spends one unit of its budget
+/// and returns `true`, or returns `false` if the budget was already spent (the caller then
+/// suspends instead of completing). Always `true` outside a porto task.
+#[inline]
+pub(crate) fn proceed(py: Python<'_>) -> PyResult<bool> {
+    let Some(running) = running() else {
+        return Ok(true);
+    };
+    if let Some(cancelled) = running_cancellation(py, running) {
+        return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
+    }
+    let budget = &running.budget;
+    match budget.get() {
+        0 => Ok(false),
+        left => {
+            budget.set(left - 1);
+            Ok(true)
         }
     }
-    Ok(Py::new(py, Ready::new(value))?.into_any())
+}
+
+/// The fast path of an awaitable that can complete at once by taking something (a free lock):
+/// in a running porto task that is not cancelled and has budget left, runs `take`, and if it
+/// took the grant, spends one unit of the budget (T2) and returns `true`. The caller then
+/// completes in this same step, so the coroutine holds what it took before anything else runs.
+/// Raises `Cancelled` (taking nothing) while the task is cancelled. `false`, with nothing
+/// taken or spent, when the caller must go the lazy way: outside a task, out of budget (the
+/// lazy awaitable yields first, then takes), or when `take` found nothing.
+#[inline]
+pub(crate) fn take_now(py: Python<'_>, take: impl FnOnce() -> bool) -> PyResult<bool> {
+    let Some(running) = running() else {
+        return Ok(false);
+    };
+    if let Some(cancelled) = running_cancellation(py, running) {
+        return Err(PyErr::from_value(cancelled.into_bound(py).into_any()));
+    }
+    let budget = &running.budget;
+    let left = budget.get();
+    if left == 0 || !take() {
+        return Ok(false);
+    }
+    budget.set(left - 1);
+    Ok(true)
 }
 
 /// T2 for a native awaitable that completed synchronously and suspends by itself: spends one

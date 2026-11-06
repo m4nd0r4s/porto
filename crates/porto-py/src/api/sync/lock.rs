@@ -11,8 +11,8 @@ use pyo3::prelude::*;
 use super::blocking;
 use super::wait_op::{Grant, SyncWait};
 use crate::api::time::require_lane;
-use crate::driver::ready::Ready;
-use crate::driver::step::checkpoint_if_needed;
+use crate::driver::ready::ready_none;
+use crate::driver::step::{self, checkpoint_if_needed};
 use crate::driver::thin::{WaitSource, Waitable};
 
 /// The lock: a `Mutex<()>` held without guards, since a Python holder is not a Rust scope.
@@ -33,6 +33,16 @@ unsafe impl WaitSource for LockSource {
 }
 
 impl LockSource {
+    /// A new, free lock to wait on.
+    pub(super) fn waitable() -> Arc<Waitable<Self>> {
+        Waitable::new(Self(Mutex::new(())))
+    }
+
+    /// Whether the lock is held (or being handed to a waiter).
+    pub(super) fn is_locked(&self) -> bool {
+        self.0.is_locked()
+    }
+
     /// Takes the lock if it is free; the holder releases it with [`LockSource::unlock`].
     pub(super) fn try_lock(&self) -> bool {
         self.0.try_lock().map(MutexGuard::leak).is_some()
@@ -59,7 +69,7 @@ impl Lock {
     #[new]
     fn new() -> Self {
         Self {
-            lock: Waitable::new(LockSource(Mutex::new(()))),
+            lock: LockSource::waitable(),
         }
     }
 
@@ -72,10 +82,10 @@ impl Lock {
     }
 
     /// `acquire()`, then `on_acquired()` in the same step; the await evaluates to its result
-    /// (if it raises, the lock is released and the await raises). Internal: `porto.Mutex`
-    /// enters through it, so its guard exists exactly when the lock is held.
+    /// (if it raises, the lock is released and the await raises). Internal: the lazy wait
+    /// `porto.Mutex` enters through when its lock is held, exposed for the tests.
     fn _acquire_then(&self, on_acquired: Py<PyAny>) -> PyResult<SyncWait> {
-        require_lane("Mutex.__aenter__")?;
+        require_lane("Lock._acquire_then")?;
         Ok(SyncWait::calling(
             Grant::Locked(Arc::clone(&self.lock)),
             on_acquired,
@@ -91,20 +101,12 @@ impl Lock {
     /// `RuntimeError` if the lock is not held. The holder is not recorded: a release from a
     /// task that does not hold it is not detected while some task does.
     fn release(&self) -> PyResult<()> {
-        if self.lock.unlock() {
-            return Ok(());
-        }
-        Err(PyRuntimeError::new_err(
-            "porto: Lock.release() was called on a lock that is not held; release a lock once \
-             per acquire, from the task that acquired it (`async with lock:` does it for you). \
-             If this task did hold it, another task released it first (the lock does not \
-             record its holder): find the extra release()",
-        ))
+        release(&self.lock)
     }
 
     /// Whether the lock is held (or being handed to a waiter).
     fn locked(&self) -> bool {
-        self.lock.0.is_locked()
+        self.lock.is_locked()
     }
 
     /// Blocks the calling thread until it holds the lock; release it with `release()`. Only
@@ -115,8 +117,17 @@ impl Lock {
         })
     }
 
-    fn __aenter__(&self) -> PyResult<SyncWait> {
-        self.acquire()
+    /// `async with lock:`. A free lock is taken in this call (T2, `step::take_now`), and the
+    /// shared `_Ready(None)` comes back: no allocation and no suspension. `async with` awaits it
+    /// in the same step, so the coroutine holds the lock before anything else runs and a task
+    /// cancelled or closed at a suspension point never holds it unobserved (spec 16 §1). A
+    /// held lock, a spent budget or a call outside a running task get `acquire()`'s lazy wait.
+    fn __aenter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        require_lane("Lock.__aenter__")?;
+        if step::take_now(py, || self.lock.try_lock())? {
+            return ready_none(py);
+        }
+        Ok(Py::new(py, SyncWait::new(Grant::Locked(Arc::clone(&self.lock))))?.into_any())
     }
 
     #[pyo3(signature = (_exc_type, exc, _traceback, /))]
@@ -127,21 +138,45 @@ impl Lock {
         exc: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-        self.release()?;
-        // An exception is in flight: no checkpoint, which could raise `Cancelled` in its place
-        // (and a cancelled scope would then absorb it, losing the original error).
-        if !exc.is_none() {
-            return Ok(Py::new(py, Ready::new(py.None()))?.into_any());
-        }
-        // After the release: a checkpoint here (T2) never holds the lock.
-        checkpoint_if_needed(py, py.None())
+        release_then_checkpoint(py, &self.lock, exc)
     }
 
     fn __repr__(&self) -> &'static str {
-        if self.lock.0.is_locked() {
+        if self.lock.is_locked() {
             "<porto.Lock locked>"
         } else {
             "<porto.Lock unlocked>"
         }
     }
+}
+
+/// Releases `lock`, handing it to the task that has waited longest; `RuntimeError` if it is not
+/// held.
+fn release(lock: &LockSource) -> PyResult<()> {
+    if lock.unlock() {
+        return Ok(());
+    }
+    Err(PyRuntimeError::new_err(
+        "porto: Lock.release() was called on a lock that is not held; release a lock once per \
+         acquire, from the task that acquired it (`async with lock:` does it for you). If this \
+         task did hold it, another task released it first (the lock does not record its \
+         holder): find the extra release()",
+    ))
+}
+
+/// The `__aexit__` of `async with lock:` (and of a `porto.Mutex`): releases the lock, then the
+/// exit's checkpoint (T2), which never holds the lock. `exc` is the exception leaving the
+/// block, if any.
+pub(super) fn release_then_checkpoint(
+    py: Python<'_>,
+    lock: &LockSource,
+    exc: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    release(lock)?;
+    // An exception is in flight: no checkpoint, which could raise `Cancelled` in its place (and
+    // a cancelled scope would then absorb it, losing the original error).
+    if !exc.is_none() {
+        return ready_none(py);
+    }
+    checkpoint_if_needed(py, py.None())
 }

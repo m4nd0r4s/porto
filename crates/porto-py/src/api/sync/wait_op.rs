@@ -27,8 +27,8 @@ use pyo3::prelude::*;
 
 use super::event::{EventSource, NotifySource};
 use super::lock::LockSource;
-use crate::async_slots::{guard_send, stop_iteration};
-use crate::driver::step::checkpoint_if_needed;
+use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
+use crate::driver::step;
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
 use crate::throw_args::thrown_exception;
@@ -183,15 +183,10 @@ impl Drop for SyncWait {
     }
 }
 
-/// Spends one unit of the running task's budget (T2); whether that ran it out.
-///
-/// `checkpoint_if_needed` is the step loop's one budget entry point: what it returns is a
-/// `YieldThen` trap exactly when the budget ran out. That trap is dropped unawaited; the caller
-/// yields a trap of its own.
+/// Spends one unit of the running task's budget (T2); whether it was already spent. Raises
+/// `Cancelled` instead while the task is cancelled (C1).
 fn budget_ran_out(py: Python<'_>) -> PyResult<bool> {
-    Ok(checkpoint_if_needed(py, py.None())?
-        .bind(py)
-        .is_exact_instance_of::<Trap>())
+    Ok(!step::proceed(py)?)
 }
 
 /// Yields a trap for `kind` to the driver.
@@ -233,9 +228,10 @@ impl SyncWait {
         slf.clone().unbind()
     }
 
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match self.resume(py, &py.None().into_bound(py))? {
-            Stepped::Yield(trap) => Ok(trap),
+            Stepped::Yield(trap) => Ok(Some(trap)),
+            Stepped::Return(value) if value.is_none(py) => Ok(None),
             Stepped::Return(value) => Err(stop_iteration(value.into_bound(py))),
         }
     }
@@ -308,5 +304,24 @@ pub(crate) unsafe extern "C" fn sync_wait_am_send(
         // SAFETY: `presult` is writable (am_send contract); it receives a new reference.
         unsafe { *presult = result.into_ptr() };
         status
+    })
+}
+
+/// `tp_iternext` for `_SyncWait` (see `async_slots`): the same steps as `__next__`.
+///
+/// # Safety
+///
+/// CPython calls it as `tp_iternext` of `_SyncWait`, attached, with `slf` a live `_SyncWait`.
+pub(crate) unsafe extern "C" fn sync_wait_iternext(slf: *mut ffi::PyObject) -> *mut ffi::PyObject {
+    guard_next(|py| {
+        // SAFETY: `slf` is live for the call, and the slot is only installed on `_SyncWait`.
+        let wait = unsafe { Borrowed::from_ptr(py, slf).cast_unchecked::<SyncWait>() };
+        let mut wait = wait
+            .try_borrow_mut()
+            .map_err(|_| concurrent_resume_error())?;
+        Ok(match wait.resume(py, &py.None().into_bound(py))? {
+            Stepped::Yield(trap) => IterNext::Yield(trap.into_bound(py)),
+            Stepped::Return(value) => IterNext::Return(value.into_bound(py)),
+        })
     })
 }

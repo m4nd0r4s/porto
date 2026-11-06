@@ -22,6 +22,8 @@ Cancellation: a cancelled waiter is removed from the queue. If a cancelled waite
 
 Awaiting: `wait()`, `notified()` and `acquire()` return lazy awaitables; nothing is taken until they are awaited, so one created and never awaited holds no lock and consumes no permit (it emits `RuntimeWarning` when freed, `11` §10). A grant is taken only in the step that resumes the coroutine with it: a wait that completes at once but finds the task's budget spent (T2) yields first and takes the grant afterwards, never the other way round. A task closed or cancelled at any suspension point therefore never holds a grant it did not observe.
 
+`async with` on a `Lock` or `Mutex` is the exception that keeps this rule: `__aenter__()` takes a free lock in the call itself (a T2 synchronous completion: it raises `Cancelled` first if the task is cancelled, and spends a unit of the budget) and returns a ready awaitable, which the statement awaits in the same step, so the coroutine observes the lock before anything else runs. A held lock, a spent budget or a call outside a running task get `acquire()`'s lazy wait. Calling `__aenter__()` by hand and dropping the result unawaited therefore leaves a free lock held: use `acquire()` for a lazy awaitable.
+
 ## 2. Channels
 
 ```python

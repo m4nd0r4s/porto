@@ -4,6 +4,7 @@ Fair FIFO handoff, non-reentrant, cancel-safe. ``_interrupt(token, exc)`` throws
 waiting task the way cancellation will (porto-szb.36): the wait is given up first (T3).
 """
 
+import re
 import threading
 from collections.abc import Awaitable, Callable
 
@@ -376,13 +377,90 @@ def test_acquire_does_nothing_until_awaited() -> None:
         with pytest.warns(RuntimeWarning, match=r"Lock\.acquire\(\) was never awaited"):
             del not_awaited
         assert not lock.locked()
-        mutex = porto.Mutex(0)
-        entering = mutex.__aenter__()
-        with pytest.warns(RuntimeWarning, match=r"Mutex\.__aenter__\(\) was never awaited"):
-            del entering
-        assert not mutex.locked()
 
     porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_async_with_takes_a_free_lock_in_aenter_without_suspending(kind: str) -> None:
+    # The fast path (porto-szb.115): `async with` awaits `__aenter__()` in the same step, so a
+    # free lock is taken in the call and the awaitable is already complete.
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+        entering = primitive.__aenter__()
+        assert primitive.locked()
+        assert completes_at_once(entering)
+        await primitive.__aexit__(None, None, None)
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_entering_a_held_lock_takes_nothing_until_awaited(kind: str) -> None:
+    # A held lock gets the lazy wait: dropping it unawaited takes nothing.
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+        async with primitive:
+            entering = primitive.__aenter__()
+        assert not primitive.locked()
+        call = "Lock.acquire()" if kind == "lock" else "Mutex.__aenter__()"
+        with pytest.warns(RuntimeWarning, match=rf"{re.escape(call)} was never awaited"):
+            del entering
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_a_cancelled_task_entering_a_free_lock_gets_cancelled_and_takes_nothing(
+    kind: str,
+) -> None:
+    # The fast path is a checkpoint (T2): a pending cancel is raised before the lock is taken.
+    primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+    events: list[str] = []
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.cancel()
+            try:
+                async with primitive:
+                    events.append("entered")
+            except porto.Cancelled:
+                events.append("cancelled")
+                raise
+        assert not primitive.locked()
+
+    porto.run(main)
+    assert events == ["cancelled"]
+
+
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_a_loop_of_uncontended_async_with_lets_other_tasks_run(kind: str) -> None:
+    # Each fast-path entry spends a unit of the budget (T2); once it is spent, the entry yields
+    # before it takes the lock, so the loop cannot starve the lane.
+    primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+    ticks: list[int] = []
+    budget = porto.RuntimeConfig().coop_budget
+
+    async def ticker() -> None:
+        while True:
+            ticks.append(1)
+            await porto.checkpoint()
+
+    async def main() -> int:
+        async with porto.scope() as s:
+            s.spawn(ticker)
+            await porto.checkpoint()
+            before = len(ticks)
+            for _ in range(4 * budget):
+                async with primitive:
+                    pass
+            s.cancel()
+        return len(ticks) - before
+
+    assert porto.run(main) > 0
+    assert not primitive.locked()
 
 
 def test_a_release_by_another_task_breaks_exclusion_and_the_holder_gets_the_error() -> None:
