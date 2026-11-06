@@ -24,7 +24,7 @@ mod tests;
 mod loom_tests;
 
 pub use check::CancelCache;
-pub use child::{TaskEnd, TaskScope};
+pub use child::{ScopeClosed, TaskEnd, TaskScope};
 pub use node::{CancelReason, Cancellation, ScopeNode, ScopeState};
 
 /// A counted reference to a scope: what a task holds for the scopes it entered

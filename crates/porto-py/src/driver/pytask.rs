@@ -27,7 +27,7 @@ use std::ptr::NonNull;
 use std::task::{Context, Poll};
 
 use porto_core::Handle;
-use porto_core::scope::{ScopeNode, ScopeRef};
+use porto_core::scope::{ScopeClosed, ScopeNode, ScopeRef};
 use porto_core::sync::{JoinWaiters, WaitNode};
 use porto_core::task::{Header, TaskBody, TaskBodyRef, TaskFlags};
 use porto_core::time::TaskTimer;
@@ -37,7 +37,8 @@ use pyo3::prelude::*;
 
 use super::pending::{Kind, Payload};
 use super::{lane, step};
-use crate::api::scope::Task;
+use crate::api::run::close_coroutine;
+use crate::api::task::Task;
 use crate::errors::{Cancelled, RuntimeClosed};
 use crate::py_compat::take_exception;
 
@@ -248,6 +249,8 @@ pub(crate) enum Spawned {
         task: Py<Task>,
         /// The scope it is spawned into, its base scope.
         scope: PyScopeRef,
+        /// Whether it may never migrate to another lane: the header's `PIN` flag.
+        pinned: bool,
     },
 }
 
@@ -258,29 +261,46 @@ pub(crate) fn spawn(
     coro: Bound<'_, PyAny>,
     spawned: Spawned,
 ) -> PyResult<TaskBodyRef<PyTask>> {
-    let py = coro.py();
+    let context = copy_current_context(coro.py())?;
+    spawn_in_context(handle, coro, context, spawned)
+}
+
+/// A copy of the current `contextvars.Context` (`PyContext_CopyCurrent`).
+pub(crate) fn copy_current_context(py: Python<'_>) -> PyResult<Py<PyAny>> {
     // SAFETY: attached (we hold `py`). Returns a new reference, or NULL with an exception set.
     let context = unsafe { ffi::PyContext_CopyCurrent() };
     if context.is_null() {
         return Err(PyErr::from_value(take_exception(py).into_any()));
     }
     // SAFETY: a new, non-null reference, which the `Bound` takes over.
-    let context = unsafe { Bound::from_owned_ptr(py, context) }.unbind();
-    Ok(spawn_in_context(handle, coro, context, spawned))
+    Ok(unsafe { Bound::from_owned_ptr(py, context) }.unbind())
 }
 
 /// [`spawn`] in `context` itself, not a copy: every step of the task enters it. `context` MUST
-/// be a `contextvars.Context`.
+/// be a `contextvars.Context`. A child of a closed scope is refused (C7): its coroutine is
+/// closed, unrun, and the error says so.
 pub(crate) fn spawn_in_context(
     handle: &Handle,
     coro: Bound<'_, PyAny>,
     context: Py<PyAny>,
     spawned: Spawned,
-) -> TaskBodyRef<PyTask> {
+) -> PyResult<TaskBodyRef<PyTask>> {
+    let py = coro.py();
     let (flags, py_handle, scope) = match spawned {
         Spawned::Detached => (TaskFlags::PYTHON | TaskFlags::DETACHED_DROP, None, None),
         Spawned::Joined => (TaskFlags::PYTHON, None, None),
-        Spawned::Child { task, scope } => (TaskFlags::PYTHON, Some(task), Some(scope)),
+        Spawned::Child {
+            task,
+            scope,
+            pinned,
+        } => {
+            let flags = if pinned {
+                TaskFlags::PYTHON | TaskFlags::PIN
+            } else {
+                TaskFlags::PYTHON
+            };
+            (flags, Some(task), Some(scope))
+        }
     };
     let mut body = PyTask {
         coro: Some(coro.unbind()),
@@ -300,11 +320,19 @@ pub(crate) fn spawn_in_context(
         _pinned: PhantomPinned,
     };
     let Some(scope) = scope else {
-        return handle.spawn_body(body, flags);
+        return Ok(handle.spawn_body(body, flags));
     };
     // The base scope: the walk of its effective cancellation starts there (spec 15 §1.2).
     body.cancel_scope = Some(scope.clone());
-    handle.spawn_body_in(&scope, body, flags)
+    handle
+        .spawn_body_in(&scope, body, flags)
+        .map_err(|ScopeClosed(mut refused)| {
+            if let Some(coro) = refused.coro.take() {
+                close_coroutine(coro.bind(py));
+            }
+            drop(refused);
+            PyRuntimeError::new_err(ScopeClosed(()).to_string())
+        })
 }
 
 impl PyTask {

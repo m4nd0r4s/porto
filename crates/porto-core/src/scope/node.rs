@@ -104,6 +104,9 @@ pub struct ScopeState<E> {
     pub cancel_absorbed: bool,
     /// The owner task, waiting in `ScopeExit` for `live_children` to reach zero.
     pub exit_waiter: Option<Waker>,
+    /// The scope's block exited ([`ScopeNode::close`]): no task can be spawned into it any more
+    /// (C7, [`super::TaskScope::try_attach`]).
+    pub closed: bool,
     /// Nested scopes, for propagating a cancel down the tree.
     child_scopes: ChildList<E>,
     /// The tasks whose innermost scope this is and that wait in a cancellable wait, by task
@@ -235,6 +238,7 @@ impl<E: Send + 'static> ScopeNode<E> {
                 errors: Vec::new(),
                 cancel_absorbed: false,
                 exit_waiter: None,
+                closed: false,
                 child_scopes: ChildList { head: ptr::null() },
                 waiters: None,
             }),
@@ -282,6 +286,15 @@ impl<E> ScopeNode<E> {
     /// the old value out (`mem::replace`), drop the guard, then drop the value.
     pub fn lock_state(&self) -> MutexGuard<'_, ScopeState<E>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Closes the scope (C7): from now on no task can be spawned into it. Returns the failures
+    /// it recorded, which the caller drops (or raises) after the lock is released. Closing again
+    /// returns nothing more.
+    pub fn close(&self) -> Vec<E> {
+        let mut state = self.lock_state();
+        state.closed = true;
+        std::mem::take(&mut state.errors)
     }
 
     /// Cancels the scope. Returns `false`, and changes nothing, if it was already cancelled.

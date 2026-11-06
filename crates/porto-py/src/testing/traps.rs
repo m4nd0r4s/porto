@@ -186,7 +186,7 @@ fn spawn_joinable(
                      contextvars.copy_context() or leave it out",
                 ));
             }
-            pytask::spawn_in_context(&handle, coro, context.unbind(), Spawned::Joined)
+            pytask::spawn_in_context(&handle, coro, context.unbind(), Spawned::Joined)?
         }
         None => pytask::spawn(&handle, coro, Spawned::Joined)?,
     };

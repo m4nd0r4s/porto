@@ -89,6 +89,8 @@ class Task[T]:     # awaitable
 def current_task() -> Task[Any]
 ```
 
+`Scope.spawn` passes only positional arguments to the function (a keyword it does not take raises `TypeError` naming `functools.partial`). `name` names the task (`Task.name`, shown in its repr); without it the task is named after the `__qualname__` of the function or coroutine it runs. `pin=True` pins the task to its lane, `pin=False` does not, and `pin=None` inherits the pinning of the spawning task (pinning is inherited by the subtree, 03). `context` runs the task in that `contextvars.Context` itself, shared with whoever else uses it; without it the task runs in a copy of the current context (11 §8). An option of the wrong type raises `TypeError` that says what to pass.
+
 ### Sync & channels
 `Lock`, `Mutex[T]`, `RwLock`, `Semaphore`, `CapacityLimiter`, `Event`, `Notify`, `Condition`, `Barrier`, and the channel constructors `channel[T](capacity)`, `unbounded_channel[T]()`, `oneshot[T]()`, `broadcast[T](capacity)`, `watch[T](initial)` returning `(Sender[T], Receiver[T])`-like pairs (see §16 for methods).
 

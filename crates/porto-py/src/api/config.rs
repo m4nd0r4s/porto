@@ -24,8 +24,9 @@ static RESOLVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 /// `config` over the `PORTO_*` variables over the defaults. Raises what `RuntimeConfig` raises
 /// for an invalid value.
 ///
-/// The M1 single-lane runtime uses `timer_resolution` and `coop_budget` only; the other fields
-/// are checked (in Python) and not carried yet.
+/// The M1 single-lane runtime uses `timer_resolution`, `coop_budget` and `cancel_timeout` (how
+/// long `porto.run` waits for the root scope's tasks, C12) only; the other fields are checked
+/// (in Python) and not carried yet.
 pub(crate) fn resolve(
     py: Python<'_>,
     config: Option<&Bound<'_, PyAny>>,
@@ -51,9 +52,16 @@ pub(crate) fn resolve(
                 u32::MAX
             ))
         })?;
+    // Checked in Python: a finite number of seconds, at least 0. One too long for a `Duration`
+    // waits forever.
+    let cancel_timeout: f64 = resolved
+        .getattr(pyo3::intern!(py, "cancel_timeout"))?
+        .extract()?;
+    let cancel_timeout = Duration::try_from_secs_f64(cancel_timeout).unwrap_or(Duration::MAX);
     RuntimeConfig::builder()
         .timer_resolution(Duration::from_secs_f64(timer_resolution))
         .coop_budget(coop_budget)
+        .cancel_timeout(cancel_timeout)
         .build()
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }

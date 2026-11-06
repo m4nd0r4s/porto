@@ -18,7 +18,7 @@ use super::context;
 use super::inject::Inject;
 use super::park::Parking;
 use super::timers::Timers;
-use crate::scope::{ScopeRef, TaskScope};
+use crate::scope::{ScopeClosed, ScopeRef, TaskScope};
 use crate::task::{
     JoinHandle, Notified, Schedule, TaskBody, TaskBodyRef, TaskFlags, new_body_task,
     new_body_task_in, new_joinable_task, new_joinable_task_in,
@@ -169,38 +169,54 @@ impl Handle {
 
     /// Spawns `future` into `scope`, as [`Handle::spawn`]: the scope counts it in
     /// `live_children` until it ends, and hears how it ended (a panic cancels the scope, C4).
-    pub fn spawn_in<F, E>(&self, scope: &ScopeRef<E>, future: F) -> JoinHandle<F::Output>
+    ///
+    /// # Errors
+    /// Hands `future` back, unrun, if the scope is closed (C7,
+    /// [`crate::scope::ScopeNode::close`]).
+    pub fn spawn_in<F, E>(
+        &self,
+        scope: &ScopeRef<E>,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, ScopeClosed<F>>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
         E: Send + 'static,
     {
-        let (task, join) =
-            new_joinable_task_in(future, self.clone(), Some(TaskScope::attach(scope)));
+        let Some(scope) = TaskScope::try_attach(scope) else {
+            return Err(ScopeClosed(future));
+        };
+        let (task, join) = new_joinable_task_in(future, self.clone(), Some(scope));
         if let Err(task) = self.schedule_local(task) {
             self.clone().schedule_remote(task);
         }
-        join
+        Ok(join)
     }
 
     /// Spawns a task running `body` into `scope`, as [`Handle::spawn_body`] and
     /// [`Handle::spawn_in`]: the scope records what [`TaskBody::take_failure`] returns.
+    ///
+    /// # Errors
+    /// Hands `body` back, unrun, if the scope is closed (C7,
+    /// [`crate::scope::ScopeNode::close`]).
     pub fn spawn_body_in<B, E>(
         &self,
         scope: &ScopeRef<E>,
         body: B,
         flags: TaskFlags,
-    ) -> TaskBodyRef<B>
+    ) -> Result<TaskBodyRef<B>, ScopeClosed<B>>
     where
         B: TaskBody,
         E: Send + 'static,
     {
-        let scope = TaskScope::attach(scope);
+        let Some(scope) = TaskScope::try_attach(scope) else {
+            return Err(ScopeClosed(body));
+        };
         let (task, body) = new_body_task_in(body, self.clone(), flags, Some(scope));
         if let Err(task) = self.schedule_local(task) {
             self.clone().schedule_remote(task);
         }
-        body
+        Ok(body)
     }
 
     /// Runs `work` on lane 0 at its next maintenance tick (every 61 tasks, and before it

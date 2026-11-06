@@ -41,6 +41,13 @@ def run(
     one lane for now; once multi-lane scheduling lands it picks more lanes for the machine,
     with no change to code that passes it.
 
+    ``main`` is the first task of the runtime's root scope, a nursery: a task of the root
+    scope that fails cancels it, and with it ``main``. Once ``main`` ended, the tasks still in
+    the root scope are cancelled and waited for, up to ``cancel_timeout``. It then returns
+    main's result or raises main's exception; if tasks of the root scope failed, it raises an
+    ``ExceptionGroup`` (``BaseExceptionGroup`` if one is not an ``Exception``) of main's
+    exception, first, and theirs.
+
     Ctrl-C raises ``KeyboardInterrupt`` out of it within about 50 ms, also while every task
     sleeps. A ``KeyboardInterrupt`` or ``SystemExit`` raised by a task nobody waits for also
     stops the run and is raised here. Tasks still running when it returns are closed. Raises
@@ -98,11 +105,19 @@ class Scope:
         coro_or_fn: Coroutine[Any, Any, _T] | Callable[[*_Ts], Awaitable[_T]],
         /,
         *args: *_Ts,
+        name: str | None = None,
+        pin: bool | None = None,
+        context: contextvars.Context | None = None,
     ) -> Task[_T]:
-        """Starts a child task, in a copy of the current context: a coroutine object, or an
-        async function called with ``args``. Raises ``RuntimeError`` outside the block
-        (``porto.NoRuntimeError`` outside ``porto.run``); a refused coroutine object is
-        closed."""
+        """Starts a child task: a coroutine object, or an async function called with ``args``
+        (only positional ones: use ``functools.partial`` for keywords). It runs in a copy of the
+        current context, or in ``context`` itself if given. ``name`` names it (default: the
+        function's ``__qualname__``). ``pin=True`` keeps it on the lane it starts on; without
+        ``pin`` it is pinned if the spawning task is.
+
+        Raises ``RuntimeError`` outside the block (``porto.NoRuntimeError`` outside
+        ``porto.run``), ``TypeError`` for an option of the wrong type or an unknown keyword; a
+        refused coroutine object is closed."""
 
     def cancel(self, reason: str | None = None) -> None:
         """Cancels the scope: every task in it, and in the scopes nested in it, gets
@@ -136,6 +151,16 @@ class Scope:
 @final
 class Task(Generic[_T_co]):
     """A child task of a scope. Its result is readable once its scope's block exited."""
+
+    @property
+    def name(self) -> str:
+        """The name given to ``spawn``, else the ``__qualname__`` of the async function or
+        coroutine the task runs."""
+
+    @property
+    def pinned(self) -> bool:
+        """Whether the task stays on its lane: spawned with ``pin=True``, or without ``pin``
+        by a pinned task."""
 
     def done(self) -> bool:
         """Whether the task finished (returned or raised)."""
@@ -476,6 +501,11 @@ def _run(coro: Coroutine[Any, Any, _T], /) -> _T:
 
     Tasks it spawned that are still running when it returns are closed.
     """
+
+def _root_scope() -> Scope:
+    """The root scope of the running ``porto.run`` (what ``Runtime.root_scope`` will return):
+    its tasks outlive the scopes ``main`` opens, and one that fails cancels ``main``.
+    ``porto.NoRuntimeError`` outside ``porto.run``."""
 
 def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
     """Starts ``coro`` as a task on the running runtime. An ``Exception`` it raises goes to

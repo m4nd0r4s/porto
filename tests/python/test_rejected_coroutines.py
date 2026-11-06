@@ -85,6 +85,24 @@ def test_spawn_on_a_closed_scope_closes_the_coroutine() -> None:
     porto.run(main)
 
 
+@pytest.mark.parametrize(
+    ("option", "match"),
+    [
+        ({"name": 1}, "name= must be a str"),
+        ({"pin": "yes"}, "pin= must be True, False or None"),
+        ({"context": {}}, "context= must be a contextvars.Context"),
+        ({"timeout": 1}, "does not take"),
+    ],
+)
+def test_spawn_with_a_bad_option_closes_the_coroutine(option: dict[str, Any], match: str) -> None:
+    async def main() -> None:
+        async with porto.scope() as s:
+            with raises_alone(TypeError, match):
+                s.spawn(work(), **option)
+
+    porto.run(main)
+
+
 def test_spawn_on_a_scope_not_entered_closes_the_coroutine() -> None:
     async def main() -> None:
         with raises_alone(RuntimeError, "the scope is not entered yet"):
