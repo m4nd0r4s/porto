@@ -67,9 +67,10 @@ def test_a_scope_exit_holding_its_exception_in_a_cycle_is_collected() -> None:
 
 
 async def make_sync_wait(mutex: porto.Mutex[list[int]]) -> object:
-    # Closed unawaited, it still holds the mutex for the guard it would have made.
-    wait = mutex.__aenter__()
-    wait.close()  # pyright: ignore[reportAttributeAccessIssue]
+    # Closed unawaited, it still holds the callback it would have called, and through it the
+    # mutex. (`async with` on a mutex makes a `MutexGuard`, not a `_SyncWait`.)
+    wait = porto.Lock()._acquire_then(lambda: mutex)
+    wait.close()
     return wait
 
 
