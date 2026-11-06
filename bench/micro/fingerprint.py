@@ -39,6 +39,10 @@ print(json.dumps({
     "porto": porto.__version__,
     "pyperf": importlib.metadata.version("pyperf"),
     "uvloop": uvloop_version,
+    **{
+        name: next((d.version for d in importlib.metadata.distributions(name=name)), None)
+        for name in ("trio", "anyio")
+    },
 }))
 """
 
