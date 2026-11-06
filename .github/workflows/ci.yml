@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
@@ -75,13 +75,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
         python: ["3.11", "3.14"]
         event: ["${{ github.event_name }}"]
         # The repository is private, so minutes count (macOS 10x, Windows 2x): pull requests test
         # 3.11 on Linux only; pushes to main run the full matrix.
         exclude:
-          - { os: macos-14, python: "3.11", event: pull_request }
+          - { os: macos-15, python: "3.11", event: pull_request }
           - { os: windows-latest, python: "3.11", event: pull_request }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
