@@ -13,7 +13,6 @@ from collections.abc import Callable
 import pytest
 
 import porto
-from porto import _core
 
 
 class Holder:
@@ -74,19 +73,11 @@ def make_sync_wait() -> object:
     return wait
 
 
-def make_channel_op() -> object:
-    _tx, rx = porto.channel[int](1)
-    receive = rx.recv()
-    receive.close()  # pyright: ignore[reportAttributeAccessIssue]
-    return receive
-
-
-#: (the type, a function making one inside a task without leaving it pending)
+#: (the type, a function making one inside a task without leaving it pending). Only types
+#: the collector can see through (with a ``__traverse__``) are tracked again on reuse;
+#: ``_Trap``, ``_Ready`` and ``_ChannelOp`` hold nothing it could follow.
 FREELIST_TYPES: list[tuple[str, Callable[[], object]]] = [
-    ("_Ready", lambda: _core._make_ready(object())),  # pyright: ignore[reportPrivateUsage]
-    ("_Trap", _core._yield_trap),  # pyright: ignore[reportPrivateUsage]
     ("_SyncWait", make_sync_wait),
-    ("_ChannelOp", make_channel_op),
 ]
 
 

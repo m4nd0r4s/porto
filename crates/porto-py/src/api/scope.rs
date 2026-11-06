@@ -53,7 +53,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(scope, module)?)
 }
 
-freelist::gil_freelist!(exit_freelist, 64);
+freelist::gil_freelist!(exit_freelist, 64, traversed: true);
 
 /// `porto.scope()`: a new scope, to enter with `async with`.
 #[pyfunction]

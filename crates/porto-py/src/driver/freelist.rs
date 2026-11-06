@@ -11,7 +11,10 @@
 //! `tp_dealloc` stopped that), so a reference cycle through one was never collected. Every class
 //! declared with a pyo3 freelist therefore goes through [`install`]: on a GIL build ours tracks
 //! a reused object again, and a free-threaded build keeps pyo3's freelist behind a `tp_alloc`
-//! that does the same ([`TrackingAlloc`]).
+//! that does the same ([`TrackingAlloc`]). Only for a class with a `__traverse__`, though
+//! ([`gil_freelist!`]'s `traversed`): the collector cannot see through one without it (`_Trap`,
+//! `_Ready`, `_ChannelOp`), so tracking it would only cost time on the hottest allocations
+//! (2 ns of a 60 ns `checkpoint`).
 //!
 //! Only the storage changes: pyo3 still runs `Drop` (so a trap freed unawaited still warns,
 //! `unawaited.rs`) and releases the type reference, exactly as with its own freelist. The same
@@ -29,6 +32,8 @@ use pyo3::type_object::PyTypeInfo;
 /// Freed objects of one type, at most `N`; only reached while attached on a GIL build.
 pub(crate) struct FreeList<const N: usize> {
     slots: UnsafeCell<([*mut ffi::PyObject; N], usize)>,
+    /// Whether a reused object is tracked by the collector again (see the module docs).
+    track_reused: bool,
 }
 
 // SAFETY: only `alloc` and `free` reach the cell, and CPython calls them as slots, attached;
@@ -37,10 +42,11 @@ pub(crate) struct FreeList<const N: usize> {
 unsafe impl<const N: usize> Sync for FreeList<N> {}
 
 impl<const N: usize> FreeList<N> {
-    /// An empty freelist.
-    pub(crate) const fn new() -> Self {
+    /// An empty freelist; `track_reused` as in the module docs.
+    pub(crate) const fn new(track_reused: bool) -> Self {
         Self {
             slots: UnsafeCell::new(([core::ptr::null_mut(); N], 0)),
+            track_reused,
         }
     }
 
@@ -68,7 +74,7 @@ impl<const N: usize> FreeList<N> {
                 // code or allocation in between), so a traversal never sees the old one.
                 unsafe {
                     let object = ffi::PyObject_Init(object, subtype);
-                    if ffi::PyType_IS_GC(subtype) != 0 {
+                    if self.track_reused && ffi::PyType_IS_GC(subtype) != 0 {
                         ffi::PyObject_GC_Track(object.cast());
                     }
                     return object;
@@ -158,17 +164,19 @@ pub(crate) struct Slots {
     /// Free-threaded build: `tp_alloc` over [`Slots::tracking`].
     pub(crate) tracking_alloc: ffi::allocfunc,
     pub(crate) tracking: &'static TrackingAlloc,
+    /// Whether the class has a `__traverse__`, so a reused object is tracked again.
+    pub(crate) traversed: bool,
 }
 
 /// Defines module `$name` with a [`FreeList`] of `$capacity`, its `alloc` and `free` slots, and
-/// `SLOTS` for [`install`].
+/// `SLOTS` for [`install`]. `traversed`: the class has a `__traverse__` (see the module docs).
 macro_rules! gil_freelist {
-    ($name:ident, $capacity:expr) => {
+    ($name:ident, $capacity:expr, traversed: $traversed:expr) => {
         pub(crate) mod $name {
             use pyo3::ffi;
 
             static LIST: $crate::driver::freelist::FreeList<$capacity> =
-                $crate::driver::freelist::FreeList::new();
+                $crate::driver::freelist::FreeList::new($traversed);
 
             static TRACKING: $crate::driver::freelist::TrackingAlloc =
                 $crate::driver::freelist::TrackingAlloc::new();
@@ -180,6 +188,7 @@ macro_rules! gil_freelist {
                     free,
                     tracking_alloc,
                     tracking: &TRACKING,
+                    traversed: $traversed,
                 };
 
             /// `tp_alloc` on a free-threaded build: pyo3's, tracked.
@@ -238,6 +247,9 @@ pub(crate) fn install<T: PyTypeInfo>(py: Python<'_>, slots: &'static Slots) -> P
             )));
         }
         if cfg!(Py_GIL_DISABLED) {
+            if !slots.traversed {
+                return Ok(());
+            }
             if let Some(pyo3_alloc) = (*type_ptr).tp_alloc {
                 slots.tracking.pyo3_alloc.get_or_init(|| pyo3_alloc);
             }
