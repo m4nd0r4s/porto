@@ -435,6 +435,43 @@ mod waiters {
     }
 
     #[test]
+    fn a_waiter_woken_normally_leaves_the_scope_free_to_drop() {
+        // porto-szb.114: the wait ends without a cancel (what it waits on wakes it), and the
+        // task takes its entry out, so the scope drops with no waiter left (a debug assert).
+        let root = Scope::new_root(0);
+        let inner = child(&root);
+        let (counter, waker) = counting_waker();
+        assert!(!inner.register_waiter(1, &waker));
+        waker.wake_by_ref();
+        inner.unregister_waiter(1);
+        assert_eq!(inner.lock_state().waiter_count(), 0);
+        assert_eq!(
+            Arc::strong_count(&counter),
+            2,
+            "the scope dropped its clone"
+        );
+        drop(inner);
+        root.cancel(CancelReason::Explicit);
+        assert_eq!(
+            wakes(&counter),
+            1,
+            "only the normal wake: the cancel finds nobody"
+        );
+    }
+
+    #[test]
+    fn sequential_waits_in_a_long_lived_scope_do_not_grow_it() {
+        let root = Scope::new_root(0);
+        let (_, waker) = counting_waker();
+        for key in 0..10_000 {
+            assert!(!root.register_waiter(key * 64, &waker));
+            assert_eq!(root.lock_state().waiter_count(), 1);
+            root.unregister_waiter(key * 64);
+        }
+        assert_eq!(root.lock_state().waiter_count(), 0);
+    }
+
+    #[test]
     fn a_cancel_from_another_thread_wakes_the_waiter() {
         let root = Scope::new_root(0);
         let (counter, waker) = counting_waker();

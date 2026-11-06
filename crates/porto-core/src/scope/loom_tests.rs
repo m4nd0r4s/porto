@@ -176,6 +176,51 @@ fn register_waiter_vs_cancel() {
     });
 }
 
+/// A waiter whose wait ends normally (woken by what it waited on, porto-szb.114) and
+/// unregisters while another thread cancels the scope: the entry is gone once both are done,
+/// whichever went first, and the cancel woke it at most once. The scope then drops with no
+/// waiter left (a debug assert).
+#[test]
+fn normal_wake_vs_cancel_unregisters_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let scope = ScopeNode::new_child(&root, 1, false);
+        let wakes = std::sync::Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&wakes));
+        assert!(!scope.register_waiter(1, &waker));
+        let canceller = {
+            let root = Arc::clone(&root);
+            thread::spawn(move || assert!(root.cancel(CancelReason::Explicit)))
+        };
+
+        // The normal wake: the wait is over, the task takes its entry out.
+        scope.unregister_waiter(1);
+
+        canceller.join().unwrap();
+        assert_eq!(scope.lock_state().waiter_count(), 0);
+        assert!(wakes.0.load(Ordering::SeqCst) <= 1);
+        // A cancel that missed the entry is still seen by the next check (level-triggered).
+        assert!(scope.is_cancelled());
+        drop(waker);
+        assert_eq!(
+            std::sync::Arc::strong_count(&wakes),
+            1,
+            "no clone left anywhere"
+        );
+    });
+}
+
 /// The scope's own walk cache against a cancel of its parent from another thread: whatever a
 /// check saw before, one after the cancel returned sees it, and a check from a third thread
 /// that refills the cache meanwhile never leaves a stale answer behind.

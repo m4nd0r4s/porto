@@ -58,6 +58,7 @@ impl PyTask {
     /// Starts waiting for `pending`. The task waits for nothing yet.
     pub(super) fn set_pending(&mut self, pending: Pending) {
         debug_assert!(!self.is_waiting(), "a task waits for one thing at a time");
+        debug_assert!(self.wait_links == 0, "the last wait left its waker filed");
         if let Pending::Sleep(deadline) = pending {
             self.timer().reset(deadline);
         }
@@ -99,7 +100,9 @@ impl PyTask {
                 if unsafe { self.timer().poll(cx) }.is_pending() {
                     return Poll::Pending;
                 }
-                // The deadline is `Copy`: nothing to drop.
+                // The deadline is `Copy`: nothing to drop, but a sleep in a scope was filed with
+                // it (`watch_cancel`), which the end of the wait undoes (porto-szb.114).
+                self.unlink_wait();
                 self.pending_kind = Kind::None;
                 return Poll::Ready(Resume::None);
             }
@@ -233,24 +236,46 @@ impl PyTask {
         ptr::from_ref(self).addr()
     }
 
-    /// Moves the payload out; the task waits for nothing afterwards, and the lane no longer
-    /// keeps its waker.
+    /// Moves the payload out; the task waits for nothing afterwards, and neither its scope nor
+    /// the lane keeps its waker.
     fn take_pending(&mut self) -> Pending {
-        let links = std::mem::take(&mut self.wait_links);
-        if links & WaitLinks::SCOPE != 0
-            && let Some(scope) = self.innermost_scope()
-        {
-            // The scope filed with is still the innermost one: scopes are entered and exited
-            // only while the coroutine runs, never during a wait.
-            scope.unregister_waiter(self.key());
-        }
-        if links & WaitLinks::LANE != 0 {
-            lane::forget_linked_wait(self.key());
-        }
+        self.unlink_wait();
         let kind = std::mem::replace(&mut self.pending_kind, Kind::None);
         let payload = std::mem::replace(&mut self.pending_payload, Payload::EMPTY);
         // SAFETY: the payload was packed with `kind` (`set_pending`), and is replaced above.
         unsafe { Pending::unpack(kind, &payload) }
+    }
+
+    /// Takes the task's waker back from its scope and the lane, if the wait filed it there.
+    /// Every end of a wait comes through here once, whatever ended it (resolved, abandoned,
+    /// released): the links are cleared on the way, so a second call does nothing. A stale
+    /// link would keep the entry filed with a scope the task may since have left, and make the
+    /// next wait skip filing with its own (porto-szb.114).
+    #[inline]
+    fn unlink_wait(&mut self) {
+        let links = std::mem::take(&mut self.wait_links);
+        if links != 0 {
+            self.forget_links(links);
+        }
+    }
+
+    fn forget_links(&self, links: u8) {
+        if links & WaitLinks::SCOPE != 0 {
+            // The scope filed with is still the innermost one: scopes are entered and exited
+            // only while the coroutine runs, never during a wait. An unlink while the cancel
+            // stack is moved out (during `resume`) would leak the entry, so it is a bug.
+            let scope = self.innermost_scope();
+            debug_assert!(
+                scope.is_some(),
+                "a filed wait unlinked with no innermost scope"
+            );
+            if let Some(scope) = scope {
+                scope.unregister_waiter(self.key());
+            }
+        }
+        if links & WaitLinks::LANE != 0 {
+            lane::forget_linked_wait(self.key());
+        }
     }
 
     /// Whether the body behind `target` is this task's.

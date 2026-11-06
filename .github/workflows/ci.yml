@@ -99,3 +99,27 @@ jobs:
           cache-dependency-glob: "**/pyproject.toml"
       - run: uv sync
       - run: uv run pytest -q
+
+  # porto built without --release, so the debug_asserts of porto-core and porto-py run under
+  # the Python tests (porto-szb.114: a waiter left filed with its scope only panicked there).
+  # tests/python/test_examples.py fails on any stderr output, which is where a panic in a drop
+  # shows up.
+  py-test-debug:
+    name: py-test-debug (ubuntu-latest, 3.14)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: py3.14-debug
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+      # The dev tools without porto: `uv sync` would build it in release.
+      - run: uv sync --no-install-package porto
+      - run: uv run --no-sync --directory packaging/porto maturin develop
+      # --no-sync: a sync would replace the debug build with a release one.
+      - run: uv run --no-sync pytest -q
