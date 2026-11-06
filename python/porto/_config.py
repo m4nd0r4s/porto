@@ -35,6 +35,10 @@ ENV_PREFIX: Final = "PORTO_"
 #: Overrides ``DeterministicConfig.seed`` (24-deterministic-testing.md §2); not a field.
 SEED_ENV: Final = "PORTO_SEED"
 
+#: The most lanes this runtime runs: multi-lane scheduling (12-scheduler-and-lanes.md) is
+#: not implemented yet, so ``porto.run`` rejects more.
+MAX_SUPPORTED_LANES: Final = 1
+
 #: The finest and coarsest ``timer_resolution``, in seconds (porto_core's
 #: ``MIN_TIMER_RESOLUTION`` and ``MAX_TIMER_RESOLUTION``).
 MIN_TIMER_RESOLUTION: Final = 0.0001
@@ -351,6 +355,9 @@ class RuntimeConfig:
     else takes its default. ``porto.run(main, config=..., **overrides)`` overrides fields
     again. Invalid values raise ``ValueError`` (``TypeError`` for a wrong type) naming the
     field, or the variable, and a valid value.
+
+    Multi-lane scheduling is not implemented yet: a config may hold ``lanes=4``, but
+    ``porto.run`` refuses it with ``NotImplementedError``; ``lanes="auto"`` runs on one lane.
     """
 
     lanes: int | Literal["auto"] = field(default_factory=_from_env("lanes", lambda: 1))
@@ -436,7 +443,39 @@ def resolve(config: RuntimeConfig | None, overrides: Mapping[str, Any]) -> Runti
                 f"{', '.join(FIELD_NAMES)}"
             )
         config = dataclasses.replace(config, **overrides)
+    _reject_unsupported_lanes(config, overrides)
     return _with_env_seed(config)
+
+
+def _reject_unsupported_lanes(config: RuntimeConfig, overrides: Mapping[str, Any]) -> None:
+    """Raises ``NotImplementedError`` for an int ``lanes`` above what the runtime runs, naming
+    where it came from (the keyword, the config, or ``PORTO_LANES``). ``'auto'`` is porto's
+    choice, and runs on one lane until multi-lane scheduling exists."""
+    lanes = config.lanes
+    if lanes == "auto" or lanes <= MAX_SUPPORTED_LANES:
+        return
+    unsupported = (
+        "is not supported yet: porto runs every task on one lane until multi-lane "
+        "scheduling is implemented"
+    )
+    variable = env_name("lanes")
+    text = os.environ.get(variable)
+    if "lanes" not in overrides and text is not None and _env_lanes(text) == lanes:
+        raise NotImplementedError(
+            f"porto: {variable}={text!r} asks for {lanes} lanes, which {unsupported}; unset "
+            f"{variable}, or set {variable}=1"
+        )
+    raise NotImplementedError(
+        f"porto: lanes={lanes} {unsupported}; leave lanes out, or pass lanes=1 "
+        '(lanes="auto" also runs on one lane for now)'
+    )
+
+
+def _env_lanes(text: str) -> object:
+    try:
+        return _parse_lanes(text.strip())
+    except _Invalid:
+        return None
 
 
 def _with_env_seed(config: RuntimeConfig) -> RuntimeConfig:

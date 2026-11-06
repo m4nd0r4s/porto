@@ -56,7 +56,7 @@ def check_run_takes_a_config_and_overrides() -> None:
     assert_type(config.deterministic, porto.DeterministicConfig | None)
     assert_type(porto.run(total, config=config), int)
     assert_type(porto.run(total, config=config, coop_budget=64), int)
-    assert_type(porto.run(main, ["a"], lanes=2), list[bytes])
+    assert_type(porto.run(main, ["a"], lanes=1), list[bytes])
 
 
 def check_config_values_are_typed() -> None:
