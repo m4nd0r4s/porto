@@ -12,14 +12,14 @@
 //! indistinguishable from a fresh `StopIteration(value)`. The GIL serializes every use, and a
 //! count of one means no other reference exists to observe the reset. Free-threaded builds,
 //! where another thread could take a reference between the check and the reset, always
-//! allocate.
+//! allocate, and so does 3.11, where `SEND` goes through `am_send` and never needs one.
 
 use pyo3::ffi;
 use pyo3::prelude::*;
 
 /// Raises `StopIteration(value)`: sets it as the current exception.
 pub(crate) fn raise_stop_iteration(value: &Bound<'_, PyAny>) {
-    #[cfg(not(Py_GIL_DISABLED))]
+    #[cfg(all(Py_3_12, not(Py_GIL_DISABLED)))]
     {
         // SAFETY: attached (we hold a `Bound`), on a GIL build: see the module docs.
         if unsafe { spare::raise_again(value.as_ptr()) } {
@@ -37,16 +37,25 @@ fn raise_new(value: &Bound<'_, PyAny>) {
     if exception.is_null() {
         return;
     }
-    #[cfg(not(Py_GIL_DISABLED))]
+    #[cfg(all(Py_3_12, not(Py_GIL_DISABLED)))]
     // SAFETY: attached, on a GIL build; `exception` is a live `StopIteration`.
     unsafe {
         spare::keep(exception);
     }
     // SAFETY: attached; steals the new reference.
-    unsafe { ffi::PyErr_SetRaisedException(exception) };
+    #[cfg(Py_3_12)]
+    unsafe {
+        ffi::PyErr_SetRaisedException(exception);
+    }
+    // SAFETY: attached; `exception` is a live instance, raised as itself; the reference is ours.
+    #[cfg(not(Py_3_12))]
+    unsafe {
+        ffi::PyErr_SetObject(ffi::PyExc_StopIteration, exception);
+        ffi::Py_DECREF(exception);
+    }
 }
 
-#[cfg(not(Py_GIL_DISABLED))]
+#[cfg(all(Py_3_12, not(Py_GIL_DISABLED)))]
 mod spare {
     use core::ptr;
     use core::sync::atomic::{AtomicPtr, Ordering};
