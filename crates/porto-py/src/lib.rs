@@ -21,6 +21,7 @@ pub use py_compat::interned;
 
 driver::freelist::gil_freelist!(trap_freelist, 512);
 driver::freelist::gil_freelist!(ready_freelist, 1024);
+driver::freelist::gil_freelist!(channel_op_freelist, 256);
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,
 /// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`, `Lock`, the channel handles
@@ -42,14 +43,15 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     async_slots::install_am_send::<Ready>(py, driver::ready::ready_am_send)?;
     async_slots::install_iter_slots::<Trap>(py, driver::trap::trap_iternext)?;
     async_slots::install_iter_slots::<Ready>(py, driver::ready::ready_iternext)?;
-    driver::freelist::install::<Trap>(py, trap_freelist::alloc, trap_freelist::free)?;
-    driver::freelist::install::<Ready>(py, ready_freelist::alloc, ready_freelist::free)?;
+    driver::freelist::install::<Trap>(py, &trap_freelist::SLOTS)?;
+    driver::freelist::install::<Ready>(py, &ready_freelist::SLOTS)?;
     driver::trap::fast_new::init(py)?;
     module.add_class::<api::channel_op::ChannelOp>()?;
     async_slots::install_am_send::<api::channel_op::ChannelOp>(
         py,
         api::channel_op::channel_op_am_send,
     )?;
+    driver::freelist::install::<api::channel_op::ChannelOp>(py, &channel_op_freelist::SLOTS)?;
     py_compat::names(py);
     api::channel::register(module)?;
     api::config::register(module)?;

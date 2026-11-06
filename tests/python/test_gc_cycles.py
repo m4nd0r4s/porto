@@ -74,11 +74,19 @@ def make_sync_wait() -> object:
     return wait
 
 
+def make_channel_op() -> object:
+    _tx, rx = porto.channel[int](1)
+    receive = rx.recv()
+    receive.close()  # pyright: ignore[reportAttributeAccessIssue]
+    return receive
+
+
 #: (the type, a function making one inside a task without leaving it pending)
 FREELIST_TYPES: list[tuple[str, Callable[[], object]]] = [
     ("_Ready", lambda: _core._make_ready(object())),  # pyright: ignore[reportPrivateUsage]
     ("_Trap", _core._yield_trap),  # pyright: ignore[reportPrivateUsage]
     ("_SyncWait", make_sync_wait),
+    ("_ChannelOp", make_channel_op),
 ]
 
 

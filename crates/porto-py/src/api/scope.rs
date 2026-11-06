@@ -49,7 +49,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ScopeExit>()?;
     // Right after `add_class`, before anything can see the type (see `async_slots`).
     async_slots::install_iter_slots::<ScopeExit>(module.py(), scope_exit::scope_exit_iternext)?;
-    freelist::install::<ScopeExit>(module.py(), exit_freelist::alloc, exit_freelist::free)?;
+    freelist::install::<ScopeExit>(module.py(), &exit_freelist::SLOTS)?;
     module.add_function(wrap_pyfunction!(scope, module)?)
 }
 

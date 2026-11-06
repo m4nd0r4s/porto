@@ -34,11 +34,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Right after `add_class`, before anything can see the type (see `async_slots`).
     async_slots::install_am_send::<wait_op::SyncWait>(module.py(), wait_op::sync_wait_am_send)?;
     async_slots::install_iter_slots::<wait_op::SyncWait>(module.py(), wait_op::sync_wait_iternext)?;
-    freelist::install::<wait_op::SyncWait>(
-        module.py(),
-        sync_wait_freelist::alloc,
-        sync_wait_freelist::free,
-    )?;
+    freelist::install::<wait_op::SyncWait>(module.py(), &sync_wait_freelist::SLOTS)?;
     wait_op::init_fast_new(module.py())?;
     module.add_class::<event::Event>()?;
     module.add_class::<event::Notify>()?;
@@ -47,7 +43,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<mutex::Mutex>()?;
     mutex::install_raw_methods(module.py())?;
     module.add_class::<mutex::MutexGuard>()?;
-    freelist::install::<mutex::MutexGuard>(module.py(), guard_freelist::alloc, guard_freelist::free)
+    freelist::install::<mutex::MutexGuard>(module.py(), &guard_freelist::SLOTS)
 }
 
 freelist::gil_freelist!(sync_wait_freelist, 256);
