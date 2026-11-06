@@ -153,7 +153,8 @@ def test_a_root_task_that_ignores_cancellation_is_abandoned_after_cancel_timeout
         await porto.checkpoint()
 
     started = time.monotonic()
-    porto.run(main, cancel_timeout=0.2)
+    with pytest.warns(RuntimeWarning, match=r"1 task\(s\) of the root scope .* abandoned"):
+        porto.run(main, cancel_timeout=0.2)
     assert 0.15 < time.monotonic() - started < 5
     # It was cancelled at every await until the timeout, then closed with the runtime.
     assert events[0] == "swallowed"

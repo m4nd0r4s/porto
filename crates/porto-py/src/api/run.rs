@@ -9,16 +9,19 @@
 //! returns main's result, or raises main's exception as is; when tasks of the root scope
 //! failed, it raises a strict exception group of main's exception (first) and theirs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::task::Poll;
+use std::time::Duration;
 
 use porto_core::Handle;
 use porto_core::config::RuntimeConfig;
 use porto_core::scope::CancelReason;
 use porto_core::time::{Deadline, sleep_until};
-use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{
+    PyBaseException, PyException, PyRuntimeError, PyRuntimeWarning, PyTypeError,
+};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -92,20 +95,25 @@ fn run_in_root_scope(
             pinned: false,
         };
         let main = pytask::spawn(runtime.handle(), coro, spawned)?;
+        let abandoned = Cell::new(0);
         let outcome = runtime.block_on(lane::main_or_interrupt(async {
             let outcome = pytask::join(main).await;
             node.cancel(CancelReason::Shutdown);
-            drain(&node, Deadline::after(cancel_timeout)).await;
+            abandoned.set(drain(&node, Deadline::after(cancel_timeout)).await);
             outcome
         }));
+        if abandoned.get() > 0 {
+            warn_abandoned(py, abandoned.get(), cancel_timeout)?;
+        }
         PyResult::Ok((outcome, root.get().close()))
     })?;
     root_outcome(py, outcome, errors)
 }
 
 /// Waits until no task is left in `scope`, or `deadline` passed: the tasks still there are
-/// then abandoned (dropped with the runtime). MUST be polled by the lane's `block_on`.
-async fn drain(scope: &PyScopeNode, deadline: Deadline) {
+/// then abandoned (dropped with the runtime), and their count is returned. MUST be polled by
+/// the lane's `block_on`.
+async fn drain(scope: &PyScopeNode, deadline: Deadline) -> u32 {
     let mut timeout = pin!(sleep_until(deadline));
     poll_fn(|cx| {
         let mut state = scope.lock_state();
@@ -124,8 +132,26 @@ async fn drain(scope: &PyScopeNode, deadline: Deadline) {
         Poll::Pending
     })
     .await;
-    let waiter = scope.lock_state().exit_waiter.take();
+    let mut state = scope.lock_state();
+    let waiter = state.exit_waiter.take();
+    let abandoned = state.live_children;
+    drop(state);
+    // Dropped after the lock (see `ScopeNode::lock_state`).
     drop(waiter);
+    abandoned
+}
+
+/// Warns that `count` tasks of the root scope outlived `cancel_timeout` after main ended: they
+/// are dropped with the runtime, their coroutines closed with no runtime around (26 §2).
+fn warn_abandoned(py: Python<'_>, count: u32, cancel_timeout: Duration) -> PyResult<()> {
+    let message = format!(
+        "porto.run: {count} task(s) of the root scope still ran {:.3} s (cancel_timeout) after \
+         main ended and the root scope was cancelled, and were abandoned; let them exit when \
+         they get porto.Cancelled (do not swallow it), or raise cancel_timeout",
+        cancel_timeout.as_secs_f64()
+    );
+    let category = py.get_type::<PyRuntimeWarning>();
+    PyErr::warn(py, &category, &std::ffi::CString::new(message)?, 1)
 }
 
 /// What `porto.run` returns or raises, given how main ended and the failures its root scope
@@ -136,6 +162,13 @@ fn root_outcome(
     outcome: TaskOutcome,
     errors: Vec<Py<PyBaseException>>,
 ) -> PyResult<Py<PyAny>> {
+    // An interrupt (Ctrl-C, or `SystemExit`) ends `porto.run` bare, also when it arrived while
+    // the root scope drained after main failed: it is not one more failure to group.
+    if let TaskOutcome::Err(exception) = &outcome
+        && !exception.bind(py).is_instance_of::<PyException>()
+    {
+        return outcome.into_result(py);
+    }
     let main_error = match &outcome {
         TaskOutcome::Err(exception) => Some(exception.as_ptr()),
         _ => None,
