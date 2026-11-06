@@ -63,7 +63,7 @@ use super::pytask::{CancelStack, PyScopeNode, PyScopeRef, PyTask, Resume, TaskOu
 use super::ready::ready;
 use super::trap::{Trap, TrapKind};
 use crate::errors::Cancelled;
-use crate::py_compat::{Sent, names, send, take_exception};
+use crate::py_compat::{Sent, names, release_spare_value, send, take_exception};
 
 thread_local! {
     /// The task this lane is polling, null between polls.
@@ -317,6 +317,9 @@ pub(super) fn poll(
         step_until_wait(task, &coro, &running, cx)
     };
     task.coro = Some(coro.unbind());
+    // The task gives the lane up: the last result an await returned through the spare
+    // `StopIteration` must not live on in it.
+    release_spare_value(py);
     match outcome {
         Some(outcome) => {
             let outcome = cancelled_by_its_scope(py, task, outcome);

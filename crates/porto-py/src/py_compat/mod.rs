@@ -32,4 +32,4 @@ mod stop_iteration;
 pub(crate) use exception::take_exception;
 pub use interned::names;
 pub(crate) use send::{Sent, send};
-pub(crate) use stop_iteration::raise_stop_iteration;
+pub(crate) use stop_iteration::{raise_stop_iteration, release_spare_value};
