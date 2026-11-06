@@ -30,6 +30,10 @@ pub(crate) enum Pending {
     Sleep(Deadline),
     /// Until a sync primitive grants the task's embedded wait node.
     Notified(WaitTarget),
+    /// [`Pending::Notified`] that a cancellation does not give up: the wait a cancelled task
+    /// makes to get back what it must hold when the `Cancelled` leaves it (a `Condition.wait()`
+    /// takes its lock again).
+    NotifiedShielded(WaitTarget),
     /// Until an I/O operation succeeds, re-attempted on readiness (spec 13 §5).
     Io(IoWait),
     /// Until another task finishes, through its join list and the embedded wait node; resumes
@@ -56,6 +60,7 @@ pub(crate) enum Kind {
     YieldThen,
     Sleep,
     Notified,
+    NotifiedShielded,
     Io,
     Join,
     ScopeExit,
@@ -71,7 +76,8 @@ impl Kind {
 
     /// Whether a cancellation gives the wait up (T3) while it is not over: every kind but the
     /// yields (the task is queued already, and a `YieldThen` holds a result it must get, see
-    /// `step.rs`) and `ScopeExit` (an exit never abandons its children, C5).
+    /// `step.rs`), `ScopeExit` (an exit never abandons its children, C5) and
+    /// `NotifiedShielded`.
     pub(crate) fn is_cancellable(self) -> bool {
         matches!(
             self,
@@ -90,7 +96,7 @@ impl Kind {
             Self::None => "none",
             Self::Yield | Self::YieldThen => "yield",
             Self::Sleep => "sleep",
-            Self::Notified => "notified",
+            Self::Notified | Self::NotifiedShielded => "notified",
             Self::Io => "io",
             Self::Join => "join",
             Self::ScopeExit => "scope_exit",
@@ -135,6 +141,7 @@ impl Pending {
             Self::YieldThen(_) => Kind::YieldThen,
             Self::Sleep(_) => Kind::Sleep,
             Self::Notified(_) => Kind::Notified,
+            Self::NotifiedShielded(_) => Kind::NotifiedShielded,
             Self::Io(_) => Kind::Io,
             Self::Join(_) => Kind::Join,
             Self::ScopeExit(_) => Kind::ScopeExit,
@@ -154,6 +161,12 @@ impl Pending {
             Self::Sleep(deadline) => (Kind::Sleep, Payload { deadline }),
             Self::Notified(wait) => (
                 Kind::Notified,
+                Payload {
+                    wait: ManuallyDrop::new(wait),
+                },
+            ),
+            Self::NotifiedShielded(wait) => (
+                Kind::NotifiedShielded,
                 Payload {
                     wait: ManuallyDrop::new(wait),
                 },
@@ -202,6 +215,7 @@ impl Pending {
                 Kind::YieldThen => Self::YieldThen(read(&payload.object)),
                 Kind::Sleep => Self::Sleep(payload.deadline),
                 Kind::Notified => Self::Notified(read(&payload.wait)),
+                Kind::NotifiedShielded => Self::NotifiedShielded(read(&payload.wait)),
                 Kind::Io => Self::Io(read(&payload.io)),
                 Kind::Join => Self::Join(read(&payload.join)),
                 Kind::ScopeExit => Self::ScopeExit(read(&payload.scope)),
