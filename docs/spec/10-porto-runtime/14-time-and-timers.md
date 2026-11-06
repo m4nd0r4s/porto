@@ -27,3 +27,4 @@ porto.interval(period: float, *, missed: Literal["burst","skip","delay"]="skip")
 ## 4. Precision rules
 - The park timeout is computed as `deadline - now` rounded **up** to the driver granularity (epoll: ms, or µs with `epoll_pwait2` on Linux ≥ 5.11).
 - `timer_resolution` is configurable in `[100µs, 10ms]`.
+- "Never early" holds on the runtime clock: `current_time()` read after a `sleep(d)` is at least `d` past a reading taken before it. A coarser clock can read the same sleep as shorter. Python 3.11's `time.monotonic()` on Windows ticks every ~15.6 ms (`GetTickCount64`), so measure sleeps with `current_time()` or `time.perf_counter()`.
