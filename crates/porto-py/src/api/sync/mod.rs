@@ -46,8 +46,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     freelist::install::<mutex::MutexGuard>(module.py(), &guard_freelist::SLOTS)
 }
 
-freelist::gil_freelist!(sync_wait_freelist, 256, traversed: true);
-freelist::gil_freelist!(guard_freelist, 64, traversed: true);
+freelist::gil_freelist!(sync_wait_freelist, 256);
+freelist::gil_freelist!(guard_freelist, 64);
 
 /// Runs a `blocking_*` wait with the thread detached from Python, after refusing a porto lane
 /// thread: waiting there would stall every task on the lane.

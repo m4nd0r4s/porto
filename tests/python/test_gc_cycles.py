@@ -8,7 +8,7 @@ freelists (GIL builds) must be tracked by the collector again, like freshly allo
 
 import gc
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import pytest
 
@@ -66,32 +66,76 @@ def test_a_scope_exit_holding_its_exception_in_a_cycle_is_collected() -> None:
     porto.run(main)
 
 
-def make_sync_wait() -> object:
-    lock = porto.Lock()
-    wait = lock.acquire()
+async def make_sync_wait(mutex: porto.Mutex[list[int]]) -> object:
+    # Closed unawaited, it still holds the mutex for the guard it would have made.
+    wait = mutex.__aenter__()
     wait.close()  # pyright: ignore[reportAttributeAccessIssue]
     return wait
 
 
-#: (the type, a function making one inside a task without leaving it pending). Only types
-#: the collector can see through (with a ``__traverse__``) are tracked again on reuse;
-#: ``_Trap``, ``_Ready`` and ``_ChannelOp`` hold nothing it could follow.
-FREELIST_TYPES: list[tuple[str, Callable[[], object]]] = [
+async def make_mutex_guard(mutex: porto.Mutex[list[int]]) -> object:
+    async with mutex as guard:
+        pass
+    return guard
+
+
+async def make_scope_exit(_: porto.Mutex[list[int]]) -> object:
+    scope = porto.scope()
+    await scope.__aenter__()
+    scope.spawn(porto.checkpoint)
+    exiting = scope.__aexit__(KeyError, KeyError("leaving the block"), None)
+    await exiting
+    return exiting
+
+
+#: A function making an object that holds what it is given and objects of its own, inside a
+#: task and without leaving it pending.
+Make = Callable[[porto.Mutex[list[int]]], Awaitable[object]]
+
+#: (the type, its `Make`), for every type with a freelist that the collector can see through
+#: (with a ``__traverse__``): those are tracked again on reuse. ``_Trap``, ``_Ready`` and
+#: ``_ChannelOp`` hold nothing it could follow.
+FREELIST_TYPES: list[tuple[str, Make]] = [
     ("_SyncWait", make_sync_wait),
+    ("MutexGuard", make_mutex_guard),
+    ("_ScopeExit", make_scope_exit),
 ]
 
+FREELIST_IDS = [name for name, _ in FREELIST_TYPES]
 
-@pytest.mark.parametrize(("name", "make"), FREELIST_TYPES, ids=[name for name, _ in FREELIST_TYPES])
+
+@pytest.mark.parametrize(("name", "make"), FREELIST_TYPES, ids=FREELIST_IDS)
 def test_an_object_reused_from_a_freelist_is_tracked_by_the_collector(
-    name: str, make: Callable[[], object]
+    name: str, make: Make
 ) -> None:
     async def main() -> None:
-        first = make()
+        first = await make(porto.Mutex([]))
         assert type(first).__name__ == name
         assert gc.is_tracked(first)
         del first
-        again = make()
+        again = await make(porto.Mutex([]))
         assert gc.is_tracked(again)
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize(("name", "make"), FREELIST_TYPES, ids=FREELIST_IDS)
+def test_a_reused_object_is_tracked_only_once_its_new_value_is_written(
+    name: str, make: Make
+) -> None:
+    # Each object is the last to hold what it references, so freeing it frees those too, and
+    # the next mutex is made before that, so the freed memory is not handed out again at once.
+    # Tracking the object again on reuse before its new value is written would make a debug
+    # CPython traverse the old value and follow the freed objects (porto-txa); the
+    # py-test-debug CI job runs this on one. Elsewhere it checks that churn stays sound.
+    async def main() -> None:
+        mutex = porto.Mutex([])
+        for _ in range(50):
+            made = await make(mutex)
+            assert type(made).__name__ == name
+            mutex = porto.Mutex([])
+            del made
+            gc.collect()
 
     porto.run(main)
 

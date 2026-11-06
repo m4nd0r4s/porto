@@ -29,6 +29,7 @@ use pyo3::types::PyType;
 use super::lock::{LockSource, release_then_checkpoint};
 use super::wait_op::{Grant, SyncWait, Then};
 use crate::api::time::require_lane;
+use crate::driver::freelist;
 use crate::driver::thin::Waitable;
 use crate::raw_methods::{self, MethodDef};
 
@@ -105,9 +106,9 @@ impl Mutex {
         release_then_checkpoint(slf.py(), &this.lock, exc)
     }
 
-    /// The guard for the block that now holds the lock.
+    /// The guard for the block that now holds the lock, from a freelist.
     pub(super) fn guard(slf: &Bound<'_, Self>) -> PyResult<Py<MutexGuard>> {
-        Py::new(
+        freelist::new_tracked(
             slf.py(),
             MutexGuard {
                 mutex: slf.clone().unbind(),

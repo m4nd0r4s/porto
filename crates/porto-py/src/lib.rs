@@ -19,9 +19,9 @@ pub use driver::ready::Ready;
 pub use driver::trap::Trap;
 pub use py_compat::interned;
 
-driver::freelist::gil_freelist!(trap_freelist, 512, traversed: false);
-driver::freelist::gil_freelist!(ready_freelist, 1024, traversed: false);
-driver::freelist::gil_freelist!(channel_op_freelist, 256, traversed: false);
+driver::freelist::gil_freelist!(trap_freelist, 512);
+driver::freelist::gil_freelist!(ready_freelist, 1024);
+driver::freelist::gil_freelist!(channel_op_freelist, 256);
 
 /// The `porto._core` module: the public API (`run`, `scope`, `Scope`, `Task`, `sleep`,
 /// `checkpoint`, `current_time`, `monotonic`, `Event`, `Notify`, `Lock`, the channel handles

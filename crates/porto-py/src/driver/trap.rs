@@ -27,6 +27,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use super::fast_new::Unawaited;
 use super::pending::{AbiFuture, IoWait, Kind, Payload, Pending};
 use super::pytask::{PyScopeRef, PyTask, Resume};
 use super::thin::{BoxedFuture, WaitTarget};
@@ -230,6 +231,12 @@ impl Trap {
     /// Marks the trap finished (thrown into or closed), keeping MOVED.
     fn finish(&self) {
         self.state.fetch_or(DONE, Ordering::AcqRel);
+    }
+}
+
+impl Unawaited for Trap {
+    fn unwatch(&mut self) {
+        *self.state.get_mut() &= !WATCHED;
     }
 }
 
@@ -471,6 +478,15 @@ mod tests {
         assert!(matches!(refused.resume(false), Step::NotStarted));
         assert_eq!(refused.state.load(Ordering::Acquire), FRESH | WATCHED);
         refused.finish();
+    }
+
+    #[test]
+    fn an_unwatched_trap_is_dropped_without_the_never_awaited_warning() {
+        // What `FastNew::object` does when its object cannot be made: the trap stays FRESH, and
+        // dropping it here needs no Python because it no longer warns.
+        let mut trap = Trap::sleep_until(Deadline::from_nanos(7)).watched();
+        trap.unwatch();
+        assert_eq!(trap.state.load(Ordering::Acquire), FRESH);
     }
 
     #[test]

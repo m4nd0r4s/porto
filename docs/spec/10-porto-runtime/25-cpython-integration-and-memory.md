@@ -18,6 +18,7 @@ CPython 3.11, 3.12, 3.13, 3.14 (GIL) and 3.14t (free-threaded, and later t build
 - Interned strings for attribute names (`"throw"`, `"_asyncio_future_blocking"`, `"send"`) are created once per interpreter (`GILOnceCell`/`PyOnceLock`).
 - Results passed into `PyIter_Send` transfer ownership (steal semantics wrapper). Avoid temporary `Py_INCREF/DECREF` pairs.
 - Freelists: `_Trap` (512), `_Ready` (1024), `asyncio Handle` facade objects (256).
+- A freelisted object the collector can see through (one with a `__traverse__`) is tracked again only after its new value is written: `tp_alloc` returns it untracked, and the code that writes the value tracks it. Tracking it in `tp_alloc` would expose the old value, whose references were already released, to a traversal (a debug CPython traverses at once to validate).
 
 ## 5. Memory budgets
 | Object | Target size |

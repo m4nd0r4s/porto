@@ -17,7 +17,10 @@
 //! A reused spare must look fresh to everything that can reach it: its argument tuple gets its
 //! cached hash (3.14) reset and is tracked by the collector again. And it must not keep the
 //! last value alive: [`release_spare_value`] puts `None` back whenever a task gives its lane
-//! up, so an await's result lives no longer than the step that took it.
+//! up, so an await's result lives no longer than the step that took it. Within that step it
+//! does: the spare keeps the task's latest result until the task next suspends or ends, even
+//! once the task let go of it (`del guard` frees a `MutexGuard` only then), as
+//! `16-sync-primitives-and-channels.md` §1 documents.
 
 use pyo3::ffi;
 use pyo3::prelude::*;
