@@ -49,9 +49,9 @@ An entry point that takes a coroutine object and refuses it (`run` inside a runn
 Until multi-lane scheduling lands (M2, `12`), the runtime runs one lane: `porto.run` MUST refuse an int `lanes` above 1, from any source, with `NotImplementedError` that names the source (`lanes=4`, or `PORTO_LANES='4'`) and says to leave it out or use 1, rather than silently run on one lane. `RuntimeConfig(lanes=4)` itself stays valid. `"auto"` is accepted from any source and runs on one lane for now. Once multi-lane scheduling lands it resolves as in `12` §7, with no change for callers that pass it.
 
 ### Time
-`current_time() -> float`, `monotonic() -> float`, `sleep(seconds: float, /) -> Awaitable[None]`, `async sleep_until(t: float)`, `async sleep_forever() -> NoReturn`, `checkpoint() -> Awaitable[None]`, `interval(period, *, missed="skip") -> AsyncIterator[float]`.
+`current_time() -> float`, `monotonic() -> float`, `sleep(seconds: float, /) -> Awaitable[None]`, `sleep_until(deadline: float, /) -> Awaitable[None]`, `sleep_forever() -> Awaitable[NoReturn]`, `checkpoint() -> Awaitable[None]`, `interval(period, *, missed="skip") -> AsyncIterator[float]`. Zero, negative, infinite and NaN arguments behave as `14` §3 says.
 
-`sleep` and `checkpoint` return a trap (§11 §5, T1), not a coroutine: they are the hottest awaits, and a trap costs one freelisted object where a coroutine costs a frame. Await the result right away. A trap freed without ever being awaited emits `RuntimeWarning` naming the call (§11 §10).
+`sleep`, `sleep_until`, `sleep_forever` and `checkpoint` return a trap (§11 §5, T1), not a coroutine: they are the hottest awaits, and a trap costs one freelisted object where a coroutine costs a frame. Await the result right away. A trap freed without ever being awaited emits `RuntimeWarning` naming the call (§11 §10).
 
 ### Structured concurrency
 ```python

@@ -24,6 +24,12 @@ porto.interval(period: float, *, missed: Literal["burst","skip","delay"]="skip")
 ```
 `interval` follows Tokio `MissedTickBehavior` semantics, and yields the scheduled tick time.
 
+Arguments are `float` seconds, and the edge values are defined:
+- A deadline already reached (`sleep(seconds <= 0)`, `-inf` included; `sleep_until(t)` with `t <= current_time()`) is a pure checkpoint: the task yields once, and a cancellation is delivered there (C2). It is not an error.
+- An infinite one (`sleep(inf)`, `sleep_until(inf)`, or a deadline beyond the clock's ~584 years) never fires: like `sleep_forever()`, only a cancellation ends it. Its entry stays linked (in the top level's ring, re-armed about every 2.2 years at 1 ms), so cancelling it unlinks it like any other.
+- NaN is no point in time: `sleep` and `sleep_until` raise `ValueError` saying what to pass (a number of seconds, `0` to yield, or `sleep_forever()`).
+- `sleep_until(t)` rounds `t` up to the nanosecond, so "never early" holds on the `current_time()` reading it was computed from.
+
 ## 4. Precision rules
 - The park timeout is computed as `deadline - now` rounded **up** to the driver granularity (epoll: ms, or µs with `epoll_pwait2` on Linux ≥ 5.11).
 - `timer_resolution` is configurable in `[100µs, 10ms]`.

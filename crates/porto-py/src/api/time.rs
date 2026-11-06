@@ -1,5 +1,11 @@
 //! The runtime clock (`porto.current_time`, alias `porto.monotonic`) and the trap constructors
-//! behind `porto.sleep` and `porto.checkpoint`.
+//! behind `porto.sleep`, `porto.sleep_until`, `porto.sleep_forever` and `porto.checkpoint`
+//! (`14-time-and-timers.md` §3).
+//!
+//! A sleep whose deadline is already reached (`sleep(seconds <= 0)`, `sleep_until` of a past
+//! time) is a pure checkpoint: the driver turns a sleep trap with a passed deadline into a yield,
+//! cancellation check included. An infinite one (`inf`, `sleep_forever`) only ends by
+//! cancellation. NaN is refused: it is no point in time.
 
 use std::time::Duration;
 
@@ -9,13 +15,16 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use crate::driver::lane;
-use crate::driver::trap::{self, Trap};
+use crate::driver::trap::{self, SleepCall, Trap};
 use crate::errors::NoRuntimeError;
 
 /// Adds the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("checkpoint", checkpoint_function(module)?)?;
     module.add_function(wrap_pyfunction!(sleep, module)?)?;
+    module.add_function(wrap_pyfunction!(sleep_until, module)?)?;
+    module.add_function(wrap_pyfunction!(sleep_forever, module)?)?;
+    module.add_function(wrap_pyfunction!(armed_timers, module)?)?;
     module.add_function(wrap_pyfunction!(current_time, module)?)?;
     // The same function object, so `porto.monotonic is porto.current_time`.
     module.add("monotonic", module.getattr("current_time")?)?;
@@ -94,12 +103,51 @@ unsafe extern "C" fn checkpoint_noargs(
 }
 
 /// `porto.sleep(seconds)`: an awaitable that resumes the task `seconds` from now, never earlier.
-/// `sleep(0)` yields once; `inf` never resumes.
+/// `seconds <= 0` is a checkpoint (it yields once); `inf` never resumes.
 #[pyfunction]
 #[pyo3(signature = (seconds, /))]
 fn sleep(seconds: f64) -> PyResult<Trap> {
     require_lane("sleep")?;
-    Ok(sleep_trap(seconds)?.watched())
+    Ok(sleep_trap(seconds)?.watched_sleep(SleepCall::Sleep))
+}
+
+/// `porto.sleep_until(deadline)`: an awaitable that resumes the task once `current_time()`
+/// reaches `deadline`, never earlier. A deadline already passed is a checkpoint; `inf` never
+/// resumes.
+#[pyfunction]
+#[pyo3(signature = (deadline, /))]
+fn sleep_until(deadline: f64) -> PyResult<Trap> {
+    require_lane("sleep_until")?;
+    if deadline.is_nan() {
+        return Err(PyValueError::new_err(
+            "porto: porto.sleep_until() got a NaN deadline, which is no point in time; pass a \
+             time on the runtime clock, such as porto.current_time() + 5 (or call \
+             porto.sleep_forever() to wait until cancelled)",
+        ));
+    }
+    let now = now("sleep_until")?;
+    Ok(Trap::sleep_until(deadline_at(now, deadline)).watched_sleep(SleepCall::SleepUntil))
+}
+
+/// `porto.sleep_forever()`: an awaitable that never resumes the task; only a cancellation ends
+/// it.
+#[pyfunction]
+fn sleep_forever() -> PyResult<Trap> {
+    require_lane("sleep_forever")?;
+    Ok(Trap::sleep_until(Deadline::NEVER).watched_sleep(SleepCall::SleepForever))
+}
+
+/// Test hook: how many timers are armed on the running runtime's wheel: sleeping tasks and the
+/// runtime's own (the lane's signal check). A cancelled sleep leaves none behind.
+#[pyfunction(name = "_armed_timers")]
+fn armed_timers() -> PyResult<usize> {
+    porto_core::Handle::try_current()
+        .map(|handle| handle.armed_timers())
+        .ok_or_else(|| {
+            NoRuntimeError::new_err(
+                "porto: _armed_timers() was called outside porto.run(); call it from a task",
+            )
+        })
 }
 
 /// Fails unless a porto task is running on this thread: porto awaitables only work there.
@@ -139,19 +187,43 @@ fn yield_trap() -> Trap {
 }
 
 /// A trap that resumes the task `delay` seconds from now, never earlier. `inf` never resumes;
-/// a delay of zero still yields once.
+/// a delay of zero or less still yields once.
 #[pyfunction(name = "_sleep_trap")]
 #[pyo3(signature = (delay, /))]
 fn sleep_trap(delay: f64) -> PyResult<Trap> {
-    if delay.is_nan() || delay < 0.0 {
-        return Err(PyValueError::new_err(format!(
-            "porto: the sleep delay must be a number of seconds >= 0, got {delay}; use 0 to \
-             just yield to other tasks"
-        )));
+    if delay.is_nan() {
+        return Err(PyValueError::new_err(
+            "porto: porto.sleep() got NaN seconds, which is no delay; pass a number of seconds \
+             (0 or less just yields to the other tasks), or call porto.sleep_forever() to wait \
+             until cancelled",
+        ));
     }
     let now = now("sleep")?;
+    if delay <= 0.0 {
+        // Already reached: a checkpoint.
+        return Ok(Trap::sleep_until(now));
+    }
     // Only an overflow is left: a delay too long for the clock never ends.
     let deadline = Duration::try_from_secs_f64(delay)
         .map_or(Deadline::NEVER, |delay| now.saturating_add(delay));
     Ok(Trap::sleep_until(deadline))
+}
+
+/// The deadline for `seconds` on the runtime clock (not NaN), at `now` if that has passed.
+/// Rounded up to the nanosecond, so `current_time()` at or after it never reads below
+/// `seconds`: never early on the clock the caller measured with.
+fn deadline_at(now: Deadline, seconds: f64) -> Deadline {
+    if seconds <= now.as_secs_f64() {
+        return now;
+    }
+    let Ok(since_epoch) = Duration::try_from_secs_f64(seconds) else {
+        // Beyond the clock (or `inf`): never reached.
+        return Deadline::NEVER;
+    };
+    let deadline = Deadline::from_duration(since_epoch);
+    if deadline.as_secs_f64() < seconds {
+        deadline.saturating_add(Duration::from_nanos(1))
+    } else {
+        deadline
+    }
 }

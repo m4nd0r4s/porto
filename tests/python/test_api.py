@@ -373,11 +373,19 @@ def test_current_time_outside_run_raises_and_says_what_to_do() -> None:
         porto.monotonic()
 
 
-def test_a_negative_sleep_raises() -> None:
+def test_a_negative_sleep_is_a_checkpoint() -> None:
+    # 14 §3: seconds <= 0 is a pure checkpoint, not an error (more in test_time.py).
     async def main() -> None:
         await porto.sleep(-1)
 
-    with pytest.raises(ValueError, match="must be a number of seconds >= 0"):
+    porto.run(main)
+
+
+def test_a_nan_sleep_raises_and_says_what_to_do() -> None:
+    async def main() -> None:
+        await porto.sleep(float("nan"))
+
+    with pytest.raises(ValueError, match=r"got NaN seconds.*0 or less just yields"):
         porto.run(main)
 
 

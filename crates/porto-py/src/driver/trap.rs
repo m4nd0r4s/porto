@@ -49,6 +49,21 @@ const MOVED: u8 = 0b0100;
 /// Set on a FRESH trap that a public API returned (`porto.sleep`, `porto.checkpoint`):
 /// freeing it while still FRESH warns that it was never awaited. The first resume clears it.
 const WATCHED: u8 = 0b1000;
+/// With WATCHED, on a sleep trap: which call returned it, for the warning (none: `porto.sleep`).
+const CALL: u8 = 0b11_0000;
+const CALL_SLEEP_UNTIL: u8 = 0b01_0000;
+const CALL_SLEEP_FOREVER: u8 = 0b10_0000;
+
+/// The public call that returned a sleep trap, named if it is never awaited.
+#[derive(Clone, Copy)]
+pub(crate) enum SleepCall {
+    /// `porto.sleep(...)`.
+    Sleep,
+    /// `porto.sleep_until(...)`.
+    SleepUntil,
+    /// `porto.sleep_forever()`.
+    SleepForever,
+}
 
 /// What a trap asks the driver to do (11-task-model-and-trap-protocol.md §5.2).
 pub(crate) enum TrapKind {
@@ -166,10 +181,24 @@ impl Trap {
         self
     }
 
+    /// A sleep trap that `call` returned, watched like [`Trap::watched`].
+    pub(crate) fn watched_sleep(mut self, call: SleepCall) -> Self {
+        debug_assert!(self.kind == Kind::Sleep);
+        let call = match call {
+            SleepCall::Sleep => 0,
+            SleepCall::SleepUntil => CALL_SLEEP_UNTIL,
+            SleepCall::SleepForever => CALL_SLEEP_FOREVER,
+        };
+        *self.state.get_mut() |= WATCHED | call;
+        self
+    }
+
     /// The call that returned a watched trap, as the user wrote it.
-    fn call_name(&self) -> &'static str {
-        match self.kind {
-            Kind::Sleep => "porto.sleep(...)",
+    fn call_name(&self, state: u8) -> &'static str {
+        match (self.kind, state & CALL) {
+            (Kind::Sleep, CALL_SLEEP_UNTIL) => "porto.sleep_until(...)",
+            (Kind::Sleep, CALL_SLEEP_FOREVER) => "porto.sleep_forever()",
+            (Kind::Sleep, _) => "porto.sleep(...)",
             _ => "porto.checkpoint()",
         }
     }
@@ -236,7 +265,7 @@ impl Trap {
 
 impl Unawaited for Trap {
     fn unwatch(&mut self) {
-        *self.state.get_mut() &= !WATCHED;
+        *self.state.get_mut() &= !(WATCHED | CALL);
     }
 }
 
@@ -244,7 +273,7 @@ impl Drop for Trap {
     fn drop(&mut self) {
         let state = *self.state.get_mut();
         if state & (PHASE | WATCHED) == FRESH | WATCHED {
-            crate::unawaited::warn_never_awaited(self.call_name());
+            crate::unawaited::warn_never_awaited(self.call_name(state));
         }
         if self.kind.owns_payload() && state & MOVED == 0 {
             // SAFETY: not moved out, so the payload is live and packed with `self.kind`; it is

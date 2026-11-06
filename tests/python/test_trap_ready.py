@@ -74,10 +74,20 @@ def test_a_yield_trap_has_no_deadline() -> None:
     assert repr(trap) == "<porto._core._Trap yield fresh>"
 
 
-@pytest.mark.parametrize("delay", [-1.0, float("nan")])
-def test_a_sleep_trap_rejects_a_negative_or_nan_delay(delay: float) -> None:
-    with pytest.raises(ValueError, match="sleep delay must be a number of seconds >= 0"):
-        _core._sleep_trap(delay)
+def test_a_sleep_trap_rejects_a_nan_delay() -> None:
+    with pytest.raises(ValueError, match="got NaN seconds, which is no delay"):
+        _core._sleep_trap(float("nan"))
+
+
+@pytest.mark.parametrize("delay", [0.0, -1.0, float("-inf")])
+def test_a_sleep_trap_of_no_delay_has_a_deadline_already_reached(delay: float) -> None:
+    def check() -> None:
+        trap = _core._sleep_trap(delay)
+        assert trap.kind == "sleep"
+        assert trap.deadline is not None
+        assert trap.deadline <= _core.current_time()
+
+    in_a_runtime(check)
 
 
 def test_a_sleep_trap_outside_a_runtime_raises_and_says_what_to_do() -> None:

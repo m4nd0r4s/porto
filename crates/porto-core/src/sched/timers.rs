@@ -126,6 +126,11 @@ impl Timers {
         }
     }
 
+    /// How many entries are linked: armed timers, sleeping tasks among them.
+    pub(crate) fn armed(&self) -> usize {
+        self.armed.load(Ordering::Relaxed)
+    }
+
     /// The earliest deadline the lane must wake up for, if any timer is armed: never after
     /// the earliest timer's deadline.
     pub(crate) fn next_deadline(&self) -> Option<Deadline> {

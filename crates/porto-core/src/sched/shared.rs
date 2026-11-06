@@ -139,6 +139,13 @@ impl Handle {
         self.shared.clock.now()
     }
 
+    /// How many timers are armed on this runtime's wheel: sleeps that have not fired or been
+    /// cancelled yet. For observability and tests; a cancelled sleep is unlinked at once, so it
+    /// no longer counts.
+    pub fn armed_timers(&self) -> usize {
+        self.shared.timers.armed()
+    }
+
     /// Spawns `future` as a new task. From one of this runtime's lanes it goes on that lane's
     /// local queue; from anywhere else, onto the injector (unparking a lane).
     ///

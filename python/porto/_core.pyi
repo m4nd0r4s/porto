@@ -1,8 +1,8 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock``, ``Mutex``,
-``MutexGuard``, ``Sender``, ``Receiver`` and ``__version__``
+``sleep_until``, ``sleep_forever``, ``checkpoint``, ``current_time``, ``monotonic``, ``Event``,
+``Notify``, ``Lock``, ``Mutex``, ``MutexGuard``, ``Sender``, ``Receiver`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -69,10 +69,30 @@ monotonic = current_time
 """An alias of ``current_time``: the same function."""
 
 def sleep(seconds: float, /) -> Awaitable[None]:
-    """Resumes the task ``seconds`` from now, never earlier. ``sleep(0)`` yields once.
+    """Resumes the task ``seconds`` from now, never earlier on ``current_time()``.
+    ``seconds <= 0`` is a checkpoint (it yields once); ``inf`` sleeps until cancelled.
+
+    Raises ``ValueError`` for NaN.
 
     Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``. A trap
     freed without being awaited emits ``RuntimeWarning`` ("never awaited").
+    """
+
+# Time: sleep_until and sleep_forever (porto-szb.33)
+
+def sleep_until(deadline: float, /) -> Awaitable[None]:
+    """Resumes the task once ``current_time()`` reaches ``deadline``, never earlier. A deadline
+    already passed is a checkpoint (it yields once); ``inf`` sleeps until cancelled.
+
+    Raises ``ValueError`` for NaN. Returns a trap, not a coroutine: ``await`` it right away,
+    inside ``porto.run``. A trap freed without being awaited emits ``RuntimeWarning``.
+    """
+
+def sleep_forever() -> Awaitable[NoReturn]:
+    """Never resumes the task: only a cancellation (``porto.Cancelled``) ends the wait.
+
+    Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``. A trap
+    freed without being awaited emits ``RuntimeWarning``.
     """
 
 def checkpoint() -> Awaitable[None]:
@@ -515,8 +535,14 @@ def _yield_trap() -> _Trap:
     """A trap that yields to the scheduler once."""
 
 def _sleep_trap(delay: float, /) -> _Trap:
-    """A trap that resumes the task ``delay`` seconds from now, never earlier. Reads the runtime
-    clock, so it raises ``porto.NoRuntimeError`` outside ``porto.run``."""
+    """A trap that resumes the task ``delay`` seconds from now, never earlier (``delay <= 0``:
+    a deadline already passed, so a yield). Reads the runtime clock, so it raises
+    ``porto.NoRuntimeError`` outside ``porto.run``; ``ValueError`` for NaN."""
+
+def _armed_timers() -> int:
+    """Test hook: how many timers are armed on the running runtime's wheel, its own included
+    (the lane's signal check). A cancelled sleep leaves none behind. Raises
+    ``porto.NoRuntimeError`` outside ``porto.run``."""
 
 def _make_ready(value: _T_co, /) -> _Ready[_T_co]:
     """Test hook: a ready awaitable holding ``value``."""
