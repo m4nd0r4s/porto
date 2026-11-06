@@ -15,6 +15,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::pin::pin;
 use std::task::{Poll, Waker};
 use std::time::Duration;
@@ -41,12 +42,45 @@ thread_local! {
     static LANE: RefCell<LaneState> = RefCell::new(LaneState::default());
 }
 
+/// The hasher of the lane's maps, whose keys are task addresses (distinct, not chosen by
+/// anyone): a multiply and a rotate instead of SipHash, which showed in every spawn that waits
+/// for its scope (porto-itr.7).
+type ByAddress = BuildHasherDefault<AddressHasher>;
+
+/// See [`ByAddress`].
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_usize(&mut self, key: usize) {
+        self.write_u64(key as u64);
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        // Fibonacci hashing: the multiply spreads the address bits into the high ones, the
+        // rotate brings some back down for the bucket index.
+        self.0 = (self.0 ^ key)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(26);
+    }
+}
+
 #[derive(Default)]
 struct LaneState {
     /// The wakers of the tasks in a linked wait, by the key `keep_linked_wait` got.
-    linked_waits: HashMap<usize, Waker>,
+    linked_waits: HashMap<usize, Waker, ByAddress>,
     /// Exceptions to throw into tasks at their next wait that is not over, by task key.
-    interrupts: HashMap<usize, Py<PyBaseException>>,
+    interrupts: HashMap<usize, Py<PyBaseException>, ByAddress>,
     /// An exception that stops the run, raised out of `porto.run` in place of main's outcome.
     failure: Option<Py<PyBaseException>>,
     /// The waker of the `block_on` future, to deliver `failure` right away.

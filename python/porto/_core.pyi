@@ -1,8 +1,8 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock``, ``Sender``,
-``Receiver`` and ``__version__``
+``checkpoint``, ``current_time``, ``monotonic``, ``Event``, ``Notify``, ``Lock``, ``Mutex``,
+``MutexGuard``, ``Sender``, ``Receiver`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -126,8 +126,6 @@ class Scope:
         traceback: TracebackType | None,
         /,
     ) -> bool: ...
-    def _wait_trap(self) -> _Trap | None: ...
-    def _finish(self, exc: BaseException | None, /) -> bool: ...
     def _waiter_count(self) -> int: ...
 
 @final
@@ -217,12 +215,14 @@ class Lock:
         """Completes once the task holds the lock; without suspending if it is free.
 
         Nothing happens until it is awaited: one that is never awaited takes no lock (and emits
-        ``RuntimeWarning`` when freed). A task
-        cancelled or closed before it observed the lock passes it on.
+        ``RuntimeWarning`` when freed). A task cancelled or closed before it observed the lock
+        passes it on. (``async with lock:`` takes a free lock in ``__aenter__()`` itself, which
+        the statement awaits at once.)
         """
 
     def _acquire_then(self, on_acquired: Callable[[], _T], /) -> _SyncWait[_T]:
-        """Internal (``porto.Mutex``): ``acquire()``, then ``on_acquired()`` in the same step;
+        """Internal (the lazy wait of ``porto.Mutex``, for tests): ``acquire()``, then
+        ``on_acquired()`` in the same step;
         the await evaluates to its result. If it raises, the lock is released first."""
 
     def try_acquire(self) -> bool:
@@ -242,7 +242,43 @@ class Lock:
 
         The wait does not check for signals: Ctrl-C does not interrupt it."""
 
-    def __aenter__(self) -> _SyncWait[None]: ...
+    def __aenter__(self) -> Awaitable[None]: ...
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
+
+@final
+class MutexGuard(Generic[_T]):
+    """Access to a ``porto.Mutex``'s value while its lock is held; what ``async with`` gives.
+    It stops working when the block exits (``RuntimeError``)."""
+
+    @property
+    def value(self) -> _T:
+        """The value the mutex owns."""
+
+    def set(self, value: _T, /) -> None:
+        """Replaces the value the mutex owns."""
+
+@final
+class Mutex(Generic[_T]):
+    """``porto.Mutex[T](value)``: an async lock that owns ``value``.
+
+    ``async with mutex as guard:`` waits for the lock (fair FIFO, like ``porto.Lock``), then
+    ``guard.value`` reads the value and ``guard.set(new)`` replaces it. Not reentrant: entering
+    it again inside its own block waits forever. A free mutex is taken in ``__aenter__()``
+    itself, which ``async with`` awaits at once; a task cancelled or closed while it waits for
+    the mutex never holds it. Thread-safe.
+    """
+
+    def __init__(self, value: _T, /) -> None: ...
+    def locked(self) -> bool:
+        """Whether the lock is held (or being handed to a waiter)."""
+
+    def __aenter__(self) -> Awaitable[MutexGuard[_T]]: ...
     def __aexit__(
         self,
         exc_type: type[BaseException] | None,

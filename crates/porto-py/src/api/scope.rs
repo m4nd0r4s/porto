@@ -18,10 +18,13 @@
 //! Not yet: deadlines and timeouts (C9), shields (C8), names, `start()` (§3), `Task.cancel()` and
 //! awaiting a task (§4), and spawning from other lanes or threads (C10).
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+
+use parking_lot::{Mutex, MutexGuard};
 
 use porto_core::scope::{CancelReason, ScopeNode};
+use porto_core::sync::SetOnce;
 use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -29,25 +32,34 @@ use pyo3::types::{PyBool, PyList, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
 use super::run::{closing_on_error, coroutine_from};
-use crate::driver::lane;
-use crate::driver::pytask::{self, PyScopeRef, Spawned, TaskOutcome};
-use crate::driver::ready::Ready;
+use super::scope_exit;
+use super::scope_exit::ScopeExit;
+use crate::async_slots;
+use crate::driver::pytask::{self, PyScopeNode, Spawned, TaskOutcome};
+use crate::driver::ready::{Ready, ready_none};
 use crate::driver::step::{self, checkpoint_if_needed};
-use crate::driver::trap::{Trap, TrapKind};
+use crate::driver::trap::TrapKind;
+use crate::driver::{freelist, lane};
 use crate::errors::{Cancelled, InvalidStateError, NoRuntimeError};
 
 /// Adds the classes and functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Scope>()?;
     module.add_class::<Task>()?;
+    module.add_class::<ScopeExit>()?;
+    // Right after `add_class`, before anything can see the type (see `async_slots`).
+    async_slots::install_iter_slots::<ScopeExit>(module.py(), scope_exit::scope_exit_iternext)?;
+    freelist::install::<ScopeExit>(module.py(), exit_freelist::alloc, exit_freelist::free)?;
     module.add_function(wrap_pyfunction!(scope, module)?)
 }
+
+freelist::gil_freelist!(exit_freelist, 64);
 
 /// `porto.scope()`: a new scope, to enter with `async with`.
 #[pyfunction]
 fn scope() -> Scope {
     Scope {
-        node: OnceLock::new(),
+        node: SetOnce::new(),
         flags: AtomicU8::new(0),
         cancel_reason: OnceLock::new(),
     }
@@ -57,7 +69,7 @@ fn scope() -> Scope {
 #[pyclass(frozen, module = "porto._core", name = "Scope")]
 pub struct Scope {
     /// The scope's node in the tree, set when the block is entered.
-    node: OnceLock<PyScopeRef>,
+    node: SetOnce<PyScopeNode>,
     /// [`ScopeFlags`]. A cancel before the block is entered reaches the node through them:
     /// `cancel` sets `CANCEL_REQUESTED` and `__aenter__` sets `ENTERED` (after `node`), both
     /// with one read-modify-write, so the later one sees the other and cancels the node.
@@ -93,8 +105,6 @@ enum Phase {
 
 /// `BaseExceptionGroup`, built in since 3.11.
 static BASE_EXCEPTION_GROUP: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-/// `porto._bridge.finish_scope`: the waiting part of `__aexit__`.
-static FINISH_SCOPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 #[pymethods]
 impl Scope {
@@ -163,7 +173,7 @@ impl Scope {
             }
             let errors = this.close();
             drop(errors);
-            return Ok(Bound::new(py, Ready::new(py.None()))?.into_any());
+            return Ok(ready_none(py)?.into_bound(py));
         }
         // The exit runs outside the scope: waiting for the children (C5) is not cancelled by
         // it, and its checkpoint belongs to the enclosing scope.
@@ -185,9 +195,12 @@ impl Scope {
             // T2: no child to wait for, so the exit completes synchronously.
             return Ok(checkpoint_if_needed(py, py.None())?.into_bound(py));
         }
-        FINISH_SCOPE
-            .import(py, "porto._bridge", "finish_scope")?
-            .call1((slf, exc))
+        // The waiting part: a native awaitable, not a coroutine (porto-itr.7).
+        Ok(Bound::new(
+            py,
+            ScopeExit::new(slf.clone().unbind(), exc.clone().unbind()),
+        )?
+        .into_any())
     }
 
     /// Cancels the scope: every task in it, and in the scopes nested in it, gets
@@ -226,30 +239,12 @@ impl Scope {
         self.has(ScopeFlags::CANCELLED_CAUGHT)
     }
 
-    /// While children run: a `ScopeExit` trap to await, which resumes the awaiting task once
-    /// the last child ended. `None` once none runs.
-    fn _wait_trap(&self) -> Option<Trap> {
-        if self.live_children() == 0 {
-            return None;
-        }
-        let scope = self.node.get()?.clone();
-        Some(Trap::new(TrapKind::ScopeExit { scope }))
-    }
-
     /// How many tasks are filed with the scope as waiting in a cancellable wait (C10): 0 before
     /// it is entered. For tests: every way a wait ends takes its task out (porto-szb.114).
     fn _waiter_count(&self) -> usize {
         self.node
             .get()
             .map_or(0, |node| node.lock_state().waiter_count())
-    }
-
-    /// Closes the scope; raises the children's failures, after `exc` (the body's exception, or
-    /// `None`), as an exception group. Returns whether `exc` is a `Cancelled` the scope
-    /// absorbs (the `__aexit__` result).
-    #[pyo3(signature = (exc, /))]
-    fn _finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
-        self.finish(exc)
     }
 
     fn __repr__(&self) -> String {
@@ -298,8 +293,8 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         };
-        let node = match (self.phase(), self.node.get()) {
-            (Phase::Open, Some(node)) => node.clone(),
+        let node = match (self.phase(), self.node.get_arc()) {
+            (Phase::Open, Some(node)) => node,
             (Phase::Closed, _) => {
                 return Err(PyRuntimeError::new_err(
                     "porto: scope is closed: its `async with` block has exited, so it cannot \
@@ -342,6 +337,16 @@ impl Scope {
         self.flags.load(Ordering::Acquire) & flag != 0
     }
 
+    /// While children run: what the owner waits on at the exit, a `ScopeExit` request that
+    /// resumes it once the last child ended. `None` once none runs.
+    pub(super) fn exit_wait(&self) -> Option<TrapKind> {
+        if self.live_children() == 0 {
+            return None;
+        }
+        let scope = self.node.get_arc()?;
+        Some(TrapKind::ScopeExit { scope })
+    }
+
     /// Children spawned and not ended.
     fn live_children(&self) -> u32 {
         self.node
@@ -362,7 +367,7 @@ impl Scope {
     /// Closes the scope and raises the children's failures, after `exc` unless the scope
     /// absorbs it. Returns whether it absorbs `exc`: a `Cancelled` while this scope itself is
     /// cancelled (C3; one from an enclosing scope's cancellation goes on).
-    fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
+    pub(super) fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         let py = exc.py();
         let absorbed = !exc.is_none()
             && exc.is_instance_of::<Cancelled>()
@@ -398,13 +403,14 @@ impl Scope {
 /// the scope's `async with` block exited.
 #[pyclass(frozen, module = "porto._core", name = "Task")]
 pub struct Task {
-    /// `None` until the task finishes. Only held to store, read or take the outcome.
+    /// `None` until the task finishes. Only held to store, read or take the outcome. A
+    /// parking_lot lock: std's allocates a pthread mutex per task on macOS (porto-itr.7).
     outcome: Mutex<Option<TaskOutcome>>,
 }
 
 impl Task {
     fn lock(&self) -> MutexGuard<'_, Option<TaskOutcome>> {
-        self.outcome.lock().unwrap_or_else(PoisonError::into_inner)
+        self.outcome.lock()
     }
 
     /// Stores the outcome of the finished task (its scope hears of it from porto-core).
@@ -458,7 +464,7 @@ impl Task {
     // let the cycle collector see through it.
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         // Never block in the collector; a held lock means the outcome is being stored or read.
-        let Ok(outcome) = self.outcome.try_lock() else {
+        let Some(outcome) = self.outcome.try_lock() else {
             return Ok(());
         };
         match &*outcome {
