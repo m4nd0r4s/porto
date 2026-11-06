@@ -211,7 +211,8 @@ On first run, the runtime calls `sys.set_asyncgen_hooks(firstiter, finalizer)` p
 In `debug=True` mode:
 - `sys.set_coroutine_origin_tracking_depth(8)` is enabled.
 - The spawn site is captured (`traceback.extract_stack(limit=10)` → stored as a compact string).
-- Never-awaited Porto awaitables (a trap created but never awaited) emit `RuntimeWarning` on dealloc.
+
+Always, not only in debug mode: a Porto awaitable that a user call returned (`sleep`, `checkpoint`, `Event.wait`, `Notify.notified`, `Lock.acquire`, the channel operations) and that is freed without ever being resumed, thrown into or closed emits `RuntimeWarning` on dealloc, naming the call and saying to add `await` (the counterpart of CPython's "coroutine ... was never awaited"). The awaitable already records whether it was resumed, so the awaited path pays nothing; a warning turned into an error goes to `sys.unraisablehook`, and an exception already set is kept. Traps the runtime makes for itself never warn.
 
 ## 11. Performance targets for this layer (M1 gate)
 

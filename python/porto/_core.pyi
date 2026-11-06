@@ -33,14 +33,18 @@ def run(
     """Runs ``main(*args)`` (or the awaitable ``main``) as the main task of a new runtime whose
     lane 0 is the calling thread, and returns its result or raises its exception.
 
-    The runtime's settings are ``config_overrides`` (``lanes=4``) over ``config`` over the
-    ``PORTO_*`` environment variables over the defaults; see ``porto.RuntimeConfig``. They are
-    checked before ``main`` is called. Unknown ``PORTO_*`` variables warn.
+    The runtime's settings are ``config_overrides`` (``coop_budget=64``) over ``config`` over
+    the ``PORTO_*`` environment variables over the defaults; see ``porto.RuntimeConfig``. They
+    are checked before ``main`` is called. Unknown ``PORTO_*`` variables warn. Multi-lane
+    scheduling is not implemented yet: ``lanes`` above 1 (from the keyword, the config or
+    ``PORTO_LANES``) raises ``NotImplementedError``, and ``lanes="auto"`` runs on one lane.
 
     Ctrl-C raises ``KeyboardInterrupt`` out of it within about 50 ms, also while every task
     sleeps. A ``KeyboardInterrupt`` or ``SystemExit`` raised by a task nobody waits for also
     stops the run and is raised here. Tasks still running when it returns are closed. Raises
-    ``RuntimeError`` when called from inside a running porto runtime.
+    ``RuntimeError`` when called from inside a running porto runtime. A coroutine object
+    ``main`` that is refused (inside a runtime, or with an invalid config) is closed, so no
+    "never awaited" warning follows the error.
     """
 
 # Time
@@ -58,13 +62,15 @@ monotonic = current_time
 def sleep(seconds: float, /) -> Awaitable[None]:
     """Resumes the task ``seconds`` from now, never earlier. ``sleep(0)`` yields once.
 
-    Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``.
+    Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``. A trap
+    freed without being awaited emits ``RuntimeWarning`` ("never awaited").
     """
 
 def checkpoint() -> Awaitable[None]:
     """Yields to the other ready tasks once.
 
-    Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``.
+    Returns a trap, not a coroutine: ``await`` it right away, inside ``porto.run``. A trap
+    freed without being awaited emits ``RuntimeWarning`` ("never awaited").
     """
 
 # Structured concurrency
@@ -93,7 +99,8 @@ class Scope:
     ) -> Task[_T]:
         """Starts a child task, in a copy of the current context: a coroutine object, or an
         async function called with ``args``. Raises ``RuntimeError`` outside the block
-        (``porto.NoRuntimeError`` outside ``porto.run``)."""
+        (``porto.NoRuntimeError`` outside ``porto.run``); a refused coroutine object is
+        closed."""
 
     def cancel(self, reason: str | None = None) -> None:
         """Cancels the scope: every task in it, and in the scopes nested in it, gets
@@ -151,7 +158,8 @@ class Event:
     def wait(self) -> _SyncWait[None]:
         """Completes once the event is set; without suspending if it already is.
 
-        Nothing happens until it is awaited; ``await`` it inside ``porto.run``.
+        Nothing happens until it is awaited; ``await`` it inside ``porto.run``. One freed
+        without being awaited emits ``RuntimeWarning``.
         """
 
     def blocking_wait(self) -> None:
@@ -179,7 +187,8 @@ class Notify:
         """Completes when notified: at once if a permit is stored (consuming it), otherwise on
         a ``notify_one()`` or ``notify_all()`` made after the ``await`` started.
 
-        Nothing happens until it is awaited: one that is never awaited consumes no permit. A
+        Nothing happens until it is awaited: one that is never awaited consumes no permit (and
+        emits ``RuntimeWarning`` when freed). A
         task closed or cancelled before it observed the wake passes it on.
         """
 
@@ -206,7 +215,8 @@ class Lock:
     def acquire(self) -> _SyncWait[None]:
         """Completes once the task holds the lock; without suspending if it is free.
 
-        Nothing happens until it is awaited: one that is never awaited takes no lock. A task
+        Nothing happens until it is awaited: one that is never awaited takes no lock (and emits
+        ``RuntimeWarning`` when freed). A task
         cancelled or closed before it observed the lock passes it on.
         """
 
@@ -256,7 +266,8 @@ class Sender(Generic[_T_contra]):
     def send(self, value: _T_contra, /) -> Awaitable[None]:
         """Sends ``value``, waiting for room while the channel is full. Raises
         ``porto.BrokenResourceError`` if every receiver is gone, ``porto.ClosedResourceError``
-        if this sender was closed. Nothing happens until it is awaited."""
+        if this sender was closed. Nothing happens until it is awaited; one freed unawaited
+        emits ``RuntimeWarning``."""
 
     def try_send(self, value: _T_contra, /) -> None:
         """Sends ``value`` if there is room now; raises ``porto.WouldBlock`` if the channel is
@@ -302,7 +313,8 @@ class Receiver(Generic[_T_co]):
     def recv(self) -> Awaitable[_T_co]:
         """The next value, waiting while the channel is empty. Raises ``porto.EndOfChannel``
         once every sender is closed and the buffer is drained, ``porto.ClosedResourceError``
-        if this receiver was closed. Nothing happens until it is awaited."""
+        if this receiver was closed. Nothing happens until it is awaited; one freed unawaited
+        emits ``RuntimeWarning``."""
 
     def recv_many(self, max: int, /) -> Awaitable[list[_T_co]]:
         """Waits for at least one value, then returns up to ``max`` buffered values (``max``

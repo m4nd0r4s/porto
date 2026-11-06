@@ -75,6 +75,16 @@ def invalid_settings_fail_early() -> None:
         raise AssertionError("lanes=0 was accepted")
     assert calls == [], "main must not run with an invalid config"
 
+    # Multi-lane scheduling is not implemented yet: more than one lane is refused, not
+    # silently run on one. lanes="auto" lets porto choose, and runs on one lane for now.
+    try:
+        porto.run(main, lanes=4)
+    except NotImplementedError as error:
+        assert "pass lanes=1" in str(error), error
+    else:
+        raise AssertionError("lanes=4 was accepted")
+    assert calls == [], "main must not run with an unsupported config"
+
     with environment("PORTO_COOP_BUDGET", "lots"):
         try:
             porto.RuntimeConfig()
@@ -96,7 +106,8 @@ def runtime_only_apis() -> None:
         raise AssertionError("current_time() worked outside porto.run")
 
     async def nested() -> None:
-        porto.run(greet, "inner", 1)
+        # The refused coroutine is closed: no "coroutine ... was never awaited" follows.
+        porto.run(greet("inner", 1))
 
     # porto.run does not nest: inside a runtime, await the coroutine instead.
     try:
