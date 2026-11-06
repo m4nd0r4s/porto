@@ -204,6 +204,15 @@ impl Scope {
                  use `async with porto.scope() as s:` and do not call __aexit__ yourself",
             ));
         }
+        // The block raised: like a failing child, its exception cancels the scope (C4), so
+        // the children end and the exit raises it instead of waiting for them. A `Cancelled`
+        // that a cancellation already reaching this scope raised needs no new one.
+        if !exc.is_none()
+            && let Some(node) = this.node.get()
+            && !(exc.is_instance_of::<Cancelled>() && node.effective_cancellation().is_some())
+        {
+            node.cancel(CancelReason::ChildFailed);
+        }
         if this.live_children() == 0 {
             let absorbed = this.finish(exc)?;
             if !exc.is_none() {

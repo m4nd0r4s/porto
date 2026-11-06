@@ -222,6 +222,42 @@ def test_C4_a_failing_child_stops_a_sleeping_sibling_promptly() -> None:
     assert [repr(error) for error in raised.value.exceptions] == ["ValueError('boom')"]
 
 
+def test_C4_an_exception_in_the_body_cancels_a_sleeping_child_promptly() -> None:
+    # porto-szb.121: the exit used to wait for the child forever.
+    ended: list[str] = []
+
+    async def child() -> None:
+        try:
+            await porto.sleep(3600)
+        except porto.Cancelled:
+            ended.append("cancelled")
+            raise
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.spawn(child)
+            await porto.sleep(0.01)
+            raise ValueError("boom")
+
+    started = time.monotonic()
+    # The child ended cancelled, not failed: the body's exception goes on as is.
+    with pytest.raises(ValueError, match="boom"):
+        porto.run(main)
+    assert time.monotonic() - started < 5
+    assert ended == ["cancelled"]
+
+
+def test_C4_a_body_exception_with_children_already_done_is_raised_as_is() -> None:
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.spawn(porto.checkpoint)
+            await porto.sleep(0.01)
+            raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        porto.run(main)
+
+
 def test_C4_a_failing_child_cancels_the_body_and_its_cancelled_is_absorbed() -> None:
     events: list[str] = []
 

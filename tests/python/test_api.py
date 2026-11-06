@@ -255,9 +255,17 @@ def test_the_group_holds_every_failure_in_the_order_the_children_finished() -> N
 def test_the_body_exception_comes_first_in_the_group() -> None:
     body, child = RuntimeError("body"), ValueError("child")
 
+    async def fails_when_cancelled() -> None:
+        try:
+            await porto.sleep(3600)
+        finally:
+            raise child
+
     async def main() -> None:
         async with porto.scope() as s:
-            s.spawn(fail_with, child, 0.01)
+            s.spawn(fails_when_cancelled)
+            await porto.checkpoint()
+            # Cancels the scope (C4): the child fails on its way out.
             raise body
 
     with pytest.raises(ExceptionGroup) as raised:
