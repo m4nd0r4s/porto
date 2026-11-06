@@ -2,8 +2,8 @@
 //! (16-sync-primitives-and-channels.md §1).
 //!
 //! The mutex is a `porto.Lock` (the same `LockSource`) plus the value. `async with mutex as
-//! guard:` takes the lock like `async with lock:` (a free lock in `__aenter__` itself, else the
-//! lazy `_SyncWait`) and evaluates to a fresh guard, made in the step that takes the lock.
+//! guard:` takes the lock like `async with lock:` (the lazy `_SyncWait`, which takes a free lock
+//! on its first resume) and evaluates to a fresh guard, made in the step that takes the lock.
 //!
 //! A guard works while its block is open: it records the mutex's `generation` when it is made,
 //! and every exit bumps the generation before releasing the lock, so a guard is current exactly
@@ -24,10 +24,8 @@ use pyo3::sync::critical_section::with_critical_section;
 use pyo3::types::PyType;
 
 use super::lock::{LockSource, release_then_checkpoint};
-use super::wait_op::{Grant, SyncWait};
+use super::wait_op::{Grant, SyncWait, Then};
 use crate::api::time::require_lane;
-use crate::driver::ready::ready;
-use crate::driver::step;
 use crate::driver::thin::Waitable;
 
 /// The value a mutex owns, reached only in the mutex's critical section (see the module docs).
@@ -68,7 +66,7 @@ impl Mutex {
     }
 
     /// The guard for the block that now holds the lock.
-    fn guard(slf: &Bound<'_, Self>) -> PyResult<Py<MutexGuard>> {
+    pub(super) fn guard(slf: &Bound<'_, Self>) -> PyResult<Py<MutexGuard>> {
         Py::new(
             slf.py(),
             MutexGuard {
@@ -96,30 +94,16 @@ impl Mutex {
         self.lock.is_locked()
     }
 
-    /// `async with mutex as guard:`. A free lock is taken in this call, like
-    /// `Lock.__aenter__`, and the await evaluates to the guard; otherwise a lazy wait makes
-    /// the guard in the step that takes the lock.
-    fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
-        let py = slf.py();
+    /// `async with mutex as guard:`: a lazy wait for the lock, like `Lock.__aenter__`, that
+    /// evaluates to a fresh guard made in the step that takes the lock (a free one on its
+    /// first resume, without suspending). If making the guard fails, the lock is released.
+    fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<SyncWait> {
         require_lane("Mutex.__aenter__")?;
-        let this = slf.get();
-        if step::take_now(py, || this.lock.try_lock())? {
-            return match Self::guard(slf) {
-                Ok(guard) => ready(py, guard.into_any()),
-                Err(error) => {
-                    this.lock.unlock();
-                    Err(error)
-                }
-            };
-        }
-        let enter = slf.getattr(pyo3::intern!(py, "_enter"))?.unbind();
-        let wait = SyncWait::calling(Grant::Locked(Arc::clone(&this.lock)), enter);
-        Ok(Py::new(py, wait)?.into_any())
-    }
-
-    /// Internal: the guard, made by the lazy wait in the step that takes the lock.
-    fn _enter(slf: &Bound<'_, Self>) -> PyResult<Py<MutexGuard>> {
-        Self::guard(slf)
+        Ok(SyncWait::with(
+            Grant::Locked(Arc::clone(&slf.get().lock)),
+            Then::Guard(slf.clone().unbind()),
+            "Mutex.__aenter__()",
+        ))
     }
 
     #[pyo3(signature = (_exc_type, exc, _traceback, /))]

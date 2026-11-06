@@ -216,14 +216,12 @@ class Lock:
 
         Nothing happens until it is awaited: one that is never awaited takes no lock (and emits
         ``RuntimeWarning`` when freed). A task cancelled or closed before it observed the lock
-        passes it on. (``async with lock:`` takes a free lock in ``__aenter__()`` itself, which
-        the statement awaits at once.)
+        passes it on. ``async with lock:`` waits the same way.
         """
 
     def _acquire_then(self, on_acquired: Callable[[], _T], /) -> _SyncWait[_T]:
-        """Internal (the lazy wait of ``porto.Mutex``, for tests): ``acquire()``, then
-        ``on_acquired()`` in the same step;
-        the await evaluates to its result. If it raises, the lock is released first."""
+        """Internal, for tests: ``acquire()``, then ``on_acquired()`` in the same step; the
+        await evaluates to its result. If it raises, the lock is released first."""
 
     def try_acquire(self) -> bool:
         """Takes the lock if it is free right now; returns whether it did."""
@@ -242,7 +240,7 @@ class Lock:
 
         The wait does not check for signals: Ctrl-C does not interrupt it."""
 
-    def __aenter__(self) -> Awaitable[None]: ...
+    def __aenter__(self) -> _SyncWait[None]: ...
     def __aexit__(
         self,
         exc_type: type[BaseException] | None,
@@ -269,16 +267,16 @@ class Mutex(Generic[_T]):
 
     ``async with mutex as guard:`` waits for the lock (fair FIFO, like ``porto.Lock``), then
     ``guard.value`` reads the value and ``guard.set(new)`` replaces it. Not reentrant: entering
-    it again inside its own block waits forever. A free mutex is taken in ``__aenter__()``
-    itself, which ``async with`` awaits at once; a task cancelled or closed while it waits for
-    the mutex never holds it. Thread-safe.
+    it again inside its own block waits forever. Like ``Lock``, nothing is taken until the
+    entry is awaited, and a task cancelled or closed while it waits for the mutex never holds
+    it. Thread-safe.
     """
 
     def __init__(self, value: _T, /) -> None: ...
     def locked(self) -> bool:
         """Whether the lock is held (or being handed to a waiter)."""
 
-    def __aenter__(self) -> Awaitable[MutexGuard[_T]]: ...
+    def __aenter__(self) -> _SyncWait[MutexGuard[_T]]: ...
     def __aexit__(
         self,
         exc_type: type[BaseException] | None,

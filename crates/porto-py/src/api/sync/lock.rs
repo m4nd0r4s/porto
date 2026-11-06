@@ -9,10 +9,10 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use super::blocking;
-use super::wait_op::{Grant, SyncWait};
+use super::wait_op::{Grant, SyncWait, Then};
 use crate::api::time::require_lane;
 use crate::driver::ready::ready_none;
-use crate::driver::step::{self, checkpoint_if_needed};
+use crate::driver::step::checkpoint_if_needed;
 use crate::driver::thin::{WaitSource, Waitable};
 
 /// The lock: a `Mutex<()>` held without guards, since a Python holder is not a Rust scope.
@@ -82,13 +82,14 @@ impl Lock {
     }
 
     /// `acquire()`, then `on_acquired()` in the same step; the await evaluates to its result
-    /// (if it raises, the lock is released and the await raises). Internal: the lazy wait
-    /// `porto.Mutex` enters through when its lock is held, exposed for the tests.
+    /// (if it raises, the lock is released and the await raises). Internal, for the tests: the
+    /// way `porto.Mutex` makes its guard, with a Python callback.
     fn _acquire_then(&self, on_acquired: Py<PyAny>) -> PyResult<SyncWait> {
         require_lane("Lock._acquire_then")?;
-        Ok(SyncWait::calling(
+        Ok(SyncWait::with(
             Grant::Locked(Arc::clone(&self.lock)),
-            on_acquired,
+            Then::Call(on_acquired),
+            "Lock._acquire_then()",
         ))
     }
 
@@ -117,17 +118,18 @@ impl Lock {
         })
     }
 
-    /// `async with lock:`. A free lock is taken in this call (T2, `step::take_now`), and the
-    /// shared `_Ready(None)` comes back: no allocation and no suspension. `async with` awaits it
-    /// in the same step, so the coroutine holds the lock before anything else runs and a task
-    /// cancelled or closed at a suspension point never holds it unobserved (spec 16 §1). A
-    /// held lock, a spent budget or a call outside a running task get `acquire()`'s lazy wait.
-    fn __aenter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// `async with lock:`: `acquire()`'s lazy wait, named for the warning if it is dropped
+    /// unawaited. `async with` awaits it in the same step, and its first resume takes a free
+    /// lock without suspending (T2: `Cancelled` first if the task is cancelled, one unit of
+    /// the budget). Nothing is taken in this call: an exception between it and the await
+    /// leaves the lock free.
+    fn __aenter__(&self) -> PyResult<SyncWait> {
         require_lane("Lock.__aenter__")?;
-        if step::take_now(py, || self.lock.try_lock())? {
-            return ready_none(py);
-        }
-        Ok(Py::new(py, SyncWait::new(Grant::Locked(Arc::clone(&self.lock))))?.into_any())
+        Ok(SyncWait::with(
+            Grant::Locked(Arc::clone(&self.lock)),
+            Then::Nothing,
+            "Lock.__aenter__()",
+        ))
     }
 
     #[pyo3(signature = (_exc_type, exc, _traceback, /))]

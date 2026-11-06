@@ -4,8 +4,11 @@ Fair FIFO handoff, non-reentrant, cancel-safe. ``_interrupt(token, exc)`` throws
 waiting task the way cancellation will (porto-szb.36): the wait is given up first (T3).
 """
 
+import gc
 import re
+import sys
 import threading
+import warnings
 from collections.abc import Awaitable, Callable
 
 import pytest
@@ -382,14 +385,15 @@ def test_acquire_does_nothing_until_awaited() -> None:
 
 
 @pytest.mark.parametrize("kind", ["lock", "mutex"])
-def test_async_with_takes_a_free_lock_in_aenter_without_suspending(kind: str) -> None:
-    # The fast path (porto-szb.115): `async with` awaits `__aenter__()` in the same step, so a
-    # free lock is taken in the call and the awaitable is already complete.
+def test_entering_a_free_lock_takes_it_when_awaited_without_suspending(kind: str) -> None:
+    # `async with` awaits `__aenter__()` in the same step: the free lock is taken on the first
+    # resume, which completes at once (porto-szb.115).
     async def main() -> None:
         primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
         entering = primitive.__aenter__()
-        assert primitive.locked()
+        assert not primitive.locked()
         assert completes_at_once(entering)
+        assert primitive.locked()
         await primitive.__aexit__(None, None, None)
         assert not primitive.locked()
 
@@ -397,16 +401,56 @@ def test_async_with_takes_a_free_lock_in_aenter_without_suspending(kind: str) ->
 
 
 @pytest.mark.parametrize("kind", ["lock", "mutex"])
-def test_entering_a_held_lock_takes_nothing_until_awaited(kind: str) -> None:
-    # A held lock gets the lazy wait: dropping it unawaited takes nothing.
+@pytest.mark.parametrize("held", [False, True], ids=["free", "held"])
+def test_entering_takes_nothing_until_awaited(kind: str, held: bool) -> None:
+    # A dropped `__aenter__()` takes nothing, and warns like any forgotten await.
     async def main() -> None:
         primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
-        async with primitive:
+        if held:
+            async with primitive:
+                entering = primitive.__aenter__()
+        else:
             entering = primitive.__aenter__()
         assert not primitive.locked()
-        call = "Lock.acquire()" if kind == "lock" else "Mutex.__aenter__()"
+        call = "Lock.__aenter__()" if kind == "lock" else "Mutex.__aenter__()"
         with pytest.warns(RuntimeWarning, match=rf"{re.escape(call)} was never awaited"):
             del entering
+        assert not primitive.locked()
+
+    porto.run(main)
+
+
+class RaisedAfterAenter(Exception):
+    """Raised by a profile hook as ``__aenter__()`` returns, before the block is entered."""
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="before 3.14 `async with` calls __aenter__ inside one opcode: no hook runs between",
+)
+@pytest.mark.parametrize("kind", ["lock", "mutex"])
+def test_an_exception_between_aenter_and_the_block_leaves_the_lock_free(kind: str) -> None:
+    # From 3.14, `async with` calls `__aenter__` and awaits its result in separate opcodes, and
+    # `__aexit__` is only guaranteed from the block on: an exception in between (a profile or
+    # trace hook, a KeyboardInterrupt) must not leave the lock held forever.
+    def raise_once(_frame: object, event: str, arg: object) -> None:
+        if event == "c_return" and getattr(arg, "__name__", "") == "__aenter__":
+            sys.setprofile(None)
+            raise RaisedAfterAenter
+
+    async def main() -> None:
+        primitive = porto.Lock() if kind == "lock" else porto.Mutex(0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                sys.setprofile(raise_once)
+                async with primitive:
+                    pytest.fail("the block must not run")
+            except RaisedAfterAenter:
+                pass
+            finally:
+                sys.setprofile(None)
+            gc.collect()
         assert not primitive.locked()
 
     porto.run(main)

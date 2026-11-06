@@ -6,9 +6,9 @@
 //! a `Notified` trap on the primitive, so the task's embedded wait node joins its queue, with
 //! no allocation per wait, and a task that gives the wait up (T3) unlinks the node or passes an
 //! unobserved exclusive grant on. A wait that is over at once is a synchronous completion (T2),
-//! and a grant is only taken in the step that hands it to the coroutine. `async with` on a free
-//! `Lock` or `Mutex` takes it in `__aenter__` itself and returns a ready awaitable, which the
-//! statement awaits in that same step: no allocation and no `_SyncWait` (porto-szb.115).
+//! and a grant is only taken in the step that hands it to the coroutine. `async with` on a
+//! `Lock` or `Mutex` is the same lazy wait: `__aenter__` takes nothing, and the statement's
+//! await takes a free lock on the first resume, without suspending.
 //!
 //! The objects are thread-safe: the methods that do not wait can be called from any thread,
 //! and `blocking_*` waits from threads that do not run porto. A `blocking_*` wait runs with
