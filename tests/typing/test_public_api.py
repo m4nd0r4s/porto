@@ -116,6 +116,31 @@ async def sync_primitives() -> int:
         return guard.value
 
 
+async def more_sync_primitives() -> bool:
+    semaphore = porto.Semaphore(4)
+    async with semaphore:
+        assert_type(semaphore.available, int)
+    await semaphore.acquire(2)
+    semaphore.release(2)
+    assert_type(semaphore.try_acquire(), bool)
+    limiter = porto.CapacityLimiter(2)
+    async with limiter:
+        assert_type(limiter.borrowed_tokens, int)
+    assert_type(limiter.total_tokens, float)
+    limiter.total_tokens = 3
+    await limiter.acquire_on_behalf_of(object())
+    rwlock = porto.RwLock()
+    async with rwlock.read():
+        assert_type(rwlock.readers, int)
+    async with rwlock.write():
+        assert_type(rwlock.write_locked(), bool)
+    condition = porto.Condition(porto.Lock())
+    async with condition:
+        condition.notify_all()
+        assert_type(await condition.wait_for(lambda: 3), int)
+    return await porto.Barrier(1).wait()
+
+
 async def check_a_mutex_guard_checks_the_value_type() -> None:
     async with porto.Mutex[int](0) as guard:
         guard.set("one")  # pyright: ignore[reportArgumentType]

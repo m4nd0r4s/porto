@@ -80,6 +80,9 @@ pub(crate) enum TrapKind {
     },
     /// Wait until a sync primitive grants the task's embedded wait node (spec 16).
     Notified(WaitTarget),
+    /// [`TrapKind::Notified`] that a cancellation does not give up (`Condition.wait()` taking
+    /// its lock again after a cancel).
+    NotifiedShielded(WaitTarget),
     /// Run an I/O operation, re-attempted on readiness (spec 13 §5).
     #[allow(dead_code, reason = "made by the socket APIs (porto-szb.62)")]
     Io(IoWait),
@@ -111,6 +114,7 @@ impl From<TrapKind> for Pending {
             TrapKind::YieldThen(value) => Self::YieldThen(value),
             TrapKind::Sleep { deadline } => Self::Sleep(deadline),
             TrapKind::Notified(wait) => Self::Notified(wait),
+            TrapKind::NotifiedShielded(wait) => Self::NotifiedShielded(wait),
             TrapKind::Io(io) => Self::Io(io),
             TrapKind::Join { target } => Self::Join(target),
             TrapKind::ScopeExit { scope } => Self::ScopeExit(scope),

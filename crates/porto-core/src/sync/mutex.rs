@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
-use super::primitives::{AtomicU8, UnsafeCell};
+use super::primitives::{AtomicU64, UnsafeCell};
 use super::{BlockingOnLane, Locked, Wait, WaitNode, WaitQueue, WaitState, blocking_wait};
 
 /// An async mutual-exclusion lock around a `T`.
@@ -47,7 +47,7 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 /// The first-poll check of a lock wait, as a nameable type.
 type Acquire = fn(&mut Locked<'_, LockState>) -> bool;
 
-/// The queue state: none beyond the list. The lock itself is the queue's lock-free byte
+/// The queue state: none beyond the list. The lock itself is the queue's lock-free word
 /// ([`WaitQueue::word`]): [`LOCKED`] while held (or being handed to a waiter), [`QUEUED`] while
 /// waiters may be queued.
 ///
@@ -61,9 +61,9 @@ type Acquire = fn(&mut Locked<'_, LockState>) -> bool;
 struct LockState;
 
 /// The lock is held, or being handed to a waiter.
-const LOCKED: u8 = 1;
+const LOCKED: u64 = 1;
 /// Waiters may be queued: a release must take the queue lock to hand the lock over.
-const QUEUED: u8 = 2;
+const QUEUED: u64 = 2;
 
 impl WaitState for LockState {
     /// A handoff whose waiter gave up: the lock goes to the next waiter, or is unlocked.
@@ -74,7 +74,7 @@ impl WaitState for LockState {
 
 /// Takes the lock if it is free (and the waiter queues otherwise), without the queue lock.
 /// Fair: by the invariant, a free lock has nobody queued ahead.
-fn try_lock_fast(word: &AtomicU8) -> bool {
+fn try_lock_fast(word: &AtomicU64) -> bool {
     word.compare_exchange(0, LOCKED, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
 }
@@ -243,10 +243,15 @@ pub struct MutexGuard<'a, T: ?Sized> {
 // SAFETY: a shared guard gives `&T` only, like `&T`.
 unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
-impl<T: ?Sized> MutexGuard<'_, T> {
+impl<'a, T: ?Sized> MutexGuard<'a, T> {
     /// Keeps the lock held without a guard; [`Mutex::force_unlock`] releases it.
     pub fn leak(guard: Self) {
         std::mem::forget(guard);
+    }
+
+    /// The mutex the guard holds.
+    pub(super) fn mutex(guard: &Self) -> &'a Mutex<T> {
+        guard.mutex
     }
 }
 

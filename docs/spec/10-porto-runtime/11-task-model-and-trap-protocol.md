@@ -168,6 +168,7 @@ pub enum TrapKind {
     Yield,                                    // schedule point (checkpoint)
     Sleep { deadline: Deadline },             // runtime-clock ns (§14); wheel entry embedded in PyTask (no alloc)
     Notified(WaitNodeRef),                    // intrusive waiter node for sync primitives (§16)
+    NotifiedShielded(WaitNodeRef),            // the same, not given up by a cancellation (below)
     Io { reg: RegistrationRef, interest: Interest, op: IoOp },  // §13 retry-on-ready
     Join { target: TaskRef },                 // await another task
     ScopeExit { scope: ScopeRef },            // wait for children of a scope (§15)
@@ -176,11 +177,13 @@ pub enum TrapKind {
 }
 ```
 
+`NotifiedShielded` is a `Notified` that a cancellation does not abandon: the wait a cancelled awaitable makes to get back what it must hold when the `Cancelled` leaves it. `Condition.wait()` uses it to take its lock again (§16 §1); it is not cancellable in the sense below, like `ScopeExit`.
+
 The `Pending` variants mirror `TrapKind` plus `AsyncioFuture(PyObj)` and `YieldThen`. `YieldThen(value)` completes the set in the implementation: a `Yield` that resumes with `value`, which is how T2 stashes a synchronous result when the budget runs out (`_Trap.kind` shows `"yield"`). It holds the value itself, not a boxed `Pending`.
 
 `Io` is packed as one pointer to the operation, which owns its registration reference, interest and op state (13-io-driver.md §5). The operation is a future: polling it attempts the op, and dropping it unregisters its waker.
 
-A woken task whose wait is not over yet is where cancellation is delivered (§4 step 2 for a task that cannot step): the wait is abandoned under T3 and the exception thrown in. A wait that is already over wins: its result is delivered, and the cancellation waits for the next wait. A task cancelled when it yields a trap gets `Cancelled` thrown back at once instead of waiting. The cancellable kinds are all but `Yield`, `YieldThen` and `ScopeExit` (C5: an exit never abandons its children); a `YieldThen` holds a result its coroutine must get (a lock taken by a fast path), so it is never replaced by `Cancelled`. For the same reason a task out of budget yields *before* polling a wait: a grant that resolved it stays in the wait node, where abandoning the wait passes it on.
+A woken task whose wait is not over yet is where cancellation is delivered (§4 step 2 for a task that cannot step): the wait is abandoned under T3 and the exception thrown in. A wait that is already over wins: its result is delivered, and the cancellation waits for the next wait. A task cancelled when it yields a trap gets `Cancelled` thrown back at once instead of waiting. The cancellable kinds are all but `Yield`, `YieldThen`, `ScopeExit` (C5: an exit never abandons its children) and `NotifiedShielded`; a `YieldThen` holds a result its coroutine must get (a lock taken by a fast path), so it is never replaced by `Cancelled`. For the same reason a task out of budget yields *before* polling a wait: a grant that resolved it stays in the wait node, where abandoning the wait passes it on.
 
 A cancellable wait that does not resolve at once is registered with the task's innermost scope (`ScopeState::waiters`, the task's waker by task key) until it ends, which is how `Scope.cancel()` wakes it (15 C10). The registration re-walks the effective cancellation after filing the waker, so a cancel from another thread racing with it is never missed. The scope's hold on the waker is the same cycle as a `Notified` wait's, broken at shutdown the same way (the lane keeps the waker).
 

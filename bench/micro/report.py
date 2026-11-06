@@ -64,6 +64,7 @@ ROWS = [
     Row("channel_fan_out", "channel fan-out 1→8 (cloned receivers), capacity 64", "item"),
     Row("channel_cross_thread", "4 OS threads `blocking_send` → one task (unbounded)", "item"),
     Row("lock_uncontended", "Lock acquire+release, uncontended", "op"),
+    Row("semaphore_uncontended", "Semaphore(4) acquire+release, uncontended", "op"),
     Row("lock_contended", "Lock, 100 tasks, a yield inside the critical section", "acquisition"),
     Row("mutex_value", "`Mutex[int]` read+set (vs Lock + attribute)", "op"),
     Row("event_wakeup_10k", "Event.set() → 10k waiters resumed", "waiter"),

@@ -15,6 +15,10 @@
 //!   current waiters.
 //!
 //! - [`Mutex`]: an async lock that owns its value; fair FIFO handoff, non-reentrant.
+//! - [`Semaphore`]: permits acquired and released several at a time, granted in FIFO order.
+//! - [`RwLock`]: a writer-preferring read/write lock that owns its value.
+//! - [`Condvar`]: waits for a notification with a [`Mutex`] released.
+//! - [`Barrier`]: waits until a set number of tasks arrived; reusable.
 //!
 //! And [`JoinWaiters`]: the one-word intrusive list of a task's joiners, built on the same
 //! nodes and closed once when the task finishes.
@@ -33,13 +37,17 @@
 //! RUSTFLAGS="--cfg loom" cargo test -p porto-core --release sync
 //! ```
 
+mod barrier;
 mod blocking;
+mod condvar;
 mod event;
 mod join_waiters;
 pub mod mpsc;
 mod mutex;
 mod notify;
 pub(crate) mod primitives;
+mod rwlock;
+mod semaphore;
 mod set_once;
 mod wait_queue;
 
@@ -64,10 +72,29 @@ mod loom_event_notify_tests;
 #[cfg(all(test, loom))]
 mod loom_mutex_tests;
 
+#[cfg(all(test, not(loom)))]
+mod semaphore_tests;
+
+#[cfg(all(test, not(loom)))]
+mod rwlock_tests;
+
+#[cfg(all(test, not(loom)))]
+mod condvar_barrier_tests;
+
+#[cfg(all(test, loom))]
+mod loom_semaphore_rwlock_tests;
+
+#[cfg(all(test, loom))]
+mod loom_condvar_barrier_tests;
+
+pub use barrier::{Barrier, BarrierWait, BarrierWaitResult};
 pub use blocking::{BlockingOnLane, blocking_wait};
+pub use condvar::{Condvar, CondvarWait};
 pub use event::{Event, EventWait};
 pub use join_waiters::JoinWaiters;
 pub use mutex::{Mutex, MutexGuard, MutexLock};
 pub use notify::{Notified, Notify};
+pub use rwlock::{RwLock, RwLockRead, RwLockReadGuard, RwLockWrite, RwLockWriteGuard};
+pub use semaphore::{MAX_PERMITS, Semaphore, SemaphoreAcquire, SemaphorePermit};
 pub use set_once::SetOnce;
 pub use wait_queue::{Locked, Wait, WaitNode, WaitQueue, WaitState};

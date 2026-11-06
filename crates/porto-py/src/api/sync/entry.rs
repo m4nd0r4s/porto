@@ -1,5 +1,7 @@
 //! The lazy entry of `async with lock:` and `async with mutex as guard:` (porto-szb.115,
-//! porto-szb.118): one small frozen object per entry, its own awaitable.
+//! porto-szb.118), and of the other primitives' `async with` (a semaphore's permit, a
+//! limiter's token, a read or write lock: `sync_entry`): one small frozen object per entry,
+//! its own awaitable.
 //!
 //! It follows `_SyncWait`'s rules (`wait_op`) exactly: nothing is taken until it is awaited, the
 //! first resume spends one unit of the task's budget (T2, `Cancelled` first if the task is
@@ -10,7 +12,7 @@
 //!
 //! - its state is one atomic byte ([`Entry`]), so the class is frozen: no borrow flag, and no
 //!   `Grant` holding its own `Arc` of the lock (two atomic counts per entry). The lock is
-//!   reached through the `Lock` or `Mutex` object being entered, held by a [`Strong`];
+//!   reached through the object being entered (an [`Enterable`]), held by a [`Strong`];
 //! - for a `Mutex`, the entry is the guard: the await evaluates to the entry itself, so an
 //!   entry is one object, not a wait and then a guard;
 //! - its dealloc is a raw slot ([`install_dealloc`]), which skips pyo3's trampoline.
@@ -30,8 +32,41 @@ use super::lock::LockSource;
 use crate::api::time::require_lane;
 use crate::driver::fast_new::{FastNew, Unawaited};
 use crate::driver::step;
-use crate::driver::thin::Waitable;
+use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
+
+/// What an entry takes and how: a lock, a permit, a limiter token, a read or write lock.
+pub(super) trait Enterable {
+    /// Runs on the first resume, after the T2 check and before any attempt: an error that makes
+    /// the wait pointless (a borrower that already holds a token). Takes nothing.
+    fn check(&self, py: Python<'_>) -> PyResult<()> {
+        let _ = py;
+        Ok(())
+    }
+
+    /// Takes the grant if it is available now, without waiting.
+    fn try_take(&self) -> bool;
+
+    /// The handle a waiting task parks on; its grant is what [`Enterable::try_take`] takes.
+    fn target(&self) -> WaitTarget;
+
+    /// Runs in the step that resumes the task with the grant, taken at once or handed over: it
+    /// records the holder. If it fails, it gives the grant back and the await raises.
+    fn taken(&self, py: Python<'_>) -> PyResult<()> {
+        let _ = py;
+        Ok(())
+    }
+}
+
+impl Enterable for Arc<Waitable<LockSource>> {
+    fn try_take(&self) -> bool {
+        self.try_lock()
+    }
+
+    fn target(&self) -> WaitTarget {
+        Waitable::target(self)
+    }
+}
 
 /// A strong reference to an object, released with a plain `Py_DECREF`.
 ///
@@ -106,13 +141,21 @@ impl Entry {
         self.phase.store(DONE, Ordering::Relaxed);
     }
 
+    /// Ends an entered entry, for the `__aexit__` of an entry object that is its own context
+    /// manager (`RwLock.read()`); `false`, changing nothing, if it is not entered.
+    pub(super) fn exit(&self) -> bool {
+        self.phase
+            .compare_exchange(ENTERED, DONE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
     /// Resumes the entry of `lock` with `sent` (`None` from `__next__`), as `_SyncWait` does.
     /// `call` names the method that made it (`Lock.__aenter__`), for the error if it is
     /// awaited outside a porto runtime.
     pub(super) fn resume(
         &self,
         py: Python<'_>,
-        lock: &Arc<Waitable<LockSource>>,
+        lock: &impl Enterable,
         sent: &Bound<'_, PyAny>,
         call: &str,
     ) -> PyResult<Step> {
@@ -120,15 +163,15 @@ impl Entry {
         let (next, step) = match phase {
             BUSY => return Err(concurrent_resume_error()),
             FRESH if !sent.is_none() => (FRESH, Err(not_started_error())),
-            FRESH | TRYING => match proceed(py, call) {
+            FRESH | TRYING => match proceed(py, call).and_then(|go| Ok((go, lock.check(py)?))) {
                 Err(error) => (DONE, Err(error)),
                 // Take nothing before the schedule point: a task closed there holds nothing.
-                Ok(false) => (TRYING, suspend(py, TrapKind::Yield)),
-                Ok(true) if lock.try_lock() => (ENTERED, Ok(Step::Entered)),
-                Ok(true) => (WAITING, suspend(py, TrapKind::Notified(lock.target()))),
+                Ok((false, ())) => (TRYING, suspend(py, TrapKind::Yield)),
+                Ok((true, ())) if lock.try_take() => entered(py, lock),
+                Ok((true, ())) => (WAITING, suspend(py, TrapKind::Notified(lock.target()))),
             },
             // The driver resumes a `Notified` wait only once the lock was handed over.
-            WAITING => (ENTERED, Ok(Step::Entered)),
+            WAITING => entered(py, lock),
             finished => (finished, Err(reused_error())),
         };
         self.phase.store(next, Ordering::Release);
@@ -150,6 +193,14 @@ impl Entry {
     }
 }
 
+/// The grant is taken: record it ([`Enterable::taken`]) and finish the await.
+fn entered(py: Python<'_>, lock: &impl Enterable) -> (u8, PyResult<Step>) {
+    match lock.taken(py) {
+        Ok(()) => (ENTERED, Ok(Step::Entered)),
+        Err(error) => (DONE, Err(error)),
+    }
+}
+
 /// T2 for the first resume (`step::proceed`), which is also where an entry finds out whether it
 /// runs in a porto task: outside one, it must at least be on a porto lane (a manual driver),
 /// else it raises `NoRuntimeError` naming `call`, as a call outside `porto.run()` does.
@@ -167,22 +218,23 @@ fn suspend(py: Python<'_>, kind: TrapKind) -> PyResult<Step> {
 
 fn not_started_error() -> PyErr {
     PyTypeError::new_err(
-        "can't send a non-None value to a porto lock entry that has not started; the first \
-         resume of an awaitable must be send(None)",
+        "can't send a non-None value to a porto `async with` entry that has not started; the \
+         first resume of an awaitable must be send(None)",
     )
 }
 
 fn reused_error() -> PyErr {
     PyRuntimeError::new_err(
-        "porto: an `async with` entry of a porto Lock or Mutex was awaited again after it \
-         finished; call __aenter__() again for each entry (`async with` does it for you)",
+        "porto: an `async with` entry of a porto primitive (a Lock, Mutex, Semaphore, \
+         CapacityLimiter or RwLock) was awaited again after it finished; make a new entry for \
+         each `async with` (the statement does it for you)",
     )
 }
 
 /// Two callers resumed the same entry at once.
 fn concurrent_resume_error() -> PyErr {
     PyRuntimeError::new_err(
-        "porto: an `async with` entry of a porto Lock or Mutex was resumed from two places at \
+        "porto: an `async with` entry of a porto primitive was resumed from two places at \
          once; await each entry from one task only",
     )
 }

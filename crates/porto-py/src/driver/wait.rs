@@ -9,8 +9,8 @@
 //! T3, per kind, when a wait is given up before it resolved:
 //!
 //! - `Sleep`: the timer entry is unlinked (on the lane only, see [`PyTask::release_wait`]);
-//! - `Notified`: the node leaves the primitive's queue, and an exclusive grant it has not
-//!   observed yet is passed on;
+//! - `Notified` (and `NotifiedShielded`, given up only when the task is freed): the node
+//!   leaves the primitive's queue, and an exclusive grant it has not observed yet is passed on;
 //! - `Join`: the node leaves the target's join list;
 //! - `ScopeExit`: the scope forgets the task's exit waker;
 //! - `Future`, `Io`: the future is dropped, which unregisters its wakers (an operation
@@ -106,7 +106,7 @@ impl PyTask {
                 self.pending_kind = Kind::None;
                 return Poll::Ready(Resume::None);
             }
-            Kind::Notified => {
+            Kind::Notified | Kind::NotifiedShielded => {
                 // SAFETY: `wait` is the live field of a Notified payload.
                 let target = unsafe { &*self.pending_payload.wait };
                 // SAFETY: the node is embedded in this pinned body and waits on this target
@@ -178,7 +178,7 @@ impl PyTask {
     /// freed, and a stale firing finds the task cancelled.
     pub(super) fn release_wait(&mut self) {
         match self.pending_kind {
-            Kind::Notified => {
+            Kind::Notified | Kind::NotifiedShielded => {
                 // SAFETY: as in `poll_pending`.
                 unsafe { (*self.pending_payload.wait).cancel(self.wait_node()) };
             }

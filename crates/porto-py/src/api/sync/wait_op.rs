@@ -1,5 +1,6 @@
-//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()` and `Lock.acquire()`
-//! (16-sync-primitives-and-channels.md §1). `async with` on a `Lock` or `Mutex` follows the
+//! `_SyncWait`: the awaitable behind `Event.wait()`, `Notify.notified()`, `Lock.acquire()`,
+//! `Semaphore.acquire()`, `CapacityLimiter.acquire()`, `RwLock.acquire_read()`/`acquire_write()`
+//! and `Barrier.wait()` (16-sync-primitives-and-channels.md §1). `async with` on a `Lock` or `Mutex` follows the
 //! same rules with a lighter object of its own (`entry`).
 //!
 //! Nothing happens until it is awaited, so a `notified()` created and never awaited consumes
@@ -30,8 +31,12 @@ use pyo3::ffi;
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 
+use super::barrier::Arrival;
 use super::event::{EventSource, NotifySource};
+use super::limiter::{TokenGrant, traverse_grant};
 use super::lock::LockSource;
+use super::rwlock::{ReadSource, WriteSource, release_read, release_write};
+use super::semaphore::{SemaphoreSource, permits_target};
 use crate::async_slots::{IterNext, guard_next, guard_send, stop_iteration};
 use crate::driver::fast_new::{FastNew, Unawaited};
 use crate::driver::step;
@@ -47,25 +52,67 @@ pub(super) enum Grant {
     Notified(Arc<Waitable<NotifySource>>),
     /// `Lock.acquire()`: the lock, held until `release()`.
     Locked(Arc<Waitable<LockSource>>),
+    /// `Semaphore.acquire(permits)`: that many permits, held until `release(permits)`.
+    Permits(Arc<Waitable<SemaphoreSource>>, usize),
+    /// `CapacityLimiter.acquire()`: a token, recorded for its borrower.
+    Token(TokenGrant),
+    /// `RwLock.acquire_read()`: a read lock.
+    Read(Arc<Waitable<ReadSource>>),
+    /// `RwLock.acquire_write()`: the write lock.
+    Write(Arc<Waitable<WriteSource>>),
+    /// `Barrier.wait()`: the round completed; the await evaluates to whether it led.
+    Arrival(Arc<Waitable<Arrival>>),
 }
 
 impl Grant {
+    /// Before any attempt: an error that makes the wait pointless. Takes nothing.
+    fn check(&self, py: Python<'_>) -> PyResult<()> {
+        match self {
+            Self::Token(token) => token.check(py),
+            _ => Ok(()),
+        }
+    }
+
     /// Takes the grant if it is available now.
     fn try_take(&self) -> bool {
         match self {
             Self::EventSet(event) => event.0.is_set(),
             Self::Notified(notify) => notify.0.try_notified(),
             Self::Locked(lock) => lock.try_lock(),
+            Self::Permits(semaphore, permits) => semaphore.0.try_acquire_detached(*permits),
+            Self::Token(token) => token.try_take(),
+            Self::Read(lock) => lock.0.try_read_detached(),
+            Self::Write(lock) => lock.0.0.try_write_detached(),
+            Self::Arrival(arrival) => arrival.try_lead(),
+        }
+    }
+
+    /// In the step that resumes the coroutine with the grant: records its holder. On error
+    /// the grant is given back.
+    fn taken(&self, py: Python<'_>) -> PyResult<()> {
+        match self {
+            Self::Token(token) => token.taken(py),
+            _ => Ok(()),
         }
     }
 
     /// Gives a taken grant back: the coroutine is not resumed with it after all.
-    fn give_back(&self) {
+    fn give_back(&self, py: Python<'_>) {
         match self {
-            Self::EventSet(_) => {}
+            Self::EventSet(_) | Self::Arrival(_) => {}
             Self::Notified(notify) => notify.0.notify_one(),
             Self::Locked(lock) => {
                 lock.unlock();
+            }
+            Self::Permits(semaphore, permits) => {
+                semaphore.0.release(*permits);
+            }
+            Self::Token(token) => token.give_back(py),
+            Self::Read(lock) => {
+                let _ = release_read(lock);
+            }
+            Self::Write(lock) => {
+                let _ = release_write(&lock.0);
             }
         }
     }
@@ -76,6 +123,22 @@ impl Grant {
             Self::EventSet(event) => event.target(),
             Self::Notified(notify) => notify.target(),
             Self::Locked(lock) => lock.target(),
+            Self::Permits(semaphore, permits) => permits_target(semaphore, *permits),
+            Self::Token(token) => token.target(),
+            Self::Read(lock) => lock.target(),
+            Self::Write(lock) => lock.target(),
+            Self::Arrival(arrival) => arrival.target(),
+        }
+    }
+
+    /// What the await evaluates to when nothing else is asked for ([`Then::Nothing`]).
+    fn value(&self, py: Python<'_>) -> Py<PyAny> {
+        match self {
+            Self::Arrival(arrival) => pyo3::types::PyBool::new(py, arrival.led())
+                .to_owned()
+                .into_any()
+                .unbind(),
+            _ => py.None(),
         }
     }
 }
@@ -121,10 +184,15 @@ enum Stepped {
 impl SyncWait {
     /// The wait of `wait()`, `notified()` or `acquire()`; the await evaluates to `None`.
     pub(super) fn new(grant: Grant) -> Self {
-        let call = match grant {
+        let call = match &grant {
             Grant::EventSet(_) => "Event.wait()",
             Grant::Notified(_) => "Notify.notified()",
             Grant::Locked(_) => "Lock.acquire()",
+            Grant::Permits(..) => "Semaphore.acquire()",
+            Grant::Token(token) => token.call(),
+            Grant::Read(_) => "RwLock.acquire_read()",
+            Grant::Write(_) => "RwLock.acquire_write()",
+            Grant::Arrival(_) => "Barrier.wait()",
         };
         Self::with(grant, Then::Nothing, call)
     }
@@ -146,13 +214,14 @@ impl SyncWait {
 
     /// The grant is taken: what the await evaluates to.
     fn granted(&mut self, py: Python<'_>, grant: &Grant) -> PyResult<Stepped> {
+        grant.taken(py)?;
         let result = match std::mem::replace(&mut self.then, Then::Nothing) {
-            Then::Nothing => return Ok(Stepped::Return(py.None())),
+            Then::Nothing => return Ok(Stepped::Return(grant.value(py))),
             Then::Call(then) => then.call0(py),
         };
         result
             .map(Stepped::Return)
-            .inspect_err(|_| grant.give_back())
+            .inspect_err(|_| grant.give_back(py))
     }
 
     /// Resumes the awaitable with `sent`.
@@ -168,6 +237,7 @@ impl SyncWait {
                     self.state = State::Trying(grant);
                     return suspend(py, TrapKind::Yield);
                 }
+                grant.check(py)?;
                 if grant.try_take() {
                     return self.granted(py, &grant);
                 }
@@ -295,6 +365,11 @@ impl SyncWait {
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        if let State::Trying(Grant::Token(token)) | State::Waiting(Grant::Token(token)) =
+            &self.state
+        {
+            traverse_grant(token, &visit)?;
+        }
         match &self.then {
             Then::Nothing => Ok(()),
             Then::Call(then) => visit.call(then),

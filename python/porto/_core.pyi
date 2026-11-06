@@ -2,7 +2,8 @@
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
 ``sleep_until``, ``sleep_forever``, ``checkpoint``, ``current_time``, ``monotonic``, ``Event``,
-``Notify``, ``Lock``, ``Mutex``, ``MutexGuard``, ``Sender``, ``Receiver`` and ``__version__``
+``Notify``, ``Lock``, ``Mutex``, ``MutexGuard``, ``Semaphore``, ``CapacityLimiter``, ``RwLock``,
+``Condition``, ``Barrier``, ``Sender``, ``Receiver`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -341,6 +342,241 @@ class Mutex(Generic[_T]):
         /,
     ) -> Awaitable[None]: ...
 
+# Semaphore, CapacityLimiter, RwLock, Condition, Barrier (16-sync-primitives-and-channels.md §1)
+
+@final
+class Semaphore:
+    """``porto.Semaphore(value)``: ``value`` permits, acquired and released several at a time.
+
+    Fair: waiters are granted in arrival order, and one that wants more permits than are free
+    blocks the ones behind it (so a large request is never starved by small ones). Bounded:
+    releasing more permits than are acquired raises ``ValueError``. A waiter cancelled or
+    closed before it observed its permits gives them back. Thread-safe.
+    """
+
+    def __init__(self, value: int, /) -> None:
+        """``value`` from 1 to 2**31 - 1; ``ValueError`` otherwise (to signal between tasks,
+        use ``porto.Event`` or ``porto.Notify``)."""
+
+    def acquire(self, permits: int = 1, /) -> _SyncWait[None]:
+        """Completes once the task holds ``permits`` permits; without suspending if nobody
+        waits and enough are free. Lazy like ``Lock.acquire()``. ``ValueError`` unless
+        ``permits`` is from 1 to the semaphore's value."""
+
+    def try_acquire(self, permits: int = 1, /) -> bool:
+        """Takes ``permits`` permits if nobody waits and enough are free right now."""
+
+    def release(self, permits: int = 1, /) -> None:
+        """Gives back ``permits`` permits, granting the longest waiting tasks. ``ValueError``
+        if fewer are acquired."""
+
+    @property
+    def available(self) -> int:
+        """The free permits."""
+
+    def blocking_acquire(self, permits: int = 1, /) -> None:
+        """Blocks the calling thread until it holds ``permits`` permits. Only from threads
+        that do not run porto: raises ``RuntimeError`` on a lane thread."""
+
+    def __aenter__(self) -> Awaitable[None]:
+        """The entry ``async with semaphore:`` awaits: one permit, lazily (like ``Lock``)."""
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
+
+@final
+class CapacityLimiter:
+    """``porto.CapacityLimiter(total_tokens)``: at most ``total_tokens`` borrowers at a time,
+    each holding one token (AnyIO's ``CapacityLimiter`` API).
+
+    The default borrower is the running porto task; ``*_on_behalf_of(borrower)`` borrows for
+    any object (compared by identity). A borrower holds at most one token: borrowing again
+    raises ``RuntimeError``, and so does releasing a token it does not hold. Tokens are granted
+    in arrival order. Thread-safe.
+    """
+
+    def __init__(self, total_tokens: float, /) -> None:
+        """An ``int`` of at least 1, or ``math.inf``."""
+
+    @property
+    def total_tokens(self) -> float:
+        """The most tokens borrowed at once (``math.inf`` for no limit). Raising it grants
+        waiting tasks; lowering it takes tokens back as they are released."""
+
+    @total_tokens.setter
+    def total_tokens(self, value: float) -> None: ...
+    @property
+    def borrowed_tokens(self) -> int:
+        """How many tokens are borrowed."""
+
+    @property
+    def available_tokens(self) -> float:
+        """How many tokens are free (``math.inf`` for no limit)."""
+
+    def acquire(self) -> _SyncWait[None]:
+        """Completes once the running task borrows a token. Lazy."""
+
+    def acquire_on_behalf_of(self, borrower: object, /) -> _SyncWait[None]:
+        """Completes once ``borrower`` borrows a token. Lazy."""
+
+    def acquire_nowait(self) -> None:
+        """Borrows a token for the running task now; ``porto.WouldBlock`` if none is free."""
+
+    def acquire_on_behalf_of_nowait(self, borrower: object, /) -> None:
+        """Borrows a token for ``borrower`` now; ``porto.WouldBlock`` if none is free."""
+
+    def release(self) -> None:
+        """Gives back the running task's token."""
+
+    def release_on_behalf_of(self, borrower: object, /) -> None:
+        """Gives back ``borrower``'s token."""
+
+    def __aenter__(self) -> Awaitable[None]:
+        """The entry ``async with limiter:`` awaits: a token for the running task, lazily."""
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
+
+@final
+class RwLock:
+    """``porto.RwLock()``: any number of readers, or one writer.
+
+    ``async with lock.read():`` and ``async with lock.write():``. Writer-preferring: a reader
+    never takes the lock while a writer waits. Waiters are served in arrival order, consecutive
+    readers together, so neither readers nor writers starve. Not reentrant; holders are not
+    recorded. A waiter cancelled or closed before it observed the lock passes it on.
+    Thread-safe.
+    """
+
+    def __init__(self) -> None: ...
+    def read(self) -> _SyncEntry:
+        """``async with lock.read():`` holds a read lock for the block."""
+
+    def write(self) -> _SyncEntry:
+        """``async with lock.write():`` holds the write lock for the block."""
+
+    def acquire_read(self) -> _SyncWait[None]:
+        """Completes once the task holds a read lock; ``release_read()`` releases it."""
+
+    def acquire_write(self) -> _SyncWait[None]:
+        """Completes once the task holds the write lock; ``release_write()`` releases it."""
+
+    def try_acquire_read(self) -> bool:
+        """Takes a read lock if no writer holds or waits for it right now."""
+
+    def try_acquire_write(self) -> bool:
+        """Takes the write lock if it is free and nobody waits right now."""
+
+    def release_read(self) -> None:
+        """Releases a read lock; ``RuntimeError`` if no reader holds it."""
+
+    def release_write(self) -> None:
+        """Releases the write lock; ``RuntimeError`` if no writer holds it."""
+
+    @property
+    def readers(self) -> int:
+        """How many readers hold the lock."""
+
+    def write_locked(self) -> bool:
+        """Whether a writer holds the lock (or is being handed it)."""
+
+    def blocking_acquire_read(self) -> None:
+        """Blocks the calling thread until it holds a read lock. Only from threads that do not
+        run porto."""
+
+    def blocking_acquire_write(self) -> None:
+        """Blocks the calling thread until it holds the write lock. Only from threads that do
+        not run porto."""
+
+@final
+class Condition:
+    """``porto.Condition(lock=None)``: a ``porto.Lock`` plus tasks waiting to be notified.
+
+    ``async with condition:`` takes the lock; inside, ``await condition.wait()`` releases it,
+    waits for ``notify()`` or ``notify_all()``, and takes it again, also when the task is
+    cancelled meanwhile (the ``Cancelled`` is raised once the lock is held again). A
+    notification goes to the longest waiting tasks and is not stored. A task cancelled after
+    it was notified passes the notification on.
+    """
+
+    def __init__(self, lock: Lock | None = None) -> None:
+        """``lock``: the ``porto.Lock`` to use; a new one by default."""
+
+    @property
+    def lock(self) -> Lock:
+        """The lock the condition uses."""
+
+    def acquire(self) -> _SyncWait[None]:
+        """Completes once the task holds the lock."""
+
+    def try_acquire(self) -> bool:
+        """Takes the lock if it is free right now."""
+
+    def release(self) -> None:
+        """Releases the lock; ``RuntimeError`` if it is not held."""
+
+    def locked(self) -> bool:
+        """Whether the lock is held."""
+
+    def wait(self) -> _ConditionWait[None]:
+        """Releases the lock, waits until notified, and takes the lock again. ``RuntimeError``
+        if the lock is not held. Lazy."""
+
+    def wait_for(self, predicate: Callable[[], _T], /) -> _ConditionWait[_T]:
+        """Waits (as ``wait()``) until ``predicate()`` is true; evaluates to its result. It is
+        checked first, and after each notification, with the lock held."""
+
+    def notify(self, n: int = 1, /) -> None:
+        """Wakes up to ``n`` waiting tasks. ``RuntimeError`` if the lock is not held."""
+
+    def notify_all(self) -> None:
+        """Wakes every waiting task. ``RuntimeError`` if the lock is not held."""
+
+    def __aenter__(self) -> Awaitable[None]: ...
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
+
+@final
+class Barrier:
+    """``porto.Barrier(parties)``: ``await barrier.wait()`` waits until ``parties`` tasks
+    arrived, then all go on, and the barrier is ready for the next round.
+
+    The last arrival of a round leads: its ``wait()`` returns ``True``, the others ``False``. A
+    task cancelled while it waits leaves its round, which then waits for one more arrival.
+    """
+
+    def __init__(self, parties: int, /) -> None:
+        """``parties`` of at least 1."""
+
+    def wait(self) -> _SyncWait[bool]:
+        """Arrives and completes once the round's last task arrived: ``True`` for that one.
+        Lazy: nothing happens until it is awaited."""
+
+    def blocking_wait(self) -> bool:
+        """Blocks the calling thread until the round completes. Only from threads that do not
+        run porto."""
+
+    @property
+    def parties(self) -> int:
+        """How many tasks each round waits for."""
+
+    @property
+    def n_waiting(self) -> int:
+        """How many tasks wait in the current round."""
+
 # Channels (16-sync-primitives-and-channels.md §2; constructed by porto.channel and
 # porto.unbounded_channel)
 
@@ -492,6 +728,40 @@ class _SyncWait(Generic[_T_co]):
         tb: TracebackType | None = None,
         /,
     ) -> NoReturn: ...
+    def close(self) -> None: ...
+
+@final
+class _SyncEntry:
+    """The lazy entry of ``async with`` on a ``Semaphore``, a ``CapacityLimiter``, and
+    ``RwLock.read()``/``RwLock.write()`` (for those two, also the context manager)."""
+
+    def __await__(self) -> Generator[_Trap, object]: ...
+    def send(self, value: object, /) -> _Trap: ...
+    def close(self) -> None: ...
+    async def __aenter__(self) -> None: ...
+    def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Awaitable[None]: ...
+
+@final
+class _ConditionWait(Generic[_T_co]):
+    """The awaitable of ``Condition.wait()`` and ``Condition.wait_for()``."""
+
+    def __await__(self) -> Generator[_Trap, object, _T_co]: ...
+    def __iter__(self) -> Generator[_Trap, object, _T_co]: ...
+    def __next__(self) -> _Trap: ...
+    def send(self, value: object, /) -> _Trap: ...
+    def throw(
+        self,
+        typ: type[BaseException] | BaseException,
+        val: object = None,
+        tb: TracebackType | None = None,
+        /,
+    ) -> _Trap: ...
     def close(self) -> None: ...
 
 @final

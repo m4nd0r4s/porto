@@ -1,5 +1,6 @@
 //! The synchronization primitives (16-sync-primitives-and-channels.md §1): `porto.Event`,
-//! `porto.Notify`, `porto.Lock` and `porto.Mutex[T]` with its `MutexGuard`.
+//! `porto.Notify`, `porto.Lock` and `porto.Mutex[T]` with its `MutexGuard`, `porto.Semaphore`,
+//! `porto.CapacityLimiter`, `porto.RwLock`, `porto.Condition` and `porto.Barrier`.
 //!
 //! Each wraps the `porto_core::sync` primitive in a [`Waitable`](crate::driver::thin::Waitable)
 //! and waits through a lazy `_SyncWait` awaitable (`wait_op`): an `await` that has to wait is
@@ -16,10 +17,16 @@
 //! the thread detached from Python and does not check for signals, so Ctrl-C does not
 //! interrupt it: the `KeyboardInterrupt` is raised once the wait is over.
 
+mod barrier;
+mod condition;
 mod entry;
 mod event;
+mod limiter;
 mod lock;
 mod mutex;
+mod rwlock;
+mod semaphore;
+mod sync_entry;
 mod wait_op;
 
 use porto_core::sync::BlockingOnLane;
@@ -47,7 +54,21 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<mutex::Mutex>()?;
     mutex::install_raw_methods(module.py())?;
     module.add_class::<mutex::MutexGuard>()?;
-    mutex::init_guard_type(module.py())
+    mutex::init_guard_type(module.py())?;
+    register_more(module)
+}
+
+/// The primitives of porto-szb.48, .49 and .50.
+fn register_more(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<semaphore::Semaphore>()?;
+    semaphore::install_raw_methods(module.py())?;
+    module.add_class::<limiter::CapacityLimiter>()?;
+    module.add_class::<rwlock::RwLock>()?;
+    module.add_class::<sync_entry::SyncEntry>()?;
+    sync_entry::init_entry_type(module.py())?;
+    module.add_class::<condition::Condition>()?;
+    module.add_class::<condition::ConditionWait>()?;
+    module.add_class::<barrier::Barrier>()
 }
 
 freelist::gil_freelist!(sync_wait_freelist, 256);

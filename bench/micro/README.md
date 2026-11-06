@@ -23,7 +23,7 @@ task counts and yields), run on the same loops as above. The modules say what ea
 | Module | Benchmarks | asyncio twin | Gate (53 §2, vs asyncio+uvloop) |
 |---|---|---|---|
 | `channel_programs.py` | `channel_pingpong` (capacity 1), `channel_throughput` (100k items, capacity 64, `async for`), `channel_throughput_batch` (`recv_many(64)`), `channel_fan_in` (8→1), `channel_fan_out` (1→8), `channel_cross_thread` (4 OS threads `blocking_send`, unbounded) | `asyncio.Queue`; `call_soon_threadsafe` + `put_nowait` | ≥ 3× (cross-thread: none) |
-| `sync_programs.py` | `lock_uncontended`, `lock_contended` (100 tasks), `mutex_value`, `event_wakeup_10k`, `notify_handoff` | `asyncio.Lock`, `asyncio.Event`, `asyncio.Condition` | Lock ≥ 2× |
+| `sync_programs.py` | `lock_uncontended`, `semaphore_uncontended` (4 permits), `lock_contended` (100 tasks), `mutex_value`, `event_wakeup_10k`, `notify_handoff` | `asyncio.Lock`, `asyncio.Semaphore`, `asyncio.Event`, `asyncio.Condition` | Lock ≥ 2× (semaphore: none) |
 | `scope_programs.py` | `scope_enter_exit`, `scope_nested_10`, `cancel_fanout_10k`, `fail_fast_10k` | `asyncio.TaskGroup`, `task.cancel()`; trio and anyio (on uvloop) as informative rows | none |
 | `timer_programs.py` | `sleep_100k` (`sleep(0.001)` x 100k tasks), `sleep_cancel_churn` | `asyncio.sleep` | ≥ 2× |
 | `workload_programs.py` | `worker_pool` (jobs channel → 8 workers + a Lock → results channel) | Queues + Lock | none |
