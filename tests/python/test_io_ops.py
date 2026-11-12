@@ -8,8 +8,10 @@ readiness and attempts the operation again. Registering raw sockets needs the AF
 Windows, which is not written yet, so these tests run on Unix.
 """
 
+import os
 import socket
 import sys
+import tempfile
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -323,6 +325,63 @@ def test_a_cancelled_task_does_not_start_a_connect() -> None:
                     handle.connect(listener.getsockname())
             with pytest.raises(OSError, match="not connected"):
                 client.getpeername()
+            handle.close()
+
+    run(main())
+
+
+def test_unix_datagrams_to_str_and_bytes_paths() -> None:
+    # A short directory: pytest's tmp_path is too long for sun_path on macOS.
+    directory = tempfile.TemporaryDirectory(dir="/tmp")
+
+    async def main() -> list[Any]:
+        path = os.path.join(directory.name, "porto.sock")
+        with (
+            socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as a,
+            socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as b,
+        ):
+            a.bind(path)
+            receiver = _core._IoHandle(a.fileno())
+            sender = _core._IoHandle(b.fileno())
+            await sender.send_to(b"to str", path)
+            await sender.send_to(b"to bytes", path.encode())
+            got = [await receiver.recv_from(64), await receiver.recv_from(64)]
+            receiver.close()
+            sender.close()
+            return got
+
+    with directory:
+        got = run(main())
+    # The sender is unbound: its address is ''.
+    assert got == [(b"to str", ""), (b"to bytes", "")]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="abstract Unix names are Linux-only")
+def test_unix_datagrams_to_an_abstract_name() -> None:
+    async def main() -> bytes:
+        name = b"\0porto-test-%d" % id(main)
+        with (
+            socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as a,
+            socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as b,
+        ):
+            a.bind(name)
+            receiver = _core._IoHandle(a.fileno())
+            sender = _core._IoHandle(b.fileno())
+            await sender.send_to(b"abstract", name)
+            data, _ = await receiver.recv_from(64)
+            receiver.close()
+            sender.close()
+            return data
+
+    assert run(main()) == b"abstract"
+
+
+def test_a_unix_path_that_is_too_long_says_what_to_do() -> None:
+    async def main() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as a:
+            handle = _core._IoHandle(a.fileno())
+            with pytest.raises(ValueError, match="not a valid Unix socket address"):
+                handle.send_to(b"x", b"/" + b"x" * 200)
             handle.close()
 
     run(main())

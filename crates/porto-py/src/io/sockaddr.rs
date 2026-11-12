@@ -46,26 +46,44 @@ pub(crate) fn to_py(py: Python<'_>, address: &SockAddr) -> PyResult<Py<PyAny>> {
 }
 
 /// The address `object` names: `(host, port)` or `(host, port, flowinfo, scope_id)` with a
-/// numeric host, or a path (`str` or `bytes`) for a Unix socket.
+/// numeric host, or a path (`str` or `bytes`; `bytes` starting with a NUL byte for a Linux
+/// abstract name) for a Unix socket.
 pub(crate) fn from_py(object: &Bound<'_, PyAny>) -> PyResult<SockAddr> {
     if let Ok(tuple) = object.cast::<PyTuple>() {
         return from_tuple(tuple);
     }
     #[cfg(unix)]
     if object.is_instance_of::<PyString>() || object.is_instance_of::<PyBytes>() {
-        let path: std::path::PathBuf = object.extract()?;
-        return SockAddr::unix(path).map_err(|error| {
-            PyValueError::new_err(format!(
-                "porto: {object} is not a valid Unix socket path ({error}); use a shorter path \
-                 without NUL bytes"
-            ))
-        });
+        return unix_from_py(object);
     }
     Err(PyTypeError::new_err(format!(
         "porto: a socket address must be a (host, port) tuple, (host, port, flowinfo, \
          scope_id) for IPv6, or a Unix socket path, not {}",
         object.get_type().name()?
     )))
+}
+
+/// A Unix socket address from a `str` path (encoded as `os.fsencode` does) or a `bytes` one; a
+/// name starting with a NUL byte is a Linux abstract name.
+#[cfg(unix)]
+fn unix_from_py(object: &Bound<'_, PyAny>) -> PyResult<SockAddr> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let encoded = if let Ok(bytes) = object.cast::<PyBytes>() {
+        bytes.as_bytes().to_vec()
+    } else {
+        let path: std::path::PathBuf = object.extract()?;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    SockAddr::unix(std::ffi::OsStr::from_bytes(&encoded)).map_err(|error| {
+        PyValueError::new_err(format!(
+            "porto: {} is not a valid Unix socket address ({error}); use a path of at most \
+             about 100 bytes, without NUL bytes except a leading one for a Linux abstract name",
+            object
+                .repr()
+                .map_or_else(|_| "the address".to_owned(), |repr| repr.to_string())
+        ))
+    })
 }
 
 fn from_tuple(tuple: &Bound<'_, PyTuple>) -> PyResult<SockAddr> {
