@@ -387,6 +387,19 @@ def test_a_unix_path_that_is_too_long_says_what_to_do() -> None:
     run(main())
 
 
+@pytest.mark.parametrize("path", ["/tmp/a\0b", b"/tmp/a\0b"], ids=["str", "bytes"])
+def test_a_nul_byte_inside_a_unix_path_is_refused(path: str | bytes) -> None:
+    # The kernel would cut the path at the NUL and send to /tmp/a instead.
+    async def main() -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as a:
+            handle = _core._IoHandle(a.fileno())
+            with pytest.raises(ValueError, match="NUL byte inside the path"):
+                handle.send_to(b"x", path)
+            handle.close()
+
+    run(main())
+
+
 def test_a_connect_address_must_be_numeric() -> None:
     async def main() -> None:
         with socket.socket() as client:

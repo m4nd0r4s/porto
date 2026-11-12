@@ -77,15 +77,21 @@ fn unix_from_py(object: &Bound<'_, PyAny>) -> PyResult<SockAddr> {
         let path: std::path::PathBuf = object.extract()?;
         path.as_os_str().as_bytes().to_vec()
     };
-    SockAddr::unix(std::ffi::OsStr::from_bytes(&encoded)).map_err(|error| {
+    let invalid = |reason: &dyn std::fmt::Display| {
         PyValueError::new_err(format!(
-            "porto: {} is not a valid Unix socket address ({error}); use a path of at most \
+            "porto: {} is not a valid Unix socket address ({reason}); use a path of at most \
              about 100 bytes, without NUL bytes except a leading one for a Linux abstract name",
             object
                 .repr()
                 .map_or_else(|_| "the address".to_owned(), |repr| repr.to_string())
         ))
-    })
+    };
+    // The kernel ends a path at its first NUL: refuse one inside a path rather than send to a
+    // shorter path than the one asked for (an abstract name may hold any byte).
+    if encoded.first().is_some_and(|&first| first != 0) && encoded.contains(&0) {
+        return Err(invalid(&"a NUL byte inside the path"));
+    }
+    SockAddr::unix(std::ffi::OsStr::from_bytes(&encoded)).map_err(|error| invalid(&error))
 }
 
 fn from_tuple(tuple: &Bound<'_, PyTuple>) -> PyResult<SockAddr> {
