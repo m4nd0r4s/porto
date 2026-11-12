@@ -14,6 +14,7 @@
 //! assert_eq!(rt.block_on(task).unwrap(), 2);
 //! ```
 
+pub mod blocking;
 pub mod config;
 pub mod coop;
 #[cfg(all(test, loom))]
@@ -24,4 +25,5 @@ pub mod sync;
 pub mod task;
 pub mod time;
 
-pub use sched::{Builder, Handle, ParkHook, Runtime, WeakHandle, spawn};
+pub use blocking::{BlockingError, BlockingStats, WorkerHooks};
+pub use sched::{Builder, Handle, ParkHook, Runtime, WeakHandle, spawn, spawn_blocking};

@@ -53,3 +53,24 @@ where
     };
     handle.spawn(future)
 }
+
+/// Runs `job` on the blocking pool of the runtime running on this thread, and returns a handle
+/// for its result: see [`Handle::spawn_blocking`].
+///
+/// # Panics
+/// If no runtime is running on this thread, or if the OS cannot start a pool thread. Call it
+/// from a task or from inside [`Runtime::block_on`], or use [`Handle::spawn_blocking`] from
+/// other threads.
+pub fn spawn_blocking<F, R>(job: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let Some(handle) = context::current_handle() else {
+        panic!(
+            "porto_core::spawn_blocking called outside a runtime: call it from a task or inside \
+             Runtime::block_on, or use Handle::spawn_blocking from other threads"
+        );
+    };
+    handle.spawn_blocking(job)
+}

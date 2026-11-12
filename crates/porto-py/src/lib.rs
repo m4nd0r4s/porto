@@ -67,6 +67,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     api::run::register(module)?;
     api::scope::register(module)?;
     api::task::register(module)?;
+    api::threads::register(module)?;
     api::time::register(module)?;
     api::sync::register(module)?;
     testing::register(module)

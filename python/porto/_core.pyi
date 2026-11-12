@@ -1399,6 +1399,25 @@ def _sleep_trap(delay: float, /) -> _Trap:
     a deadline already passed, so a yield). Reads the runtime clock, so it raises
     ``porto.NoRuntimeError`` outside ``porto.run``; ``ValueError`` for NaN."""
 
+def _run_in_thread(
+    func: Callable[..., _T],
+    args: tuple[object, ...],
+    kwargs: dict[str, object] | None,
+    context: contextvars.Context,
+    /,
+) -> Awaitable[_T]:
+    """The engine of ``porto.to_thread``: an awaitable that, once awaited, runs
+    ``context.run(func, *args, **kwargs)`` on a blocking-pool thread and evaluates to its result
+    or raises its exception. The job cannot be interrupted: dropping the await leaves it running
+    and discards its result. ``context`` MUST NOT be entered by anything else meanwhile (pass a
+    fresh copy). ``TypeError`` if ``func`` is not callable; ``porto.NoRuntimeError`` outside
+    ``porto.run``."""
+
+def _blocking_stats() -> tuple[int, int, int]:
+    """Test hook: ``(threads, idle, queued)`` of the running ``porto.run``'s blocking pool: worker
+    threads alive, workers waiting for a job, jobs waiting for a worker. Raises
+    ``porto.NoRuntimeError`` outside ``porto.run``."""
+
 def _armed_timers() -> int:
     """Test hook: how many timers are armed on the running runtime's wheel, its own included
     (the lane's signal check). A cancelled sleep leaves none behind. Raises

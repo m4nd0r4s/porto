@@ -13,6 +13,16 @@ def check_version_is_str() -> None:
     assert_type(porto.__version__, str)
 
 
+def square(value: int) -> int:
+    return value * value
+
+
+async def check_to_thread() -> None:
+    assert_type(await porto.to_thread(square, 3), int)
+    assert_type(await porto.to_thread(square, 3, cancellable=True), int)
+    assert_type(await porto.to_thread(sum, [1, 2], start=0), int)
+
+
 async def fetch(host: str, port: int) -> bytes:
     await porto.sleep(0)
     return f"{host}:{port}".encode()

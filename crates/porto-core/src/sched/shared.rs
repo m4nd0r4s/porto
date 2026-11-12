@@ -18,6 +18,7 @@ use super::context;
 use super::inject::Inject;
 use super::park::Parking;
 use super::timers::Timers;
+use crate::blocking::{BlockingConfig, BlockingError, BlockingPool, BlockingStats};
 use crate::scope::{ScopeClosed, ScopeRef, TaskScope};
 use crate::task::{
     JoinHandle, Notified, Schedule, TaskBody, TaskBodyRef, TaskFlags, new_body_task,
@@ -49,6 +50,9 @@ pub(crate) struct Shared {
     /// The I/O driver, if the runtime has one (`13-io-driver.md`): polled at maintenance, and
     /// the lane parks in it.
     pub(crate) driver: Option<Arc<dyn Driver>>,
+    /// The blocking pool (`19-threads-and-blocking.md`): no thread exists until a job is
+    /// spawned.
+    pub(crate) blocking: BlockingPool,
 }
 
 /// The part of one lane other threads can reach.
@@ -155,6 +159,7 @@ impl Handle {
         timer_resolution: Duration,
         driver: Option<Arc<dyn Driver>>,
         lanes: usize,
+        blocking: BlockingConfig,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -163,6 +168,7 @@ impl Handle {
                 clock,
                 timers: Timers::new(timer_resolution),
                 driver,
+                blocking: BlockingPool::new(blocking),
             }),
         }
     }
@@ -271,6 +277,47 @@ impl Handle {
         self.shared.lanes[0].deferred.push(Box::new(work))?;
         self.shared.notify_lane(0);
         Ok(())
+    }
+
+    /// Runs `job` on the blocking pool and returns a handle for its result: the way to run
+    /// code that blocks the thread it runs on (`19-threads-and-blocking.md` §4). The closure
+    /// runs on a worker thread, never on a lane, so it may block, and it may call the
+    /// `blocking_*` methods of the sync primitives.
+    ///
+    /// The job cannot be interrupted. Dropping the handle detaches it (the job still runs and
+    /// its result is dropped by the worker); [`JoinHandle::abort`] cancels one that has not
+    /// started. A panic in the job is the handle's [`JoinError`](crate::task::JoinError). If the
+    /// runtime is shut down before the job starts, the handle yields a cancelled error.
+    ///
+    /// # Panics
+    /// If the OS cannot start a thread and none is running. Use
+    /// [`Handle::try_spawn_blocking`] to handle that.
+    pub fn spawn_blocking<F, R>(&self, job: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match self.try_spawn_blocking(job) {
+            Ok(join) => join,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// [`Handle::spawn_blocking`] that returns the error when no thread can be started.
+    ///
+    /// # Errors
+    /// [`BlockingError::NoThread`].
+    pub fn try_spawn_blocking<F, R>(&self, job: F) -> Result<JoinHandle<R>, BlockingError>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.shared.blocking.spawn(job)
+    }
+
+    /// The blocking pool's gauges: workers alive, idle workers, queued jobs.
+    pub fn blocking_stats(&self) -> BlockingStats {
+        self.shared.blocking.stats()
     }
 
     /// Whether this thread runs one of this runtime's lanes (inside its `block_on` or

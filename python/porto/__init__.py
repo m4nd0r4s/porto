@@ -57,6 +57,7 @@ from porto._core import (
     sleep,
     timeout,
 )
+from porto._threads import to_thread
 from porto.errors import (
     BrokenResourceError,
     BusyResourceError,
@@ -132,6 +133,7 @@ __all__ = [
     "shield",
     "sleep",
     "timeout",
+    "to_thread",
     "unbounded_channel",
     "watch",
 ]

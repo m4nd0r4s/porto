@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use porto_io::Driver;
 
+use crate::blocking::{BlockingConfig, WorkerHooks};
+
 use super::context::Enter;
 use super::lane::{DEFAULT_COOP_BUDGET, Lane, run_each};
 use super::park::ParkHook;
@@ -41,6 +43,7 @@ pub struct Builder {
     timer_resolution: Option<Duration>,
     driver: Option<Arc<dyn Driver>>,
     coop_budget: Option<u32>,
+    blocking: BlockingConfig,
 }
 
 impl Builder {
@@ -102,6 +105,35 @@ impl Builder {
         self
     }
 
+    /// Sets the most threads the blocking pool runs (`blocking_threads`, default 512): jobs
+    /// past it wait in the queue (`19-threads-and-blocking.md` §1).
+    ///
+    /// # Panics
+    /// If `threads` is 0: no job could ever run.
+    pub fn blocking_threads(mut self, threads: usize) -> Self {
+        assert!(
+            threads > 0,
+            "porto: blocking_threads must be at least 1, got 0; pass a positive limit, or leave \
+             it unset for the default of 512"
+        );
+        self.blocking.max_threads = threads;
+        self
+    }
+
+    /// Sets how long an idle blocking-pool thread waits for work before it exits
+    /// (`blocking_keepalive`, default 10 s). Zero makes a thread leave as soon as it is idle.
+    pub fn blocking_keepalive(mut self, keepalive: Duration) -> Self {
+        self.blocking.keepalive = keepalive;
+        self
+    }
+
+    /// Runs `hooks` on every new blocking-pool thread, before its first job: the Python
+    /// bindings create the thread's `PyThreadState` there.
+    pub fn blocking_hooks(mut self, hooks: impl WorkerHooks) -> Self {
+        self.blocking.hooks = Some(Arc::new(hooks));
+        self
+    }
+
     /// Creates the runtime. The runtime clock's epoch is now, unless a clock was given.
     pub fn build(self) -> Runtime {
         let clock = match self.clock {
@@ -113,6 +145,7 @@ impl Builder {
             self.timer_resolution.unwrap_or(Timers::DEFAULT_RESOLUTION),
             self.driver,
             1,
+            self.blocking,
         );
         Runtime {
             lane: Lane::new(
@@ -133,6 +166,8 @@ impl fmt::Debug for Builder {
             .field("timer_resolution", &self.timer_resolution)
             .field("driver", &self.driver.as_ref().map(|driver| driver.kind()))
             .field("coop_budget", &self.coop_budget)
+            .field("blocking_threads", &self.blocking.max_threads)
+            .field("blocking_keepalive", &self.blocking.keepalive)
             .finish()
     }
 }
@@ -243,6 +278,13 @@ impl Default for Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         let shared = self.lane.handle.shared.clone();
+        // The blocking pool first: queued jobs are cancelled, and the workers get up to a
+        // second to finish the jobs they run (a job cannot be interrupted); the rest are left to
+        // finish alone. While they finish, the injector and the deferred queue are still open,
+        // so a job that completes wakes its awaiter on to this lane's queue, and what it hands
+        // back for release is run below, on this thread, not dropped by the worker.
+        shared.blocking.close();
+        shared.blocking.shutdown();
         // Dropping a queue entry cancels its task and drops its future, whose destructor may
         // wake other tasks; with the injector closed (and no lane entered), those wakes cancel
         // their task instead of queueing it. Deferred work still runs here, on the thread

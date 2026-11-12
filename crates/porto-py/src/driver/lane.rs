@@ -37,6 +37,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use super::pytask::TaskOutcome;
+use crate::api::threads::PythonWorkers;
 use crate::py_compat::take_exception;
 
 /// How often the lane checks for signals (Ctrl-C) while it waits for `main`: the longest a
@@ -102,7 +103,8 @@ struct LaneState {
 }
 
 /// Runs `body` with a fresh single-lane Python runtime configured by `config` (of which it uses
-/// `io_backend`, `io_backend_strict`, `timer_resolution` and `coop_budget`), on this
+/// `io_backend`, `io_backend_strict`, `timer_resolution`, `coop_budget`, `blocking_threads` and
+/// `blocking_keepalive`), on this
 /// (attached) thread. The runtime is dropped before returning, still attached, so the tasks it
 /// frees release their Python objects directly. Then every task still in a linked wait (a join,
 /// a sync primitive, a scope exit) is cancelled: its wait is given up and its coroutine closed
@@ -122,6 +124,9 @@ pub(crate) fn run<T>(
         .park_hook(DetachWhileParked)
         .timer_resolution(config.timer_resolution())
         .coop_budget(config.coop_budget())
+        .blocking_threads(config.blocking_threads())
+        .blocking_keepalive(config.blocking_keepalive())
+        .blocking_hooks(PythonWorkers::of_current_interpreter(py))
         .driver(open_driver(py, config)?)
         .build();
     let output = {

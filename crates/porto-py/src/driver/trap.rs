@@ -97,10 +97,6 @@ pub(crate) enum TrapKind {
         scope: PyScopeRef,
     },
     /// Wait for a Rust future; the await evaluates to what it resolves to.
-    #[allow(
-        dead_code,
-        reason = "made by Rust-backed awaitables (to_thread, porto-szb.26)"
-    )]
     Future(BoxedFuture<Resume>),
     /// Wait for a future from a third-party extension (porto-abi, M3).
     #[allow(dead_code, reason = "uninhabited until porto-abi (M3)")]

@@ -34,6 +34,7 @@ fn handle(clock: &HandClock) -> Handle {
         Duration::from_millis(1),
         None,
         1,
+        crate::blocking::BlockingConfig::default(),
     )
 }
 

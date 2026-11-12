@@ -119,25 +119,22 @@ impl<T> fmt::Debug for PyObj<T> {
 /// A Python reference that may be dropped on any thread: if that is not the lane of the runtime
 /// it belongs to, the release is queued on that lane ([`release_on_lane`]). `Send`, so it can
 /// travel in a message, a job or a result.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "first used by the blocking pool (porto-szb.25)")
-)]
 pub(crate) struct PyDeferred<T: 'static = PyAny> {
     object: Option<Py<T>>,
     home: WeakHandle,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "first used by the blocking pool (porto-szb.25)")
-)]
 impl<T: 'static> PyDeferred<T> {
     /// Owns `object` for the lane of `home`.
     pub(crate) fn new(object: Py<T>, home: &Handle) -> Self {
+        Self::with_home(object, home.downgrade())
+    }
+
+    /// [`PyDeferred::new`] for a home that is held weakly already.
+    pub(crate) fn with_home(object: Py<T>, home: WeakHandle) -> Self {
         Self {
             object: Some(object),
-            home: home.downgrade(),
+            home,
         }
     }
 
@@ -166,10 +163,6 @@ impl<T: 'static> fmt::Debug for PyDeferred<T> {
 /// Drops `owned` (which owns Python references) where it belongs: here if this thread runs the
 /// lane of `home`, else on that lane at its next maintenance tick. See the module docs for what
 /// happens once there is no lane.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "first used by the blocking pool (porto-szb.25)")
-)]
 pub(crate) fn release_on_lane<O: Send + 'static>(home: &WeakHandle, owned: O) {
     match home.upgrade() {
         Some(handle) => release_to(&handle, owned),
