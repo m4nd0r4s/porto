@@ -28,7 +28,7 @@ use std::any::Any;
 use std::mem;
 
 use porto_core::{BlockingStats, Handle, WeakHandle, WorkerHooks};
-use pyo3::exceptions::{PyBaseException, PyTypeError};
+use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError};
 use pyo3::ffi;
 use pyo3::intern;
 use pyo3::prelude::*;
@@ -95,7 +95,9 @@ fn run_in_thread(
             Ok(Some(Outcome::Raised(exception))) => Resume::Throw(exception.into_inner(py)),
             // The runtime ended before the job ran, or the interpreter is finalizing.
             Ok(None) => Resume::Throw(thrown(&shut_down_error())),
-            Err(error) if error.is_cancelled() => Resume::Throw(thrown(&shut_down_error())),
+            // Cancelled while queued: the pool closed, or no worker thread could be started for
+            // it (another submitter's start failed with no worker left, spec 19 §1).
+            Err(error) if error.is_cancelled() => Resume::Throw(thrown(&not_run_error())),
             Err(error) => {
                 let payload = error.into_panic();
                 Resume::Throw(thrown(&rust_panic(&*payload, None)))
@@ -231,4 +233,15 @@ fn blocking_stats() -> PyResult<(usize, usize, usize)> {
         queued,
     } = handle.blocking_stats();
     Ok((threads, idle, queued))
+}
+
+/// A blocking job cancelled before it ran: the runtime stopped, or the OS refused the worker
+/// thread it needed.
+fn not_run_error() -> PyErr {
+    PyRuntimeError::new_err(
+        "porto: the blocking job was cancelled before it ran: either its runtime stopped (keep \
+         porto.run() running until the jobs you wait for are done) or no worker thread could be \
+         started for it (the OS refused a new thread: lower RuntimeConfig.blocking_threads or \
+         free system resources, then try again)",
+    )
 }

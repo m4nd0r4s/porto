@@ -287,12 +287,17 @@ impl Drop for Runtime {
         // Through the park hook, as every wait of the lane thread: a Python lane detaches its
         // thread state meanwhile, which a worker needs to finish a Python job (it takes the
         // interpreter back as the job returns) and to delete its own thread state.
+        let waited = std::cell::Cell::new(false);
         let mut wait_for_workers = || {
             shared.blocking.shutdown();
+            waited.set(true);
         };
-        match &self.lane.park_hook {
-            Some(hook) => hook.around_park(&mut wait_for_workers),
-            None => wait_for_workers(),
+        if let Some(hook) = &self.lane.park_hook {
+            hook.around_park(&mut wait_for_workers);
+        }
+        // A hook may return without calling `park` (it only spins): wait here then.
+        if !waited.get() {
+            shared.blocking.shutdown();
         }
         // Dropping a queue entry cancels its task and drops its future, whose destructor may
         // wake other tasks; with the injector closed (and no lane entered), those wakes cancel
