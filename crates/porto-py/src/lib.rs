@@ -9,6 +9,7 @@ mod api;
 pub mod async_slots;
 pub mod driver;
 pub mod errors;
+mod io;
 mod py_compat;
 mod raw_methods;
 pub mod testing;

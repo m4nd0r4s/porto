@@ -75,6 +75,8 @@ enum IoOp {
 ```
 The driver-side `poll` re-executes the op when readiness fires. This keeps one generic trap kind for all socket ops and avoids per-op Rust futures.
 
+The call that makes the awaitable attempts the op once, nonblocking, whatever readiness the driver has reported (the fast path, 10 §4): on success it returns a ready awaitable, and on `WouldBlock` it clears the readiness it observed (unless newer readiness arrived) and returns one `Io` trap. The call first raises `Cancelled` if the task is cancelled (C1), so a fast path never consumes data it cannot deliver, and a task out of budget gets the trap without an attempt (T2). The trap's wait waits for readiness, attempts again, and resumes the task in the poll whose attempt succeeds (T3: a dropped wait consumed nothing). `WaitReadable` and `WaitWritable` always return the trap. OS errors become `OSError` with their errno, so Python picks the subclass (`ConnectionRefusedError`, …).
+
 ## 6. Buffers
 - `porto.Buffer` is a Rust-owned, growable byte buffer that exposes the buffer protocol (read/write). It is pooled per lane (size classes 4K, 16K, 64K, 256K).
 - `PyBufferRef` holds a `Py_buffer` view (from `PyObject_GetBuffer` with `PyBUF_SIMPLE`) and releases it on drop. It MUST be released on a Python lane (P1).

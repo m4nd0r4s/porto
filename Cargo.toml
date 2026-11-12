@@ -25,6 +25,9 @@ mio = { version = "1.2.4", default-features = false, features = ["os-poll", "os-
 # The short locks of porto's queues, scopes and task handles: one byte and a CAS, where std's
 # Mutex allocates a pthread mutex per lock on macOS (porto-itr.7). No `deadlock_detection`.
 parking_lot = { version = "0.12.5", default-features = false }
+# Nonblocking socket syscalls on a registered handle (accept, connect, recv, send, recvfrom,
+# sendto) for the `Io` trap's operations, on every OS mio supports (13-io-driver.md §5).
+socket2 = "0.6.3"
 # Physical core count for `lanes="auto"` (12-scheduler-and-lanes.md §7); std only knows logical.
 num_cpus = "1.17"
 # Property and model-based tests (dev only; 52-testing-strategy.md item 1).

@@ -246,16 +246,12 @@ unsafe fn read<T>(field: &ManuallyDrop<T>) -> T {
 /// the operation, which owns its registration reference, interest and op state. The operation
 /// is a future: polling it attempts the op (and registers the task's waker for the readiness
 /// it needs on `WouldBlock`); dropping it unregisters that waker. T3: it consumes data only in
-/// the attempt that returns `Ready`, so dropping a pending one loses nothing. porto-szb.62
-/// brings the registrations and the `IoOp` set.
+/// the attempt that returns `Ready`, so dropping a pending one loses nothing. The operations
+/// are `crate::io::op::IoOp`, made by `crate::io::op::submit`.
 pub(crate) struct IoWait(pub(crate) BoxedFuture<Resume>);
 
 impl IoWait {
     /// An `Io` wait for `op`.
-    #[allow(
-        dead_code,
-        reason = "made by the socket and lowlevel I/O APIs (porto-szb.62)"
-    )]
     pub(crate) fn new(op: impl Future<Output = Resume> + Send + 'static) -> Self {
         Self(BoxedFuture::new(op))
     }

@@ -8,7 +8,9 @@
 //!   and takes it back through `take_exception`, which normalizes it on 3.11;
 //! - `_count_allocations(fn)` counts every allocation CPython makes while `fn()` runs;
 //! - the error hooks of [`errors`];
-//! - the trap-kind hooks of `traps.rs`.
+//! - the trap-kind hooks of `traps.rs`;
+//! - `_IoHandle`, a socket registered with the running lane's driver, whose methods are the
+//!   `Io` trap's operations (`crate::io`).
 
 use core::ffi::c_void;
 use core::ptr;
@@ -33,6 +35,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(send, module)?)?;
     module.add_function(wrap_pyfunction!(take_unnormalized_exception, module)?)?;
     module.add_function(wrap_pyfunction!(count_allocations, module)?)?;
+    module.add_class::<crate::io::handle::IoHandle>()?;
     errors::register(module)?;
     traps::register(module)
 }
