@@ -34,10 +34,17 @@
 //! `started.set(value)`, which moves it into this scope (`started.rs`). `Task.cancel()` (§4) is
 //! in `task.rs`.
 //!
-//! Not yet: names, and spawning from other lanes or threads (C10).
+//! `Scope.name` is the name `porto.scope(name=)` gave (`""` for none, `"root"` for the root
+//! scope); it names the scope in the exception group its exit raises. `Scope.tasks` is a
+//! snapshot of the tasks spawned into it (`Scope.spawn`, or moved in by `started.set`) that
+//! have not ended: the scope keeps their handles in a list that spawning compacts.
+//!
+//! Not yet: spawning from other lanes or threads (C10).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
+
+use parking_lot::Mutex as FastMutex;
 
 use porto_core::Handle;
 use porto_core::scope::{CancelReason, ScopeNode};
@@ -47,6 +54,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::{PyTraverseError, PyVisit};
 
 use super::run::{closing_on_error, coroutine_from};
 use super::scope_deadline::{self, ScopeDeadline, seconds};
@@ -79,25 +87,46 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 freelist::gil_freelist!(exit_freelist, 64);
 
-/// `porto.scope(*, timeout=None, deadline=None, shield=False, raise_on_timeout=True)`: a new
-/// scope, to enter with `async with`. `timeout` counts seconds from the entry, `deadline` is a
-/// time on the runtime clock; with both, the earlier wins. `shield=True` keeps the cancels of
-/// the scopes it is in out (C8).
+/// `porto.scope(*, timeout=None, deadline=None, shield=False, name=None, raise_on_timeout=True)`:
+/// a new scope, to enter with `async with`. `timeout` counts seconds from the entry, `deadline`
+/// is a time on the runtime clock; with both, the earlier wins. `shield=True` keeps the cancels
+/// of the scopes it is in out (C8). `name` (a `str`) names the scope (`Scope.name`, and the
+/// message of the exception group its exit raises).
 #[pyfunction]
-#[pyo3(signature = (*, timeout=None, deadline=None, shield=false, raise_on_timeout=true))]
+#[pyo3(signature = (*, timeout=None, deadline=None, shield=false, name=None, raise_on_timeout=true))]
 fn scope(
     timeout: Option<f64>,
     deadline: Option<f64>,
     shield: bool,
+    name: Option<Bound<'_, PyAny>>,
     raise_on_timeout: bool,
 ) -> PyResult<Scope> {
+    let name = scope_name(name)?;
     let timeout = timeout
         .map(|value| seconds("porto.scope()", "timeout", value))
         .transpose()?;
     let deadline = deadline
         .map(|value| seconds("porto.scope()", "deadline", value))
         .transpose()?;
-    Ok(Scope::new(timeout, deadline, raise_on_timeout).shielded(shield))
+    Ok(Scope::new(timeout, deadline, raise_on_timeout)
+        .shielded(shield)
+        .named(name))
+}
+
+/// The `name=` of `porto.scope()`, checked: a `str`, or `None` for none.
+fn scope_name(name: Option<Bound<'_, PyAny>>) -> PyResult<Option<Py<PyString>>> {
+    match name {
+        None => Ok(None),
+        Some(name) if name.is_none() => Ok(None),
+        Some(name) => match name.cast_into::<PyString>() {
+            Ok(name) => Ok(Some(name.unbind())),
+            Err(error) => Err(PyTypeError::new_err(format!(
+                "porto: porto.scope() name= must be a str, got {}; pass name=str(...), or leave \
+                 it out for an unnamed scope",
+                error.into_inner().get_type().fully_qualified_name()?
+            ))),
+        },
+    }
 }
 
 /// `_hidden_scope()`: the scope `Scope.start` runs a task in until it reports: a nursery whose
@@ -121,7 +150,7 @@ fn shield(timeout: Option<f64>) -> PyResult<Scope> {
 /// `porto.timeout(seconds)`: a scope whose block raises `TimeoutError` if it is still running
 /// `seconds` after it was entered.
 #[pyfunction]
-#[pyo3(signature = (seconds, /))]
+#[pyo3(signature = (seconds))]
 fn timeout(seconds: f64) -> PyResult<Scope> {
     let seconds = scope_deadline::seconds("porto.timeout()", "seconds", seconds)?;
     Ok(Scope::new(Some(seconds), None, true))
@@ -130,7 +159,7 @@ fn timeout(seconds: f64) -> PyResult<Scope> {
 /// `porto.move_on_after(seconds)`: a scope whose block is cancelled `seconds` after it was
 /// entered, and which then goes on quietly (`timed_out` tells).
 #[pyfunction]
-#[pyo3(signature = (seconds, /))]
+#[pyo3(signature = (seconds))]
 fn move_on_after(seconds: f64) -> PyResult<Scope> {
     let seconds = scope_deadline::seconds("porto.move_on_after()", "seconds", seconds)?;
     Ok(Scope::new(Some(seconds), None, false))
@@ -158,6 +187,59 @@ pub struct Scope {
     /// of a group: the hidden scope of `Scope.start` (15 §3), whose child's exception must
     /// reach the caller of `start` bare.
     bare_error: bool,
+    /// The name `porto.scope(name=)` gave, `None` for an unnamed scope.
+    name: Option<Py<PyString>>,
+    /// The tasks spawned into the scope that may still run (`Scope.tasks`).
+    children: FastMutex<Children>,
+}
+
+/// The handles of a scope's children, for `Scope.tasks`. A task is taken out lazily: spawning
+/// drops the ended ones once the list has grown to four times what the last compaction kept
+/// (at least 256), so a scope that spawns a million short tasks one after another keeps a few
+/// hundred handles, an exit drops them all, and a scope with 10k live tasks is scanned a
+/// handful of times, not at every spawn (porto-szb.43 measured the cost).
+struct Children {
+    tasks: Vec<Py<Task>>,
+    /// Compact at this length.
+    compact_at: usize,
+}
+
+impl Children {
+    const COMPACT_MIN: usize = 256;
+
+    const fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            compact_at: Self::COMPACT_MIN,
+        }
+    }
+
+    /// Adds `task`, compacting first if the list reached its limit. Returns the handles taken
+    /// out, to be dropped by the caller after it released the lock (dropping one may run Python
+    /// code).
+    fn push(&mut self, task: Py<Task>) -> Vec<Py<Task>> {
+        let ended = if self.tasks.len() >= self.compact_at {
+            self.compact()
+        } else {
+            Vec::new()
+        };
+        self.tasks.push(task);
+        ended
+    }
+
+    /// Takes the ended handles out, keeping the others in order.
+    fn compact(&mut self) -> Vec<Py<Task>> {
+        let mut kept = 0;
+        for index in 0..self.tasks.len() {
+            if !self.tasks[index].get().has_ended() {
+                self.tasks.swap(kept, index);
+                kept += 1;
+            }
+        }
+        let ended = self.tasks.split_off(kept);
+        self.compact_at = Self::COMPACT_MIN.max(kept.saturating_mul(4));
+        ended
+    }
 }
 
 /// The bits of `Scope::flags`.
@@ -206,7 +288,12 @@ impl Scope {
     /// context, or in `context` itself; `name` names it (default: the function's
     /// `__qualname__`); `pin=True` keeps it on its lane, and without `pin` it is pinned if the
     /// spawning task is.
-    #[pyo3(signature = (coro_or_fn, /, *args, name=None, pin=None, context=None, **kwargs))]
+    // `**kwargs` is only there to refuse an unknown keyword with an error that says what to
+    // do; the signature shown (`inspect.signature`) is the one 20 gives.
+    #[pyo3(
+        signature = (coro_or_fn, /, *args, name=None, pin=None, context=None, **kwargs),
+        text_signature = "($self, coro_or_fn, /, *args, name=None, pin=None, context=None)"
+    )]
     fn spawn(
         &self,
         coro_or_fn: Bound<'_, PyAny>,
@@ -234,7 +321,10 @@ impl Scope {
     /// `nursery.start`). What the task raises before `set` is raised from `start` as it is,
     /// and cancelling the caller meanwhile cancels the task. Calls `fn` with keyword
     /// `started` only.
-    #[pyo3(signature = (fn_, /, *args, name=None, **kwargs))]
+    #[pyo3(
+        signature = (fn_, /, *args, name=None, **kwargs),
+        text_signature = "($self, fn, /, *args, name=None)"
+    )]
     fn start<'py>(
         slf: &Bound<'py, Self>,
         fn_: Bound<'py, PyAny>,
@@ -269,14 +359,15 @@ impl Scope {
     /// For `Scope.start`: the `Started` that will move a task into this scope. Raises what
     /// `spawn` raises for a scope tasks cannot be spawned into.
     #[pyo3(name = "_new_started")]
-    fn new_started(&self) -> PyResult<Started> {
+    fn new_started(slf: &Bound<'_, Self>) -> PyResult<Started> {
+        let this = slf.get();
         if !lane::is_active() {
             return Err(NoRuntimeError::new_err(
                 "porto: Scope.start() must be called from a task running under porto.run(); \
                  start the program with porto.run(main) and open the scope inside main",
             ));
         }
-        Ok(Started::new_for(self.open_node()?))
+        Ok(Started::new_for(this.open_node()?, slf.clone().unbind()))
     }
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -533,6 +624,35 @@ impl Scope {
             .map_or(0, |node| node.lock_state().waiter_count())
     }
 
+    /// The name `porto.scope(name=...)` gave, `""` for an unnamed scope, `"root"` for the root
+    /// scope.
+    #[getter]
+    fn name<'py>(&self, py: Python<'py>) -> Bound<'py, PyString> {
+        match &self.name {
+            Some(name) => name.bind(py).clone(),
+            None => PyString::intern(py, ""),
+        }
+    }
+
+    /// The tasks spawned into this scope that have not ended, in spawn order: a snapshot (a
+    /// tuple), taken now. Tasks of nested scopes are not listed, nor is a task `start()` has
+    /// not yet moved here (before `started.set`).
+    #[getter]
+    fn tasks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let (live, ended) = {
+            let mut children = self.children.lock();
+            let ended = children.compact();
+            let live: Vec<Py<Task>> = children
+                .tasks
+                .iter()
+                .map(|task| task.clone_ref(py))
+                .collect();
+            (live, ended)
+        };
+        drop(ended);
+        PyTuple::new(py, live)
+    }
+
     fn __repr__(&self) -> String {
         let phase = match self.phase() {
             Phase::New => "new",
@@ -564,13 +684,31 @@ impl Scope {
             state.live_children
         )
     }
+    // A child's outcome may reference the scope again (an exception's traceback reaches the
+    // frame that holds `s`): let the cycle collector see through the list of children.
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        // Never block in the collector; a held lock means a spawn or an exit is in progress.
+        let Some(children) = self.children.try_lock() else {
+            return Ok(());
+        };
+        for task in &children.tasks {
+            visit.call(task)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&self) {
+        let listed = std::mem::take(&mut self.children.lock().tasks);
+        drop(listed);
+    }
 }
 
 impl Scope {
     /// The `Scope` of a runtime's root scope, `node` (C12): open from the start, entered by no
     /// task. `porto.run` closes it once its children are done.
-    pub(crate) fn root(node: PyScopeRef) -> Self {
-        let scope = Self::new(None, None, false);
+    pub(crate) fn root(py: Python<'_>, node: PyScopeRef) -> Self {
+        let mut scope = Self::new(None, None, false);
+        scope.name = Some(PyString::intern(py, "root").unbind());
         let _unset = scope.node.set(node);
         scope
             .flags
@@ -595,7 +733,15 @@ impl Scope {
             deadline: ScopeDeadline::new(timeout, deadline),
             raise_on_timeout,
             bare_error: false,
+            name: None,
+            children: FastMutex::new(Children::new()),
         }
+    }
+
+    /// Gives the scope its name, if any.
+    fn named(mut self, name: Option<Py<PyString>>) -> Self {
+        self.name = name;
+        self
     }
 
     /// A scope whose exit raises a single failure bare, see `bare_error`.
@@ -633,7 +779,14 @@ impl Scope {
             Some(context) => pytask::spawn_in_context(&handle, coro, context.unbind(), spawned)?,
         };
         task.get().bind(&body);
+        self.register_child(task.clone_ref(py));
         Ok(task)
+    }
+
+    /// Lists `task` among the scope's children (`Scope.tasks`).
+    pub(crate) fn register_child(&self, task: Py<Task>) {
+        let ended = self.children.lock().push(task);
+        drop(ended);
     }
 
     /// The node of a scope that tasks can be spawned into: entered with `async with` and not
@@ -739,6 +892,10 @@ impl Scope {
     /// returns the children's failures.
     pub(crate) fn close(&self) -> Vec<Py<PyBaseException>> {
         self.flags.fetch_or(ScopeFlags::CLOSED, Ordering::AcqRel);
+        // Every child ended (C5), or the scope never ran: nothing is left to list. Dropped
+        // after the lock.
+        let listed = std::mem::take(&mut self.children.lock().tasks);
+        drop(listed);
         let Some(node) = self.node.get() else {
             return Vec::new();
         };
@@ -793,7 +950,13 @@ impl Scope {
         for error in errors {
             exceptions.append(error)?;
         }
-        Err(exception_group(py, "porto scope failed", &exceptions)?)
+        let message = match &self.name {
+            Some(name) if !name.bind(py).is_empty()? => {
+                format!("porto scope '{}' failed", name.bind(py).to_str()?)
+            }
+            _ => "porto scope failed".to_owned(),
+        };
+        Err(exception_group(py, &message, &exceptions)?)
     }
 }
 

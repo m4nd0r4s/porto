@@ -11,7 +11,7 @@ Underscore names are internal to porto: the trap protocol's awaitables
 """
 
 import contextvars
-from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterable
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterable, Sequence
 from types import TracebackType
 from typing import (
     Any,
@@ -122,6 +122,7 @@ def scope(
     timeout: float | None = None,
     deadline: float | None = None,
     shield: bool = False,
+    name: str | None = None,
     raise_on_timeout: bool = True,
 ) -> Scope:
     """A new scope; enter it with ``async with porto.scope() as s:``.
@@ -132,7 +133,8 @@ def scope(
     cancel cut the block short, or goes on quietly with ``raise_on_timeout=False``
     (``timed_out`` tells). 0 or less expires at once; ``inf`` never does; NaN raises
     ``ValueError``. ``shield=True`` keeps the cancels and deadlines of the scopes it is in out
-    of it (its own still count)."""
+    of it (its own still count). ``name`` names the scope (``Scope.name``, and the message of the
+    exception group its exit raises when children failed)."""
 
 def shield(*, timeout: float | None = None) -> Scope:
     """``porto.scope(shield=True, timeout=timeout)``: a scope the cancels and deadlines of the
@@ -146,11 +148,11 @@ def shield(*, timeout: float | None = None) -> Scope:
     A scope entered with ``with`` is a cancel scope only: spawning into it raises
     ``RuntimeError``."""
 
-def timeout(seconds: float, /) -> Scope:
+def timeout(seconds: float) -> Scope:
     """``porto.scope(timeout=seconds)``: the block raises ``TimeoutError`` if it is still running
     ``seconds`` after it was entered."""
 
-def move_on_after(seconds: float, /) -> Scope:
+def move_on_after(seconds: float) -> Scope:
     """``porto.scope(timeout=seconds, raise_on_timeout=False)``: the block is cancelled
     ``seconds`` after it was entered and the program goes on after it; ``timed_out`` tells
     whether it was cut short."""
@@ -219,6 +221,18 @@ class Scope:
     @property
     def cancel_called(self) -> bool:
         """Whether the scope was cancelled: ``cancel()`` was called, or a child failed."""
+
+    @property
+    def name(self) -> str:
+        """The name ``porto.scope(name=...)`` gave; ``""`` for an unnamed scope and ``"root"``
+        for the root scope. A named scope's failure group reads ``porto scope 'name' failed``."""
+
+    @property
+    def tasks(self) -> Sequence[Task[Any]]:
+        """A snapshot (a tuple) of the tasks spawned into this scope that have not ended, in
+        spawn order: those ``spawn`` returned, and those ``start`` moved here when they called
+        ``started.set``. Tasks of nested scopes are not listed. Empty before the block is
+        entered and once it exited."""
 
     @property
     def deadline(self) -> float:

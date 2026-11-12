@@ -87,7 +87,7 @@ fn run_in_root_scope(
     let (outcome, errors) = lane::run(py, config, |runtime| {
         // Owned by no task: nobody enters or exits it.
         let node = PyScopeNode::new_root(0);
-        let root = Py::new(py, Scope::root(node.clone()))?;
+        let root = Py::new(py, Scope::root(py, node.clone()))?;
         let _published = RootScope::publish(root.clone_ref(py));
         let task = Py::new(py, Task::new(Some(main.clone().unbind()), false))?;
         let spawned = Spawned::Child {

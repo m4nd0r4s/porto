@@ -127,6 +127,13 @@ impl Task {
         }
     }
 
+    /// Whether the task ended (its outcome is stored, or the task was freed unfinished), for
+    /// the scope's list of children to drop it.
+    #[inline]
+    pub(crate) fn has_ended(&self) -> bool {
+        self.body.load(Ordering::Acquire) == ENDED
+    }
+
     /// Whether `Task.cancel()` was called.
     #[inline]
     pub(crate) fn cancel_requested(&self) -> bool {

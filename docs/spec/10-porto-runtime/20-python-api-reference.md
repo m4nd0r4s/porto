@@ -65,7 +65,7 @@ class Scope:   # async context manager (and sync CM for shield-only usage)
     def spawn[*Ts, T](self, coro_or_fn: Coroutine[Any, Any, T] | Callable[[*Ts], Awaitable[T]], /, *args: *Ts,
                  name: str | None = None, pin: bool | None = None,
                  context: contextvars.Context | None = None) -> Task[T]
-    async def start[T](self, fn: Callable[..., Awaitable[Any]], *args: Any, name: str | None = None) -> T
+    async def start[T](self, fn: Callable[..., Awaitable[Any]], /, *args: Any, name: str | None = None) -> T
     def cancel(self, reason: str | None = None) -> None
     deadline: float          # read/write; inf if none
     shield: bool             # read/write
@@ -76,7 +76,7 @@ class Scope:   # async context manager (and sync CM for shield-only usage)
     @property tasks: Sequence[Task[Any]]    # live children snapshot
 
 class Started[T]:                        # made by Scope.start, not by you
-    def set(self, value: T = None) -> None   # once, from the started task; RuntimeError twice, from another task, or into a closed scope (15 §3)
+    def set(self, value: T = None, /) -> None   # once, from the started task; RuntimeError twice, from another task, or into a closed scope (15 §3)
 
 class Task[T]:     # awaitable
     id: int; name: str
@@ -88,6 +88,8 @@ class Task[T]:     # awaitable
     @property lane(self) -> int | None; @property pinned(self) -> bool   # lane: the lane it last ran on, None once finished
 def current_task() -> Task[Any]          # NoRuntimeError outside a task; the object spawn returned
 ```
+
+`Scope.name` is the `name=` that `porto.scope` was given, `""` for an unnamed scope and `"root"` for the root scope; it names the scope in the failure group (15 C4). `Scope.tasks` is a snapshot (a tuple, in spawn order) of the tasks spawned into the scope that have not ended: those `spawn` returned and those `start` moved in with `started.set`. Tasks of nested scopes are not listed, and neither is the task that opened the scope (nor `main`, for the root scope). It is empty before the block is entered and after it exited. `Scope.cancel(reason)` takes the reason for the scope's repr; `reason` must be a `str` or `None`. `deadline` and `shield` are the only attributes with a setter. `porto.timeout` and `porto.move_on_after` take `seconds` positionally or by keyword.
 
 `Scope.spawn` passes only positional arguments to the function (a keyword it does not take raises `TypeError` naming `functools.partial`). `name` names the task (`Task.name`, shown in its repr); without it the task is named after the `__qualname__` of the function or coroutine it runs. `pin=True` pins the task to its lane, `pin=False` does not, and `pin=None` inherits the pinning of the spawning task (pinning is inherited by the subtree, 03). `context` runs the task in that `contextvars.Context` itself, shared with whoever else uses it; without it the task runs in a copy of the current context (11 §8). An option of the wrong type raises `TypeError` that says what to pass.
 

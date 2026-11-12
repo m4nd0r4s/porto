@@ -31,6 +31,8 @@ use crate::driver::step;
 pub struct Started {
     /// The scope `start` was called on: where `set` moves the task.
     target: PyScopeRef,
+    /// The `Scope` object of `target`, which lists the task among its children once it reports.
+    target_scope: Py<Scope>,
     /// The hidden scope the task runs in until it reports, set by `start` before it spawns.
     hidden: SetOnce<PyScopeNode>,
     /// `set` was called (and took effect, or is taking effect).
@@ -41,9 +43,10 @@ pub struct Started {
 
 impl Started {
     /// A `Started` that moves its task into `target`.
-    pub(super) fn new_for(target: PyScopeRef) -> Self {
+    pub(super) fn new_for(target: PyScopeRef, target_scope: Py<Scope>) -> Self {
         Self {
             target,
+            target_scope,
             hidden: SetOnce::new(),
             called: AtomicBool::new(false),
             value: Mutex::new(None),
@@ -89,6 +92,10 @@ impl Started {
             self.called.store(false, Ordering::Release);
             drop(value);
             return Err(error);
+        }
+        // `Scope.tasks` of the target lists it from now on.
+        if let Some(task) = step::current_task(py)? {
+            self.target_scope.get().register_child(task);
         }
         Ok(())
     }
@@ -146,6 +153,7 @@ impl Started {
     // The value may reference the `Started` again (a task that hands out what holds it): let
     // the cycle collector see through it.
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        visit.call(&self.target_scope)?;
         // Never block in the collector.
         let Some(value) = self.value.try_lock() else {
             return Ok(());
