@@ -21,12 +21,10 @@ use parking_lot::{Mutex, MutexGuard};
 use porto_core::scope::CancelReason;
 use porto_core::task::{Header, TaskBodyRef};
 use pyo3::exceptions::PyBaseException;
-use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyString, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
-use super::scope_children::{ChildList, unlink};
 use super::time::require_lane;
 use crate::driver::pytask::{PyScopeNode, PyScopeRef, PyTask, TaskOutcome, shut_down_error};
 use crate::driver::step;
@@ -114,13 +112,6 @@ pub struct Task {
     /// none. Still set when the task returns normally: the cancellation was swallowed. Written
     /// by the task's own lane at its cold paths, read when it ends.
     swallowed: AtomicU64,
-    /// The list of the scope this task is listed in for `Scope.tasks`, null if none
-    /// (`scope_children`), the neighbours in that list, and the Python object around this
-    /// struct (for a snapshot). All change under that list's lock.
-    home: AtomicPtr<ChildList>,
-    prev: AtomicPtr<Task>,
-    next: AtomicPtr<Task>,
-    object: AtomicPtr<ffi::PyObject>,
 }
 
 impl Task {
@@ -139,10 +130,6 @@ impl Task {
             pinned,
             cancel_requested: AtomicBool::new(false),
             swallowed: AtomicU64::new(0),
-            home: AtomicPtr::new(ptr::null_mut()),
-            prev: AtomicPtr::new(ptr::null_mut()),
-            next: AtomicPtr::new(ptr::null_mut()),
-            object: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -170,59 +157,6 @@ impl Task {
     #[inline]
     pub(crate) fn swallow_pending(&self) -> bool {
         self.swallowed.load(Ordering::Relaxed) != 0
-    }
-
-    /// The task's id, for ordering a scope's tasks in a snapshot.
-    pub(super) fn task_id(&self) -> u64 {
-        self.id.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn home(&self) -> *mut ChildList {
-        self.home.load(Ordering::SeqCst)
-    }
-
-    pub(super) fn is_listed(&self) -> bool {
-        !self.home.load(Ordering::Relaxed).is_null()
-    }
-
-    pub(super) fn set_home(&self, home: *mut ChildList) {
-        self.home.store(home, Ordering::SeqCst);
-    }
-
-    pub(super) fn prev(&self) -> *const Task {
-        self.prev.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn next(&self) -> *const Task {
-        self.next.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn set_prev(&self, prev: *const Task) {
-        self.prev.store(prev.cast_mut(), Ordering::Relaxed);
-    }
-
-    pub(super) fn set_next(&self, next: *const Task) {
-        self.next.store(next.cast_mut(), Ordering::Relaxed);
-    }
-
-    pub(super) fn set_links(&self, prev: *const Task, next: *const Task) {
-        self.set_prev(prev);
-        self.set_next(next);
-    }
-
-    pub(super) fn set_object(&self, object: *mut ffi::PyObject) {
-        self.object.store(object, Ordering::Relaxed);
-    }
-
-    pub(super) fn object(&self) -> *mut ffi::PyObject {
-        self.object.load(Ordering::Relaxed)
-    }
-
-    /// Whether the task ended (its outcome is stored, or the task was freed unfinished).
-    #[inline]
-    pub(crate) fn has_ended(&self) -> bool {
-        // SeqCst: it pairs with `finish`'s store in a store-then-load pattern (scope_children).
-        self.body.load(Ordering::SeqCst) == ENDED
     }
 
     /// Whether `Task.cancel()` was called.
@@ -317,9 +251,6 @@ impl Task {
         let implicit = inner.implicit.take();
         let previous = inner.outcome.replace(outcome);
         drop(inner);
-        // Off its scope's list before anything else can free the handle: the list holds no
-        // reference (scope_children).
-        unlink(self);
         drop(previous);
         drop(implicit);
     }

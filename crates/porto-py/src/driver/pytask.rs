@@ -539,6 +539,17 @@ impl PyTask {
         unsafe { (*task.as_ptr()).timing.as_deref().copied() }
     }
 
+    /// The `porto.Task` the body holds, borrowed; null if it has none.
+    ///
+    /// # Safety
+    /// `task` points at a live body that is not being polled (read from its lane, between
+    /// polls); the pointer is only good while the body keeps the handle.
+    pub(crate) unsafe fn handle_ptr(task: NonNull<Self>) -> *mut ffi::PyObject {
+        // SAFETY: the caller's contract; the field is read alone, not through a `&PyTask`.
+        unsafe { (*task.as_ptr()).py_handle.as_ref() }
+            .map_or(std::ptr::null_mut(), |handle| handle.as_ptr())
+    }
+
     /// The steps the task ran so far.
     ///
     /// # Safety

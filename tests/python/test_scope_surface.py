@@ -448,6 +448,65 @@ def test_tasks_stays_exact_when_a_scope_spawns_many_short_tasks_in_turn() -> Non
     porto.run(main)
 
 
+def test_a_child_reading_tasks_sees_itself_and_its_siblings() -> None:
+    """The reader is the task running now: the registry walk reads it through the step driver."""
+
+    async def main() -> None:
+        release: list[bool] = []
+        seen: list[tuple[porto.Task[None], ...]] = []
+
+        async def reader(s: porto.Scope) -> None:
+            seen.append(s.tasks)
+
+        async with porto.scope() as s:
+            sibling = s.spawn(_hold, release)
+            me = s.spawn(reader, s)
+            await me
+            release.append(True)
+        (listed,) = seen
+        assert listed == (sibling, me)
+
+    porto.run(main)
+
+
+def test_tasks_does_not_list_a_task_without_a_handle_or_in_no_scope() -> None:
+    async def main() -> None:
+        release: list[bool] = []
+        async with porto.scope() as s:
+            # An internal spawn has no `porto.Task`, and `main` is no scope's child.
+            hidden = _core._spawn_joinable(_hold(release))  # pyright: ignore[reportPrivateUsage]
+            listed = s.spawn(_hold, release)
+            assert s.tasks == (listed,)
+            release.append(True)
+            await hidden.join()
+
+    porto.run(main)
+
+
+def test_tasks_of_an_open_scope_cannot_be_read_off_the_lane() -> None:
+    import threading
+
+    async def main() -> None:
+        errors: list[BaseException] = []
+        async with porto.scope() as s:
+            s.spawn(porto.sleep, 0.001)
+
+            def other_thread() -> None:
+                try:
+                    s.tasks  # noqa: B018
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=other_thread)
+            thread.start()
+            thread.join()
+        assert len(errors) == 1
+        assert isinstance(errors[0], porto.NoRuntimeError)
+        assert "porto.run()" in str(errors[0])
+
+    porto.run(main)
+
+
 def test_a_task_that_outlives_its_scope_object_is_unlisted_safely() -> None:
     """The root scope is closed with abandoned tasks still running: they end afterwards."""
     import gc

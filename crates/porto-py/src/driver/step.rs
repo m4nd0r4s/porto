@@ -241,6 +241,13 @@ pub(crate) fn is_running(header: &Header) -> bool {
     })
 }
 
+/// The `porto.Task` of the running task if `header` is its header: `Some(null)` if it has none
+/// (this never makes one), `None` if another task runs or none does. Borrowed.
+pub(crate) fn running_handle_of(header: &Header) -> Option<*mut ffi::PyObject> {
+    let running = running()?;
+    ptr::eq(running.header, header).then(|| running.handle.get())
+}
+
 /// Whether the task running on this thread is pinned (its header's `PIN` flag): what a task it
 /// spawns inherits when the spawn does not say (spec 03: pinning is inherited by the subtree).
 /// `false` outside a task.

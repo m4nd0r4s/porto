@@ -37,8 +37,8 @@
 //! `Scope.name` is the name `porto.scope(name=)` gave (`""` for none, `"root"` for the root
 //! scope); it names the scope in the exception group its exit raises. `Scope.tasks` is a
 //! snapshot of the tasks spawned into it (`Scope.spawn`, or moved in by `started.set`) that
-//! have not ended: the scope lists them (`scope_children`) and a task takes itself off when it
-//! ends.
+//! have not ended: it is derived from the lane's task registry (`scope_tasks`), so a scope keeps
+//! no list of its own and spawning and exiting pay nothing for it.
 //!
 //! Not yet: spawning from other lanes or threads (C10).
 
@@ -57,10 +57,10 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
 
 use super::run::{closing_on_error, coroutine_from};
-use super::scope_children::ChildList;
 use super::scope_deadline::{self, ScopeDeadline, seconds};
 use super::scope_exit;
 use super::scope_exit::ScopeExit;
+use super::scope_tasks::scope_tasks;
 use super::started::Started;
 use super::task::Task;
 use crate::async_slots;
@@ -201,8 +201,6 @@ pub struct Scope {
     bare_error: bool,
     /// The name `porto.scope(name=)` gave, `None` for an unnamed scope.
     name: Option<Py<PyString>>,
-    /// The tasks spawned into the scope that may still run (`Scope.tasks`).
-    children: ChildList,
 }
 
 /// The bits of `Scope::flags`.
@@ -330,7 +328,7 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         }
-        Ok(Started::new_for(this.open_node()?, slf.clone().unbind()))
+        Ok(Started::new_for(this.open_node()?))
     }
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -602,7 +600,11 @@ impl Scope {
     /// not yet moved here (before `started.set`).
     #[getter]
     fn tasks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.children.snapshot(py))
+        // Not entered, or closed (every child ended, C5): nothing to list.
+        let (Phase::Open, Some(node)) = (self.phase(), self.node.get_arc()) else {
+            return Ok(PyTuple::empty(py));
+        };
+        scope_tasks(py, &node)
     }
 
     fn __repr__(&self) -> String {
@@ -669,7 +671,6 @@ impl Scope {
             raise_on_timeout,
             bare_error: false,
             name: None,
-            children: ChildList::new(),
         }
     }
 
@@ -714,13 +715,7 @@ impl Scope {
             Some(context) => pytask::spawn_in_context(&handle, coro, context.unbind(), spawned)?,
         };
         task.get().bind(&body);
-        self.register_child(task.bind(py));
         Ok(task)
-    }
-
-    /// Lists `task` among the scope's children (`Scope.tasks`).
-    pub(crate) fn register_child(&self, task: &Bound<'_, Task>) {
-        self.children.register(task);
     }
 
     /// The node of a scope that tasks can be spawned into: entered with `async with` and not
@@ -826,9 +821,6 @@ impl Scope {
     /// returns the children's failures.
     pub(crate) fn close(&self) -> Vec<Py<PyBaseException>> {
         self.flags.fetch_or(ScopeFlags::CLOSED, Ordering::AcqRel);
-        // Every child ended (C5), or the scope never ran: nothing is left to list, and the
-        // tasks of a root scope abandoned at shutdown must not point at the list any more.
-        self.children.detach_all();
         let Some(node) = self.node.get() else {
             return Vec::new();
         };
