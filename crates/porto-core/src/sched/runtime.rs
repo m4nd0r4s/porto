@@ -284,7 +284,16 @@ impl Drop for Runtime {
         // so a job that completes wakes its awaiter on to this lane's queue, and what it hands
         // back for release is run below, on this thread, not dropped by the worker.
         shared.blocking.close();
-        shared.blocking.shutdown();
+        // Through the park hook, as every wait of the lane thread: a Python lane detaches its
+        // thread state meanwhile, which a worker needs to finish a Python job (it takes the
+        // interpreter back as the job returns) and to delete its own thread state.
+        let mut wait_for_workers = || {
+            shared.blocking.shutdown();
+        };
+        match &self.lane.park_hook {
+            Some(hook) => hook.around_park(&mut wait_for_workers),
+            None => wait_for_workers(),
+        }
         // Dropping a queue entry cancels its task and drops its future, whose destructor may
         // wake other tasks; with the injector closed (and no lane entered), those wakes cancel
         // their task instead of queueing it. Deferred work still runs here, on the thread

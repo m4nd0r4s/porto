@@ -412,3 +412,176 @@ fn jobs_can_use_the_blocking_methods_of_the_sync_primitives() {
     });
     assert!(*seen.lock().unwrap());
 }
+
+mod pool_accounting {
+    //! The pool's thread-exhaustion path and its hooks, on a `Pool` of its own with a thread
+    //! start that fails on demand.
+
+    use std::io;
+    use std::sync::Barrier;
+
+    use super::*;
+    use crate::blocking::pool::{Job, Pool, PoolConfig, SubmitError};
+
+    /// Records that it ran or was dropped unrun.
+    struct Probe {
+        ran: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        did_run: bool,
+    }
+
+    impl Probe {
+        fn new(ran: &Arc<AtomicUsize>, dropped: &Arc<AtomicUsize>) -> Self {
+            Self {
+                ran: ran.clone(),
+                dropped: dropped.clone(),
+                did_run: false,
+            }
+        }
+    }
+
+    impl Job for Probe {
+        fn run(mut self) {
+            self.did_run = true;
+            self.ran.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            if !self.did_run {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn pool(max_threads: usize, hooks: Option<Arc<dyn WorkerHooks>>) -> Arc<Pool<Probe>> {
+        Pool::new(PoolConfig {
+            max_threads,
+            keepalive: Duration::from_secs(10),
+            hooks,
+        })
+    }
+
+    fn refuse_threads(pool: &Pool<Probe>) {
+        *pool.spawn_override.lock().unwrap() =
+            Some(Arc::new(|| Err(io::Error::other("no threads left"))));
+    }
+
+    #[test]
+    fn a_job_whose_thread_cannot_start_goes_back_to_its_submitter_and_nothing_stays_queued() {
+        let (ran, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pool = pool(4, None);
+        refuse_threads(&pool);
+        let error = Pool::submit(&pool, Probe::new(&ran, &dropped)).expect_err("no thread");
+        assert!(matches!(error, SubmitError::NoThread(..)));
+        drop(error);
+        let stats = pool.stats();
+        assert_eq!((stats.threads, stats.queued), (0, 0));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "returned, then dropped");
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_start_leaves_the_job_queued_for_the_worker_that_is_alive() {
+        let (ran, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pool = pool(4, None);
+        Pool::submit(&pool, Probe::new(&ran, &dropped)).unwrap();
+        eventually("the first job to run", || ran.load(Ordering::SeqCst) == 1);
+        eventually("the worker to idle", || pool.stats().idle == 1);
+        // The worker is idle and alive: a job that needs a second thread, which cannot start,
+        // stays queued and the idle worker takes it.
+        refuse_threads(&pool);
+        for _ in 0..3 {
+            Pool::submit(&pool, Probe::new(&ran, &dropped)).expect("a worker is alive");
+        }
+        eventually("every job to run", || ran.load(Ordering::SeqCst) == 4);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        assert!(pool.shutdown(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn two_submitters_that_both_fail_leave_no_job_stranded() {
+        let (ran, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pool = pool(4, None);
+        // Both submitters queue their job and count a thread before either one's start
+        // fails: the second failure sees no worker and must clear what the first left.
+        let barrier = Arc::new(Barrier::new(2));
+        let at = barrier.clone();
+        *pool.spawn_override.lock().unwrap() = Some(Arc::new(move || {
+            at.wait();
+            Err(io::Error::other("no threads left"))
+        }));
+        let outcomes: Vec<_> = (0..2)
+            .map(|_| {
+                let (pool, ran, dropped) = (pool.clone(), ran.clone(), dropped.clone());
+                thread::spawn(move || Pool::submit(&pool, Probe::new(&ran, &dropped)).is_err())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|submitter| submitter.join().unwrap())
+            .collect();
+        assert!(
+            outcomes.iter().any(|&failed| failed),
+            "one hears of the failure"
+        );
+        let stats = pool.stats();
+        assert_eq!((stats.threads, stats.queued), (0, 0), "a job is stranded");
+        // Each job was returned (and dropped by the test) or cancelled: none is waiting.
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    struct PanickingHooks;
+
+    impl WorkerHooks for PanickingHooks {
+        fn thread_start(&self) -> Box<dyn Any> {
+            panic!("the hook failed");
+        }
+    }
+
+    #[test]
+    fn a_hook_that_panics_costs_the_worker_its_state_not_its_place_in_the_count() {
+        let (ran, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let pool = pool(1, Some(Arc::new(PanickingHooks)));
+        for _ in 0..3 {
+            Pool::submit(&pool, Probe::new(&ran, &dropped)).unwrap();
+        }
+        eventually("the jobs to run", || ran.load(Ordering::SeqCst) == 3);
+        assert!(pool.shutdown(Duration::from_secs(5)), "the worker left");
+        let stats = pool.stats();
+        assert_eq!((stats.threads, stats.idle, stats.queued), (0, 0, 0));
+    }
+
+    /// A hook whose value must be gone before the worker counts as left.
+    struct SlowTeardown(Arc<AtomicBool>);
+
+    struct TearDown(Arc<AtomicBool>);
+
+    impl Drop for TearDown {
+        fn drop(&mut self) {
+            thread::sleep(Duration::from_millis(100));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl WorkerHooks for SlowTeardown {
+        fn thread_start(&self) -> Box<dyn Any> {
+            Box::new(TearDown(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn shutdown_returns_only_after_the_workers_tore_down_their_thread_state() {
+        let (ran, dropped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let pool = pool(1, Some(Arc::new(SlowTeardown(torn_down.clone()))));
+        Pool::submit(&pool, Probe::new(&ran, &dropped)).unwrap();
+        eventually("the job to run", || ran.load(Ordering::SeqCst) == 1);
+        assert!(pool.shutdown(Duration::from_secs(5)));
+        assert!(
+            torn_down.load(Ordering::SeqCst),
+            "shutdown reported the worker gone while it was still tearing its state down"
+        );
+    }
+}

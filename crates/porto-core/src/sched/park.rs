@@ -21,6 +21,10 @@ use crate::sync::primitives::{AtomicUsize, Mutex, Thread};
 /// handing over to `park`: it could consume that token and the lane would sleep through the
 /// wake.
 ///
+/// The runtime also calls the hook around its wait for the blocking workers when it is dropped
+/// (`19-threads-and-blocking.md` §1): a wait of the lane thread like a park, which `park` stands
+/// for there.
+///
 /// [`Runtime::with_park_hook`]: super::Runtime::with_park_hook
 pub trait ParkHook: Send + 'static {
     /// Called on the lane thread instead of parking it. MUST call `park` once: it blocks until

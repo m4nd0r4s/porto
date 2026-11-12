@@ -11,8 +11,9 @@
 //! - **a worker** takes a job if there is one, else waits (counted idle) for a notify or for
 //!   `keepalive` to pass. On waking it stops counting itself idle and looks at the queue
 //!   again; it retires, leaving the thread count in the same critical section, only if the wait
-//!   timed out and the queue is empty. So a push after the retire sees the thread gone, and a
-//!   push before it is seen by the worker before it decides.
+//!   timed out and the queue is empty (`threads` drops there, and `alive`, which shutdown
+//!   waits for, only once the worker has torn its thread state down). So a push after the
+//!   retire sees the thread gone, and a push before it is seen by the worker before it decides.
 //! - **shutdown** closes the pool and takes the queue under the lock; workers see `closed` with
 //!   an empty queue and leave; the caller waits for the count to reach zero, up to its limit.
 //!
@@ -27,6 +28,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[cfg(all(loom, test))]
@@ -38,7 +40,7 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 #[cfg(not(all(loom, test)))]
 use std::thread;
 
-use crate::sync::primitives::Arc;
+use crate::sync::primitives::{Arc, AtomicBool};
 
 /// Something a worker runs once. Dropping it unrun cancels it.
 pub(crate) trait Job: Send + 'static {
@@ -95,9 +97,18 @@ impl<J> fmt::Debug for SubmitError<J> {
 }
 
 struct State<J> {
-    queue: VecDeque<J>,
-    /// Workers alive: counted when the thread is made, uncounted when it retires.
+    /// Queued jobs, each with the number `submit` gave it: a submit whose worker could not be
+    /// started takes back its own job by that number.
+    queue: VecDeque<(u64, J)>,
+    /// Numbers the jobs.
+    submitted: u64,
+    /// Workers that can take a job: counted when the thread is made, uncounted in the same
+    /// critical section in which it decides to leave (so a submit never counts on a worker that
+    /// is on its way out).
     threads: usize,
+    /// Worker threads that exist: `threads`, and those that decided to leave and are still
+    /// tearing down their per-thread state. What shutdown waits for.
+    alive: usize,
     /// Workers inside the condition wait.
     idle: usize,
     closed: bool,
@@ -112,7 +123,17 @@ pub(crate) struct Pool<J: Job> {
     /// `shutdown` waits here for the workers to leave.
     exited: Condvar,
     config: PoolConfig,
+    /// Set when a shutdown gave up waiting for the workers: they are detached, and must leave
+    /// Python alone (the interpreter may be finalizing) instead of tearing their state down.
+    abandoned: AtomicBool,
+    /// Makes `start_worker` fail or stall, for tests of the thread-exhaustion path.
+    #[cfg(test)]
+    pub(crate) spawn_override: std::sync::Mutex<Option<SpawnOverride>>,
 }
+
+/// What a test makes of a thread start: its result.
+#[cfg(test)]
+pub(crate) type SpawnOverride = std::sync::Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 impl<J: Job> Pool<J> {
     pub(crate) fn new(config: PoolConfig) -> Arc<Self> {
@@ -120,7 +141,9 @@ impl<J: Job> Pool<J> {
         Arc::new(Self {
             state: Mutex::new(State {
                 queue: VecDeque::new(),
+                submitted: 0,
                 threads: 0,
+                alive: 0,
                 idle: 0,
                 closed: false,
                 spawned: 0,
@@ -128,6 +151,9 @@ impl<J: Job> Pool<J> {
             work: Condvar::new(),
             exited: Condvar::new(),
             config,
+            abandoned: AtomicBool::new(false),
+            #[cfg(test)]
+            spawn_override: std::sync::Mutex::new(None),
         })
     }
 
@@ -154,7 +180,9 @@ impl<J: Job> Pool<J> {
         if state.closed {
             return Err(SubmitError::Closed(job));
         }
-        state.queue.push_back(job);
+        state.submitted += 1;
+        let id = state.submitted;
+        state.queue.push_back((id, job));
         if state.queue.len() <= state.idle || state.threads >= this.config.max_threads {
             // The idle workers can take everything queued, or no thread may be added: the
             // workers pick the queue up as they finish. Waking one is harmless when none waits.
@@ -163,27 +191,53 @@ impl<J: Job> Pool<J> {
             return Ok(());
         }
         state.threads += 1;
+        state.alive += 1;
         state.spawned += 1;
         let number = state.spawned;
         drop(state);
-        match Self::start_worker(this, number) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let mut state = this.lock();
-                state.threads -= 1;
-                // With another worker alive the job still runs (it was queued before the
-                // attempt); with none it would wait forever, so it goes back to the caller.
-                if state.threads == 0
-                    && let Some(job) = state.queue.pop_back()
-                {
-                    return Err(SubmitError::NoThread(job, error));
-                }
-                Ok(())
-            }
+        let Err(error) = Self::start_worker(this, number) else {
+            return Ok(());
+        };
+        let mut state = this.lock();
+        state.threads -= 1;
+        state.alive -= 1;
+        if state.threads > 0 {
+            // A worker is alive (or starting) and looks at the queue again before it leaves:
+            // the job runs when one is free.
+            return Ok(());
+        }
+        // No worker, and none can be started now: nothing would ever run a queued job. This
+        // submitter's own job goes back to it (unless it was run or cancelled meanwhile), and
+        // the jobs queued behind it, whose submitters already returned, are cancelled: they
+        // are dropped (outside the lock) and report a cancellation.
+        let own = state
+            .queue
+            .iter()
+            .position(|(queued, _)| *queued == id)
+            .and_then(|at| state.queue.remove(at))
+            .map(|(_, job)| job);
+        let stranded = std::mem::take(&mut state.queue);
+        drop(state);
+        drop(stranded);
+        match own {
+            Some(job) => Err(SubmitError::NoThread(job, error)),
+            None => Ok(()),
         }
     }
 
     fn start_worker(this: &Arc<Self>, number: u64) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            // Cloned out: the override may stall (a test holds two starts at a barrier).
+            let spawn = this
+                .spawn_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(spawn) = spawn {
+                return spawn();
+            }
+        }
         let pool = this.clone();
         let builder = thread::Builder::new();
         #[cfg(not(all(loom, test)))]
@@ -195,11 +249,16 @@ impl<J: Job> Pool<J> {
     }
 
     fn work_loop(this: &Arc<Self>) {
-        // Created here and dropped here, as the thread exits (after the last job).
-        let _thread_state = this.config.hooks.as_ref().map(|hooks| hooks.thread_start());
+        // A hook that panics leaves the thread without its per-thread state, which a job that
+        // needs one makes for itself (a Python job attaches through `PyGILState_Ensure`): the
+        // worker must still count itself out when it leaves, or its jobs wait forever.
+        let thread_state =
+            this.config.hooks.as_ref().and_then(|hooks| {
+                panic::catch_unwind(AssertUnwindSafe(|| hooks.thread_start())).ok()
+            });
         let mut state = this.lock();
         loop {
-            if let Some(job) = state.queue.pop_front() {
+            if let Some((_, job)) = state.queue.pop_front() {
                 drop(state);
                 // A panic in a job must not take the worker with it: a spawn_blocking job
                 // reports it through its join handle, and a detached one has no reader.
@@ -218,8 +277,28 @@ impl<J: Job> Pool<J> {
                 break;
             }
         }
+        // Out of the count in the critical section that decided it: a job submitted from here
+        // on sees no worker here and gets a thread of its own.
         state.threads -= 1;
-        let last = state.threads == 0;
+        drop(state);
+        // The per-thread state goes before the worker counts as gone for shutdown (`alive`): a
+        // shutdown that sees no worker left must not have one still tearing its thread state down (the Python
+        // bindings take the interpreter back for that, and may be finalizing it next). A
+        // shutdown that gave up waiting (the thread was detached) leaves the state alone and
+        // leaks it: finalization deletes it, and touching it from a detached thread would race
+        // that. What stays possible is a worker that began the teardown before the shutdown gave
+        // up and is then blocked on the interpreter; the hook's own drop skips Python once
+        // the interpreter is finalizing.
+        if let Some(thread_state) = thread_state {
+            if this.abandoned.load(Ordering::Acquire) {
+                std::mem::forget(thread_state);
+            } else {
+                drop(panic::catch_unwind(AssertUnwindSafe(|| drop(thread_state))));
+            }
+        }
+        let mut state = this.lock();
+        state.alive -= 1;
+        let last = state.alive == 0;
         drop(state);
         if last {
             this.exited.notify_all();
@@ -271,9 +350,14 @@ impl<J: Job> Pool<J> {
         let state = self.lock();
         let (state, _) = self
             .exited
-            .wait_timeout_while(state, wait, |state| state.threads > 0)
+            .wait_timeout_while(state, wait, |state| state.alive > 0)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.threads == 0
+        let all_left = state.alive == 0;
+        if !all_left {
+            // Set under the lock a leaving worker takes after its check: see `work_loop`.
+            self.abandoned.store(true, Ordering::Release);
+        }
+        all_left
     }
 
     /// loom has no clock: waits for the workers without a limit.
@@ -281,7 +365,7 @@ impl<J: Job> Pool<J> {
     pub(crate) fn shutdown(&self, _wait: Duration) -> bool {
         drop(self.close());
         let mut state = self.lock();
-        while state.threads > 0 {
+        while state.alive > 0 {
             state = self
                 .exited
                 .wait(state)
@@ -297,7 +381,7 @@ impl<J: Job> Pool<J> {
         let queued = std::mem::take(&mut state.queue);
         drop(state);
         self.work.notify_all();
-        queued
+        queued.into_iter().map(|(_, job)| job).collect()
     }
 }
 

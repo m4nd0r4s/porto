@@ -46,7 +46,7 @@ pub(crate) struct Lane {
     pub(crate) handle: Handle,
     pub(crate) local: RefCell<VecDeque<Notified>>,
     tick: Cell<u32>,
-    park_hook: Option<Box<dyn ParkHook>>,
+    pub(crate) park_hook: Option<Box<dyn ParkHook>>,
     /// The budget each task poll starts with (`crate::coop`).
     coop_budget: u32,
 }

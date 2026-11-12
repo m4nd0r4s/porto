@@ -282,6 +282,27 @@ def test_cancellable_raises_at_once_and_the_job_runs_on_with_its_result_discarde
     assert Result.released_on == [lane]
 
 
+def test_run_waits_for_a_running_job_without_holding_the_interpreter_from_it() -> None:
+    # The run ends while a job still sleeps: the pool's shutdown waits for it, and the lane
+    # thread must have let go of the interpreter meanwhile, or the job cannot finish after its
+    # sleep (it takes the interpreter back as it returns) and the wait runs out its second.
+    finished = threading.Event()
+
+    def job() -> None:
+        time.sleep(0.2)
+        finished.set()
+
+    async def main() -> None:
+        with porto.move_on_after(0.02):
+            await porto.to_thread(job, cancellable=True)
+
+    started = time.monotonic()
+    porto.run(main)
+    elapsed = time.monotonic() - started
+    assert finished.is_set(), "the run did not wait for the job it was told to leave running"
+    assert elapsed < 0.6, f"the shutdown waited out its second: {elapsed:.2f} s"
+
+
 def test_a_trap_that_is_never_awaited_starts_nothing() -> None:
     ran = threading.Event()
 
