@@ -437,12 +437,15 @@ class TcpStream:
         at the end of the stream."""
 
     def write(self, data: bytes | bytearray | memoryview | Buffer, /) -> Awaitable[None]:
-        """Sends all of ``data``, waiting while the socket's buffers are full."""
+        """Sends all of ``data``, waiting while the socket's buffers are full. If the task is
+        cancelled after part of it was sent, the stream is broken: later writes raise
+        ``porto.BrokenResourceError``; close it and connect again."""
 
     def writev(
         self, buffers: Iterable[bytes | bytearray | memoryview | Buffer], /
     ) -> Awaitable[None]:
-        """Sends all of ``buffers`` in order, with as few system calls as the OS allows."""
+        """Sends all of ``buffers`` in order, with as few system calls as the OS allows. Breaks
+        the stream when cancelled midway, like ``write``."""
 
     def shutdown_write(self) -> Awaitable[None]:
         """Half-close: the peer reads the end of the stream; this side can still read."""

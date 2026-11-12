@@ -456,6 +456,45 @@ def test_a_stream_of_a_run_on_another_thread_is_refused_at_the_call() -> None:
     assert "open the socket in the run that uses it" in refused[0]
 
 
+# A write cancelled after part of its data went out (13-io-driver.md §5)
+
+
+def test_a_write_cancelled_midway_breaks_the_stream() -> None:
+    payload = b"x" * (64 * 1024 * 1024)  # far more than the socket buffers hold
+
+    async def main() -> None:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            async with porto.move_on_after(0.05) as scope:
+                await client.write(payload)  # nobody reads: it waits, having sent a part
+            assert scope.timed_out
+            for call in (lambda: client.write(b"more"), lambda: client.writev([b"more"])):
+                with pytest.raises(porto.BrokenResourceError, match="close the stream") as caught:
+                    await call()
+                assert "left mid-write by a cancellation" in str(caught.value)
+            # Reading is unaffected, and so is the other side.
+            await server.write(b"reply")
+            assert await read_exactly(client, 5) == b"reply"
+            await client.aclose()
+
+    run(main())
+
+
+def test_a_vectored_write_cancelled_midway_breaks_the_stream() -> None:
+    buffers = [b"y" * (4 * 1024 * 1024)] * 16
+
+    async def main() -> None:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            async with porto.move_on_after(0.05) as scope:
+                await client.writev(buffers)
+            assert scope.timed_out
+            with pytest.raises(porto.BrokenResourceError, match="close the stream"):
+                await client.write(b"more")
+
+    run(main())
+
+
 def test_a_write_cancelled_before_it_sent_anything_leaves_the_stream_usable() -> None:
     async def main() -> bytes:
         client, server, listener = await connected()

@@ -1,8 +1,14 @@
 //! `porto.net.TcpStream` (17-networking-tls-dns.md §1.1): a connected TCP socket registered
 //! with the driver of the run that made it, whose methods return the awaitables of the
 //! [`IoOp`]s. It implements `porto.abc.ByteStream`.
+//!
+//! The stream keeps one fact of its own: whether a write was cancelled after it sent part of its
+//! data (13-io-driver.md §5). The bytes on the wire then stop in the middle of what the caller
+//! meant to send, so later writes raise `porto.BrokenResourceError` instead of continuing the
+//! message from the wrong place.
 
 use std::net::Shutdown;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -14,9 +20,10 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use super::raw_number;
 use crate::driver::ready::{ready, ready_none};
 use crate::driver::step;
+use crate::errors::BrokenResourceError;
 use crate::io::buffer_view::{PyBufferMut, PyBufferRef};
 use crate::io::handle::register_on_lane;
-use crate::io::op::{IoOp, IoRegistration, os_error, start_connect, submit};
+use crate::io::op::{IoOp, IoRegistration, MidWrite, os_error, start_connect, submit};
 use crate::io::sockaddr;
 
 /// The most bytes one `read` asks for by default.
@@ -26,6 +33,8 @@ const DEFAULT_MAX: i64 = 65536;
 #[pyclass(frozen, module = "porto.net", name = "TcpStream")]
 pub(crate) struct TcpStream {
     registration: Arc<IoRegistration>,
+    /// Set when a write was cancelled after sending part of its data.
+    mid_write: MidWrite,
     /// The peer's address, known when the stream was accepted, else read on first use.
     peer: OnceLock<SockAddr>,
     /// This end's address, read on first use.
@@ -38,6 +47,7 @@ impl TcpStream {
     pub(crate) fn adopt(_py: Python<'_>, socket: Socket, peer: Option<SockAddr>) -> PyResult<Self> {
         Ok(Self {
             registration: register_on_lane(socket, "a TcpStream")?,
+            mid_write: Arc::new(AtomicBool::new(false)),
             peer: peer.map_or_else(OnceLock::new, OnceLock::from),
             local: OnceLock::new(),
         })
@@ -45,6 +55,19 @@ impl TcpStream {
 
     fn submit(&self, py: Python<'_>, op: IoOp) -> PyResult<Py<PyAny>> {
         submit(py, &self.registration, op)
+    }
+
+    /// Raises `BrokenResourceError` if a cancelled write left the stream mid-message.
+    fn ensure_not_mid_write(&self) -> PyResult<()> {
+        if self.mid_write.load(Ordering::Acquire) {
+            return Err(BrokenResourceError::new_err(
+                "porto: this stream was left mid-write by a cancellation: a write was cancelled \
+                 after it had sent part of its data, so the bytes on the wire stop in the middle \
+                 of a message and anything written now would corrupt it; close the stream \
+                 (await stream.aclose()) and open a new connection",
+            ));
+        }
+        Ok(())
     }
 
     /// The address `read` caches: `known`, or what `lookup` returns the first time.
@@ -107,10 +130,18 @@ impl TcpStream {
     }
 
     /// Sends all of `data`, waiting while the socket's buffers are full: `None` once the last
-    /// byte went out.
+    /// byte went out. A cancellation after part of it was sent leaves the stream broken.
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let data = PyBufferRef::new(data, "write()'s data")?;
-        self.submit(py, IoOp::Write { data, off: 0 })
+        self.ensure_not_mid_write()?;
+        self.submit(
+            py,
+            IoOp::Write {
+                data,
+                off: 0,
+                mid_write: Some(Arc::clone(&self.mid_write)),
+            },
+        )
     }
 
     /// Sends all of `buffers` (an iterable of bytes-like objects) in order, with as few system
@@ -123,11 +154,13 @@ impl TcpStream {
                 &format!("writev()'s buffers[{index}]"),
             )?);
         }
+        self.ensure_not_mid_write()?;
         self.submit(
             py,
             IoOp::WriteV {
                 buffers: views,
                 written: 0,
+                mid_write: Some(Arc::clone(&self.mid_write)),
             },
         )
     }

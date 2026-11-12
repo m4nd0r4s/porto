@@ -13,6 +13,7 @@
 
 use std::io::{self, IoSlice};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use porto_io::{ClosedResource, Interest, Registration};
 use porto_net::tcp;
@@ -44,6 +45,10 @@ const SEND_FLAGS: std::ffi::c_int = 0x4000;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const SEND_FLAGS: std::ffi::c_int = 0;
 
+/// Whether a stream was left mid-write: set when a write ends after sending part of its data
+/// (13-io-driver.md §5), read by the stream's later writes.
+pub(crate) type MidWrite = Arc<AtomicBool>;
+
 /// The most buffers one vectored send hands the kernel (`IOV_MAX` is 1024 on Linux and macOS).
 const MAX_IOVECS: usize = 64;
 
@@ -55,12 +60,19 @@ pub(crate) enum IoOp {
     ReadBuffer { max: usize },
     /// Receive into a writable buffer → the number of bytes received.
     ReadInto { buf: PyBufferMut },
-    /// Send all of `data`, from `off` on → `None`. Sends what it can at each attempt.
-    Write { data: PyBufferRef, off: usize },
+    /// Send all of `data`, from `off` on → `None`. Sends what it can at each attempt. If it
+    /// ends having sent only part of `data` (it was cancelled), it sets `mid_write`.
+    Write {
+        data: PyBufferRef,
+        off: usize,
+        mid_write: Option<MidWrite>,
+    },
     /// Send all of `buffers`, from byte `written` on, in as few vectored sends as it can → `None`.
+    /// Sets `mid_write` like `Write`.
     WriteV {
         buffers: Vec<PyBufferRef>,
         written: usize,
+        mid_write: Option<MidWrite>,
     },
     /// Accept a connection → `(socket, address)`.
     Accept,
@@ -149,7 +161,7 @@ impl IoOp {
                 Ok(Completed::Buffer(bytes))
             }
             Self::ReadInto { buf } => socket.recv(buf.spare()).map(Completed::Count),
-            Self::Write { data, off } => {
+            Self::Write { data, off, .. } => {
                 let bytes = data.bytes();
                 while *off < bytes.len() {
                     match socket.send_with_flags(&bytes[*off..], SEND_FLAGS)? {
@@ -159,7 +171,9 @@ impl IoOp {
                 }
                 Ok(Completed::Done)
             }
-            Self::WriteV { buffers, written } => {
+            Self::WriteV {
+                buffers, written, ..
+            } => {
                 let total: usize = buffers.iter().map(|buffer| buffer.bytes().len()).sum();
                 while *written < total {
                     let mut skip = *written;
@@ -224,6 +238,33 @@ fn receive_buffer(max: usize) -> io::Result<Vec<u8>> {
         .try_reserve_exact(max)
         .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     Ok(bytes)
+}
+
+impl Drop for IoOp {
+    fn drop(&mut self) {
+        let (mid_write, sent, total) = match self {
+            Self::Write {
+                data,
+                off,
+                mid_write: Some(mid_write),
+            } => (mid_write, *off, data.bytes().len()),
+            Self::WriteV {
+                buffers,
+                written,
+                mid_write: Some(mid_write),
+            } => (
+                mid_write,
+                *written,
+                buffers.iter().map(|buffer| buffer.bytes().len()).sum(),
+            ),
+            _ => return,
+        };
+        // Part of the data went out and the rest never will: the stream's bytes now stop in
+        // the middle of what the caller meant to send.
+        if sent > 0 && sent < total {
+            mid_write.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl Completed {

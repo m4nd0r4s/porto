@@ -117,7 +117,14 @@ impl IoHandle {
     /// Sends all of `data`: `None` once the last byte went out.
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let data = PyBufferRef::new(data, "write()'s data")?;
-        self.submit(py, IoOp::Write { data, off: 0 })
+        self.submit(
+            py,
+            IoOp::Write {
+                data,
+                off: 0,
+                mid_write: None,
+            },
+        )
     }
 
     /// Accepts a connection: `(_IoHandle, address)`.

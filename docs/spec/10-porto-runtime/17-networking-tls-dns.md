@@ -41,6 +41,7 @@ await porto.net.serve_tcp(handler, host=None, port=0, *, tls=None,
 Details of the implemented subset:
 - `read(max)`, `read_buffer(max)` need `max >= 1` and `read_into(buf)` a non-empty buffer (`ValueError`): a receive of 0 bytes returns 0, which reads as the end of the stream. Cancelling a read loses no bytes (T3).
 - `write` and `writev` raise `TypeError` for anything that is not a bytes-like object, naming the argument (`writev()'s buffers[1]`); `writev` takes any iterable of them and sends with as few vectored system calls as the OS allows.
+- A `write`/`writev` cancelled after it sent part of its data leaves the stream broken: later writes raise `porto.BrokenResourceError` (message: the stream was left mid-write by a cancellation; close it and open a new connection). Reads and `aclose` still work (13 §5).
 - `shutdown_write` after which a `write` raises `BrokenPipeError`; a peer reset raises `ConnectionResetError` with `errno` (§5).
 - `aclose()` closes at once and is idempotent; it closes even when the calling task is cancelled. Operations waiting on the stream, and every later one, raise `porto.ClosedResourceError` (13 §4). `async with stream` calls it.
 - `TcpStream` is a `porto.abc.ByteStream`: a `runtime_checkable` `Protocol` of the methods the stream types share. It holds the methods above now; the buffered reads and `sendfile` join it with their beads.
