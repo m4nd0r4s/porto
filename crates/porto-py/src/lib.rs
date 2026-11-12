@@ -38,6 +38,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<Trap>()?;
     module.add_class::<Ready>()?;
+    module.add_class::<io::buffer::Buffer>()?;
     // The types exist now (`add_class` created them) and nothing outside this function can see
     // them yet, so this is the one point where their `am_send` slot can be set (see async_slots).
     async_slots::install_am_send::<Trap>(py, driver::trap::trap_am_send)?;

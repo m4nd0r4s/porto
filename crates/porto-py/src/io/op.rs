@@ -20,8 +20,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use socket2::{SockAddr, Socket};
 
+use super::buffer::Buffer;
 use super::buffer_view::{PyBufferMut, PyBufferRef};
 use super::handle::IoHandle;
+use super::pool::PooledBytes;
 use super::sockaddr;
 use crate::driver::pending::IoWait;
 use crate::driver::pytask::Resume;
@@ -43,6 +45,8 @@ const SEND_FLAGS: std::ffi::c_int = 0;
 pub(crate) enum IoOp {
     /// Receive at most `max` bytes → `bytes` (empty at end of stream).
     Read { max: usize },
+    /// Receive at most `max` bytes into a pooled buffer → `porto.Buffer` (no `bytes` copy).
+    ReadBuffer { max: usize },
     /// Receive into a writable buffer → the number of bytes received.
     ReadInto { buf: PyBufferMut },
     /// Send all of `data`, from `off` on → `None`. Sends what it can at each attempt.
@@ -65,6 +69,8 @@ pub(crate) enum IoOp {
 pub(crate) enum Completed {
     /// Bytes received.
     Bytes(Vec<u8>),
+    /// Bytes received into a pooled buffer.
+    Buffer(PooledBytes),
     /// A byte count.
     Count(usize),
     /// Nothing to return.
@@ -80,6 +86,7 @@ impl IoOp {
     pub(crate) fn interest(&self) -> Interest {
         match self {
             Self::Read { .. }
+            | Self::ReadBuffer { .. }
             | Self::ReadInto { .. }
             | Self::Accept
             | Self::RecvFrom { .. }
@@ -114,6 +121,14 @@ impl IoOp {
                 // SAFETY: `recv` initialized the first `received` bytes.
                 unsafe { bytes.set_len(received) };
                 Ok(Completed::Bytes(bytes))
+            }
+            Self::ReadBuffer { max } => {
+                let mut bytes = PooledBytes::with_capacity(*max)?;
+                let spare = &mut bytes.vec_mut().spare_capacity_mut()[..*max];
+                let received = socket.recv(spare)?;
+                // SAFETY: `recv` initialized the first `received` bytes.
+                unsafe { bytes.vec_mut().set_len(received) };
+                Ok(Completed::Buffer(bytes))
             }
             Self::ReadInto { buf } => socket.recv(buf.spare()).map(Completed::Count),
             Self::Write { data, off } => {
@@ -173,6 +188,7 @@ impl Completed {
     fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(match self {
             Self::Bytes(bytes) => PyBytes::new(py, &bytes).into_any().unbind(),
+            Self::Buffer(bytes) => Py::new(py, Buffer::from_pooled(bytes))?.into_any(),
             Self::Count(count) => count.into_pyobject(py)?.into_any().unbind(),
             Self::Done => py.None(),
             Self::Accepted(connection, address) => {

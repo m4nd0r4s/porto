@@ -207,3 +207,19 @@ def test_the_config_sample_runs() -> None:
 
 def test_the_sync_sample_runs() -> None:
     assert porto.run(sync_primitives) == 1
+
+
+def check_buffer_is_a_buffer() -> None:
+    buffer = porto.Buffer(16)
+    assert_type(len(buffer), int)
+    assert_type(buffer.capacity, int)
+    assert_type(bytes(buffer), bytes)
+    view = memoryview(buffer)
+    assert_type(view, memoryview)
+    view.release()
+    buffer.extend(b"more")
+    buffer.resize(4)
+
+
+def test_buffer_is_a_buffer() -> None:
+    check_buffer_is_a_buffer()

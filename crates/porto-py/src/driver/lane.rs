@@ -127,6 +127,8 @@ pub(crate) fn run<T>(
     // Python code that may reach the lane state again.
     let state = LANE.take();
     drop(state);
+    // The run's pooled buffers go with it (13-io-driver.md §6).
+    crate::io::pool::clear();
     Ok(output)
 }
 

@@ -141,3 +141,59 @@ impl PyBufferMut {
         unsafe { std::slice::from_raw_parts_mut(self.0.raw().buf.cast(), len) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pyo3::types::PyByteArray;
+
+    use super::*;
+
+    #[test]
+    fn a_view_pins_its_exporter_until_released_on_the_lane() {
+        Python::initialize();
+        Python::attach(|py| {
+            let array = PyByteArray::new(py, b"pinned");
+            let view = PyBufferRef::new(array.as_any(), "data").unwrap();
+            assert_eq!(view.bytes(), b"pinned");
+            assert!(array.resize(1).is_err(), "a viewed bytearray cannot resize");
+            drop(view);
+            array.resize(1).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_writable_view_receives_into_the_exporter() {
+        Python::initialize();
+        Python::attach(|py| {
+            let array = PyByteArray::new(py, b"....");
+            let mut view = PyBufferMut::new(array.as_any(), "buffer").unwrap();
+            view.spare()[0].write(b'!');
+            drop(view);
+            assert_eq!(array.to_vec(), b"!...");
+            let error = PyBufferMut::new(pyo3::types::PyBytes::new(py, b"x").as_any(), "buf")
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("writable bytes-like object"));
+        });
+    }
+
+    /// P1: a view held across a lane hop (dropped on a thread with no Python thread state)
+    /// trips the debug assertion instead of releasing it detached.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn releasing_a_view_off_a_python_lane_is_caught_in_debug_builds() {
+        Python::initialize();
+        Python::attach(|py| {
+            let array = PyByteArray::new(py, b"hop");
+            let view = PyBufferRef::new(array.as_any(), "data").unwrap();
+            let hopped = py.detach(|| std::thread::spawn(move || drop(view)).join());
+            let panic = hopped.expect_err("the release off the lane must be caught");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or_default();
+            assert!(message.contains("off a Python lane"), "{message}");
+        });
+    }
+}

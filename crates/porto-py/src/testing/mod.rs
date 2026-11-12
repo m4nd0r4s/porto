@@ -10,7 +10,8 @@
 //! - the error hooks of [`errors`];
 //! - the trap-kind hooks of `traps.rs`;
 //! - `_IoHandle`, a socket registered with the running lane's driver, whose methods are the
-//!   `Io` trap's operations (`crate::io`).
+//!   `Io` trap's operations (`crate::io`);
+//! - `_buffer_pool_stats()`: how this lane's buffer pool was used, per size class.
 
 use core::ffi::c_void;
 use core::ptr;
@@ -35,9 +36,30 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(send, module)?)?;
     module.add_function(wrap_pyfunction!(take_unnormalized_exception, module)?)?;
     module.add_function(wrap_pyfunction!(count_allocations, module)?)?;
+    module.add_function(wrap_pyfunction!(buffer_pool_stats, module)?)?;
     module.add_class::<crate::io::handle::IoHandle>()?;
     errors::register(module)?;
     traps::register(module)
+}
+
+/// This thread's buffer pool, one `(capacity, free, hits, misses, discarded)` tuple per size
+/// class, smallest first. Empty counts outside a run (the pool is cleared when a run ends).
+#[pyfunction(name = "_buffer_pool_stats")]
+fn buffer_pool_stats() -> Vec<(usize, usize, u64, u64, u64)> {
+    use crate::io::pool;
+    pool::SIZE_CLASSES
+        .iter()
+        .zip(pool::stats())
+        .map(|(&capacity, stats)| {
+            (
+                capacity,
+                stats.free,
+                stats.hits,
+                stats.misses,
+                stats.discarded,
+            )
+        })
+        .collect()
 }
 
 /// A `_Ready` holding `value`.

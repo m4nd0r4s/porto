@@ -23,6 +23,7 @@ from porto._channel import channel, unbounded_channel
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Barrier,
+    Buffer,
     CapacityLimiter,
     Condition,
     Event,
@@ -64,6 +65,7 @@ from porto.errors import (
 __all__ = [
     "Barrier",
     "BrokenResourceError",
+    "Buffer",
     "Cancelled",
     "CapacityLimiter",
     "ClosedResourceError",

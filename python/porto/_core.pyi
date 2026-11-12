@@ -3,7 +3,7 @@
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
 ``sleep_until``, ``sleep_forever``, ``checkpoint``, ``current_time``, ``monotonic``, ``Event``,
 ``Notify``, ``Lock``, ``Mutex``, ``MutexGuard``, ``Semaphore``, ``CapacityLimiter``, ``RwLock``,
-``Condition``, ``Barrier``, ``Sender``, ``Receiver`` and ``__version__``
+``Condition``, ``Barrier``, ``Sender``, ``Receiver``, ``Buffer`` and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -192,6 +192,34 @@ class Task(Generic[_T_co]):
         ``porto.RuntimeClosed`` if its runtime shut down first."""
 
 # Synchronization (16-sync-primitives-and-channels.md §1)
+
+@final
+class Buffer:
+    """A growable byte buffer owned by porto, readable and writable through the buffer protocol
+    (``memoryview(buf)``), its storage pooled per lane in size classes of 4, 16, 64 and 256 KiB
+    (13-io-driver.md §6). A socket read fills one without copying; ``bytes(buf)`` copies.
+
+    While a view is exported (a ``memoryview``, or an I/O operation using it) the buffer cannot
+    change size: ``resize`` and ``extend`` raise ``BufferError``."""
+
+    def __init__(self, size: int = 0, /) -> None:
+        """A buffer of ``size`` zero bytes."""
+
+    def __len__(self) -> int: ...
+    def __bytes__(self) -> bytes:
+        """A copy of the contents."""
+
+    def __buffer__(self, flags: int, /) -> memoryview: ...
+    def __release_buffer__(self, view: memoryview, /) -> None: ...
+    @property
+    def capacity(self) -> int:
+        """How many bytes the buffer holds before its contents move to larger storage."""
+
+    def resize(self, size: int, /) -> None:
+        """Truncates, or appends zero bytes, to make the length ``size``."""
+
+    def extend(self, data: Buffer | bytes | bytearray | memoryview, /) -> None:
+        """Appends the bytes of ``data``."""
 
 @final
 class Event:

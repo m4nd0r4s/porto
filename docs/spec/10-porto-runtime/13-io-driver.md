@@ -64,6 +64,7 @@ Edge-triggered registration (EPOLLET) is used. Readiness bits are **cleared by t
 ```rust
 enum IoOp {
     Read { max: usize },                 // → bytes
+    ReadBuffer { max: usize },           // → porto.Buffer (pooled, no bytes copy)
     ReadInto { buf: PyBufferMut },       // → int
     Write { data: PyBufferRef, off: usize },   // loops until all written → None
     Accept,                              // → (TcpStream, addr)
@@ -79,6 +80,8 @@ The call that makes the awaitable attempts the op once, nonblocking, whatever re
 
 ## 6. Buffers
 - `porto.Buffer` is a Rust-owned, growable byte buffer that exposes the buffer protocol (read/write). It is pooled per lane (size classes 4K, 16K, 64K, 256K).
+  - `Buffer(size=0)` holds `size` zero bytes; `len(buf)`, `buf.capacity`, `buf.resize(size)`, `buf.extend(data)`. While a view is exported (a `memoryview`, or a pending operation's view) `resize` and `extend` raise `BufferError`, so the exported memory never moves.
+  - Storage comes from the pool of the Python lane the buffer is made on, the smallest class that holds the request, and goes back to the pool of the Python lane it is freed on (anywhere else it is just freed). A request above 256K is allocated exactly and never pooled. Each class keeps at most 1 MiB of free storage, and a lane empties its pool when its run ends.
 - `PyBufferRef` holds a `Py_buffer` view (from `PyObject_GetBuffer` with `PyBUF_SIMPLE`) and releases it on drop. It MUST be released on a Python lane (P1).
 - Zero-copy reads: `stream.read_into(buf)` and `stream.read_buffer(max) -> porto.Buffer` (no `bytes` copy). `bytes(buf)` copies on demand.
 

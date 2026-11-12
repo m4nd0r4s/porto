@@ -94,6 +94,9 @@ def current_task() -> Task[Any]
 ### Sync & channels
 `Lock`, `Mutex[T]`, `RwLock`, `Semaphore`, `CapacityLimiter`, `Event`, `Notify`, `Condition`, `Barrier`, and the channel constructors `channel[T](capacity)`, `unbounded_channel[T]()`, `oneshot[T]()`, `broadcast[T](capacity)`, `watch[T](initial)` returning `(Sender[T], Receiver[T])`-like pairs (see §16 for methods).
 
+### Buffers
+`porto.Buffer(size=0)`: a growable, pooled byte buffer with the read/write buffer protocol; `capacity`, `resize(size)`, `extend(data)`; `bytes(buf)` copies (13 §6).
+
 ### Threads
 `async to_thread(fn, *args, cancellable=False, limiter=None, **kw)`, `from_thread.run`, `from_thread.run_sync`, `class Portal` (`submit(fn, *args) -> concurrent.futures.Future`, `close()`).
 
