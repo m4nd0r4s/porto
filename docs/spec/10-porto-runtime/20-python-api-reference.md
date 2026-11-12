@@ -108,6 +108,7 @@ PortoError(Exception)
  ├─ WouldBlock(PortoError)
  ├─ EndOfChannel(PortoError)
  ├─ BrokenResourceError(PortoError)
+ ├─ BusyResourceError(PortoError)   a second task read (or wrote) a stream that another task was already reading (or writing) (13 §5)
  ├─ ClosedResourceError(PortoError, OSError)   errno EBADF when an I/O resource is closed under an operation (13 §4)
  ├─ IncompleteReadError(PortoError, EOFError)   .partial: bytes
  ├─ LimitOverrunError(PortoError)

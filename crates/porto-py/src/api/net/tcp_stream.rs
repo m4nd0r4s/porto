@@ -2,10 +2,14 @@
 //! with the driver of the run that made it, whose methods return the awaitables of the
 //! [`IoOp`]s. It implements `porto.abc.ByteStream`.
 //!
-//! The stream keeps one fact of its own: whether a write was cancelled after it sent part of its
-//! data (13-io-driver.md §5). The bytes on the wire then stop in the middle of what the caller
-//! meant to send, so later writes raise `porto.BrokenResourceError` instead of continuing the
-//! message from the wrong place.
+//! The stream keeps three facts of its own (13-io-driver.md §5):
+//!
+//! - whether a write was cancelled after it sent part of its data: the bytes on the wire then
+//!   stop in the middle of what the caller meant to send, so later writes raise
+//!   `porto.BrokenResourceError` instead of continuing the message from the wrong place;
+//! - whether a task is reading it, and whether a task is writing it: a second reader or writer
+//!   raises `porto.BusyResourceError` (two writers would interleave their bytes inside one
+//!   message, two readers would split what the peer sent).
 
 use std::net::Shutdown;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,17 +21,19 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use super::raw_number;
+use super::{int_in_range, raw_number};
 use crate::driver::ready::{ready, ready_none};
 use crate::driver::step;
-use crate::errors::BrokenResourceError;
+use crate::errors::{BrokenResourceError, BusyResourceError};
 use crate::io::buffer_view::{PyBufferMut, PyBufferRef};
 use crate::io::handle::register_on_lane;
-use crate::io::op::{IoOp, IoRegistration, MidWrite, os_error, start_connect, submit};
+use crate::io::op::{
+    Claim, IoOp, IoRegistration, MidWrite, os_error, start_connect, submit, submit_claimed,
+};
 use crate::io::sockaddr;
 
 /// The most bytes one `read` asks for by default.
-const DEFAULT_MAX: i64 = 65536;
+const DEFAULT_MAX: usize = 65536;
 
 /// A TCP connection.
 #[pyclass(frozen, module = "porto.net", name = "TcpStream")]
@@ -35,6 +41,10 @@ pub(crate) struct TcpStream {
     registration: Arc<IoRegistration>,
     /// Set when a write was cancelled after sending part of its data.
     mid_write: MidWrite,
+    /// Held by the operation of the task reading the stream.
+    reading: Arc<AtomicBool>,
+    /// Held by the operation of the task writing the stream.
+    writing: Arc<AtomicBool>,
     /// The peer's address, known when the stream was accepted, else read on first use.
     peer: OnceLock<SockAddr>,
     /// This end's address, read on first use.
@@ -48,6 +58,8 @@ impl TcpStream {
         Ok(Self {
             registration: register_on_lane(socket, "a TcpStream")?,
             mid_write: Arc::new(AtomicBool::new(false)),
+            reading: Arc::new(AtomicBool::new(false)),
+            writing: Arc::new(AtomicBool::new(false)),
             peer: peer.map_or_else(OnceLock::new, OnceLock::from),
             local: OnceLock::new(),
         })
@@ -55,6 +67,16 @@ impl TcpStream {
 
     fn submit(&self, py: Python<'_>, op: IoOp) -> PyResult<Py<PyAny>> {
         submit(py, &self.registration, op)
+    }
+
+    /// The claim on the stream's one reader, or `BusyResourceError` if another task holds it.
+    fn claim_reader(&self, call: &str) -> PyResult<Claim> {
+        Claim::acquire(&self.reading).ok_or_else(|| busy(call, "reading from", "read"))
+    }
+
+    /// The claim on the stream's one writer, or `BusyResourceError` if another task holds it.
+    fn claim_writer(&self, call: &str) -> PyResult<Claim> {
+        Claim::acquire(&self.writing).ok_or_else(|| busy(call, "writing to", "write"))
     }
 
     /// Raises `BrokenResourceError` if a cancelled write left the stream mid-message.
@@ -84,36 +106,49 @@ impl TcpStream {
     }
 }
 
-/// `max` as the length of a receive: at least 1, because a receive of 0 bytes returns 0, which
-/// reads as the end of the stream.
-fn receive_length(max: i64, call: &str) -> PyResult<usize> {
-    usize::try_from(max)
-        .ok()
-        .filter(|&max| max >= 1)
-        .ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "porto: {call} needs max >= 1 (got {max}): a read of 0 bytes would look like the \
-                 end of the stream; ask for at least one byte"
-            ))
-        })
+fn busy(call: &str, doing: &str, verb: &str) -> PyErr {
+    BusyResourceError::new_err(format!(
+        "porto: {call} was called while another task is already {doing} this stream; a stream \
+         takes one reader and one writer at a time (concurrent {verb}s would interleave or split \
+         the data): let one task {verb}, or serialize the tasks with a porto.Lock"
+    ))
+}
+
+/// `max`, the optional argument of a read, as the length of a receive: at least 1, because a
+/// receive of 0 bytes returns 0, which reads as the end of the stream.
+fn receive_length(max: Option<&Bound<'_, PyAny>>, call: &str) -> PyResult<usize> {
+    let Some(max) = max else {
+        return Ok(DEFAULT_MAX);
+    };
+    let hint = " (a read of 0 bytes would look like the end of the stream; ask for at least one \
+                byte)";
+    let max = int_in_range(max, call, "max", 1..=i64::MAX, hint)?;
+    Ok(usize::try_from(max).unwrap_or(usize::MAX))
 }
 
 #[pymethods]
 impl TcpStream {
     /// Receives at most `max` bytes: `bytes`, empty at the end of the stream (the peer closed
     /// or shut down its writing side).
-    #[pyo3(signature = (max = DEFAULT_MAX, /))]
-    fn read(&self, py: Python<'_>, max: i64) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (max = None, /))]
+    fn read(&self, py: Python<'_>, max: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let max = receive_length(max, "read()")?;
-        self.submit(py, IoOp::Read { max })
+        let claim = self.claim_reader("read()")?;
+        submit_claimed(py, &self.registration, IoOp::Read { max }, Some(claim))
     }
 
     /// Receives at most `max` bytes into a `porto.Buffer` from the lane's pool, without the
     /// copy into `bytes`: the buffer, empty at the end of the stream.
-    #[pyo3(signature = (max = DEFAULT_MAX, /))]
-    fn read_buffer(&self, py: Python<'_>, max: i64) -> PyResult<Py<PyAny>> {
+    #[pyo3(signature = (max = None, /))]
+    fn read_buffer(&self, py: Python<'_>, max: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let max = receive_length(max, "read_buffer()")?;
-        self.submit(py, IoOp::ReadBuffer { max })
+        let claim = self.claim_reader("read_buffer()")?;
+        submit_claimed(
+            py,
+            &self.registration,
+            IoOp::ReadBuffer { max },
+            Some(claim),
+        )
     }
 
     /// Receives into `buffer`, a writable bytes-like object: the number of bytes received, 0
@@ -126,21 +161,25 @@ impl TcpStream {
                  end of the stream; pass a buffer with room for at least one byte",
             ));
         }
-        self.submit(py, IoOp::ReadInto { buf })
+        let claim = self.claim_reader("read_into()")?;
+        submit_claimed(py, &self.registration, IoOp::ReadInto { buf }, Some(claim))
     }
 
     /// Sends all of `data`, waiting while the socket's buffers are full: `None` once the last
     /// byte went out. A cancellation after part of it was sent leaves the stream broken.
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let data = PyBufferRef::new(data, "write()'s data")?;
+        let claim = self.claim_writer("write()")?;
         self.ensure_not_mid_write()?;
-        self.submit(
+        submit_claimed(
             py,
+            &self.registration,
             IoOp::Write {
                 data,
                 off: 0,
                 mid_write: Some(Arc::clone(&self.mid_write)),
             },
+            Some(claim),
         )
     }
 
@@ -154,14 +193,13 @@ impl TcpStream {
                 &format!("writev()'s buffers[{index}]"),
             )?);
         }
+        let claim = self.claim_writer("writev()")?;
         self.ensure_not_mid_write()?;
-        self.submit(
+        submit_claimed(
             py,
-            IoOp::WriteV {
-                buffers: views,
-                written: 0,
-                mid_write: Some(Arc::clone(&self.mid_write)),
-            },
+            &self.registration,
+            IoOp::write_v(views, Some(Arc::clone(&self.mid_write))),
+            Some(claim),
         )
     }
 
@@ -205,7 +243,15 @@ impl TcpStream {
     /// Turns on TCP keepalive: the first probe after `idle` seconds without traffic, then one
     /// every `interval` seconds, the connection dropped after `count` unanswered probes. The OS
     /// counts whole seconds, so fractions round up.
-    fn set_keepalive(&self, idle: f64, interval: f64, count: u32) -> PyResult<()> {
+    fn set_keepalive(&self, idle: f64, interval: f64, count: &Bound<'_, PyAny>) -> PyResult<()> {
+        let count = int_in_range(
+            count,
+            "set_keepalive()",
+            "count",
+            1..=i64::from(u32::MAX),
+            " (the probes before the connection is dropped)",
+        )?;
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
         let invalid = || {
             PyValueError::new_err(format!(
                 "porto: set_keepalive(idle, interval, count) needs idle and interval to be \
@@ -221,9 +267,6 @@ impl TcpStream {
             }
         };
         let (idle, interval) = (seconds(idle)?, seconds(interval)?);
-        if count == 0 {
-            return Err(invalid());
-        }
         let socket = self
             .registration
             .source()

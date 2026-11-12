@@ -1,6 +1,6 @@
 //! TCP sockets (17-networking-tls-dns.md §1): the listening socket `listen_tcp` opens,
 //! nonblocking `accept`, the socket options of a stream, and the rules for running out of file
-//! descriptors.
+//! descriptors, and for connections that fail before they are accepted.
 //!
 //! Every socket made here is close-on-exec, and nonblocking (the registration it goes into
 //! requires it).
@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 
-/// How long `accept` waits after `EMFILE` or `ENFILE` before it tries again: the pending
+/// How long `accept` waits after `EMFILE`, `ENFILE`, `ENOBUFS` or `ENOMEM` before it tries again: the pending
 /// connection stays queued, and every attempt would fail the same way until a descriptor is
 /// freed, so trying at once would spin a core (17 §1.2).
 pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The most often the warning about running out of descriptors is logged.
+/// The most often the warning about running out of descriptors or memory is logged.
 pub const EXHAUSTION_WARNING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What a listening socket is opened with.
@@ -128,9 +128,20 @@ fn set_reuse_port(_socket: &Socket) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// `WouldBlock` when nothing is waiting; `EMFILE` and `ENFILE` when no descriptor is left
-/// (see [`is_descriptor_exhaustion`]); the OS's error otherwise.
+/// `WouldBlock` when nothing is waiting; `EMFILE`, `ENFILE`, `ENOBUFS` and `ENOMEM` when the OS
+/// has no resources for the connection (see [`is_resource_exhaustion`]); the OS's error
+/// otherwise. A connection that failed before `accept` could return it (see
+/// [`is_aborted_connection`]) is skipped: the next queued one is accepted.
 pub fn accept(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
+    loop {
+        match accept_once(listener) {
+            Err(error) if is_aborted_connection(&error) => {}
+            result => return result,
+        }
+    }
+}
+
+fn accept_once(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
     #[cfg(any(
         target_os = "android",
         target_os = "dragonfly",
@@ -165,15 +176,56 @@ pub fn accept(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
     }
 }
 
-/// Whether `error` is the OS running out of file descriptors (`EMFILE`: this process has no
-/// more, `ENFILE`: the system has none; `WSAEMFILE` on Windows): the connection that caused it
-/// is still queued, so `accept` backs off ([`ACCEPT_BACKOFF`]) instead of failing.
-pub fn is_descriptor_exhaustion(error: &io::Error) -> bool {
-    // 24 and 23 are the same on Linux, the BSDs and macOS.
+/// Whether `error` says the connection `accept` was returning failed before the program ever
+/// saw it, so the listener is fine and the next queued connection is a new chance: the client
+/// reset it first (`ECONNABORTED`), the protocol failed on it (`EPROTO`), a firewall refused it
+/// (`EPERM`), or the network under it went away (`ENETDOWN`, `ENOPROTOOPT`, `EHOSTDOWN`,
+/// `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH`: accept(2) lists these to be treated
+/// like `EAGAIN`). `accept` skips them silently, like trio and asyncio do.
+pub fn is_aborted_connection(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::ConnectionAborted {
+        return true;
+    }
     #[cfg(unix)]
-    const CODES: [i32; 2] = [24, 23];
+    {
+        const CODES: [i32; 3] = [libc::EPROTO, libc::EPERM, libc::ENETDOWN];
+        let linux_only = {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                [
+                    libc::ENOPROTOOPT,
+                    libc::EHOSTDOWN,
+                    libc::ENONET,
+                    libc::EHOSTUNREACH,
+                    libc::EOPNOTSUPP,
+                    libc::ENETUNREACH,
+                ]
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                [0; 6]
+            }
+        };
+        matches!(
+            error.raw_os_error(),
+            Some(code) if CODES.contains(&code) || linux_only.contains(&code)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Whether `error` is the OS running out of what a connection needs: file descriptors
+/// (`EMFILE`: this process has no more, `ENFILE`: the system has none; `WSAEMFILE` on Windows)
+/// or buffers and memory (`ENOBUFS`, `ENOMEM`; `WSAENOBUFS`). The connection that caused it is
+/// still queued, so `accept` backs off ([`ACCEPT_BACKOFF`]) instead of failing.
+pub fn is_resource_exhaustion(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    const CODES: [i32; 4] = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM];
     #[cfg(windows)]
-    const CODES: [i32; 1] = [10024];
+    const CODES: [i32; 2] = [10024, 10055];
     #[cfg(not(any(unix, windows)))]
     const CODES: [i32; 0] = [];
     matches!(error.raw_os_error(), Some(code) if CODES.contains(&code))

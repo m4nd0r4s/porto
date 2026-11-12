@@ -425,8 +425,10 @@ class TcpStream:
     using it from another run raises ``RuntimeError`` at the call."""
 
     def read(self, max: int = 65536, /) -> Awaitable[bytes]:
-        """Receives at most ``max`` bytes (``max >= 1``): ``b""`` at the end of the stream, once
-        the peer closed or shut down its writing side. Cancelling loses no bytes."""
+        """Receives at most ``max`` bytes (``max >= 1``; ``ValueError`` otherwise): ``b""`` at the
+        end of the stream, once the peer closed or shut down its writing side. Cancelling loses
+        no bytes. Only one task may read a stream at a time: a second concurrent read raises
+        ``porto.BusyResourceError``."""
 
     def read_buffer(self, max: int = 65536, /) -> Awaitable[Buffer]:
         """Like ``read``, into a ``porto.Buffer`` from the lane's pool, with no ``bytes`` copy.
@@ -439,7 +441,8 @@ class TcpStream:
     def write(self, data: bytes | bytearray | memoryview | Buffer, /) -> Awaitable[None]:
         """Sends all of ``data``, waiting while the socket's buffers are full. If the task is
         cancelled after part of it was sent, the stream is broken: later writes raise
-        ``porto.BrokenResourceError``; close it and connect again."""
+        ``porto.BrokenResourceError``; close it and connect again. Only one task may write a
+        stream at a time: a second concurrent write raises ``porto.BusyResourceError``."""
 
     def writev(
         self, buffers: Iterable[bytes | bytearray | memoryview | Buffer], /

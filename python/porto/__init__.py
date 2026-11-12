@@ -59,6 +59,7 @@ from porto._core import (
 )
 from porto.errors import (
     BrokenResourceError,
+    BusyResourceError,
     Cancelled,
     ClosedResourceError,
     EndOfChannel,
@@ -80,6 +81,7 @@ __all__ = [
     "BroadcastSender",
     "BrokenResourceError",
     "Buffer",
+    "BusyResourceError",
     "Cancelled",
     "CapacityLimiter",
     "ClosedResourceError",

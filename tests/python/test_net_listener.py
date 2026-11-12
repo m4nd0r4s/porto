@@ -2,13 +2,15 @@
 loopback. Registering raw sockets needs the AFD backend on Windows, which is not written yet,
 so these tests run on Unix."""
 
+import contextlib
 import errno
 import logging
 import os
 import socket
+import struct
 import sys
 import time
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterator
 from typing import Any
 
 import pytest
@@ -365,3 +367,153 @@ def test_accept_backs_off_when_descriptors_run_out_and_recovers(
         assert data == b"first", "the connection that hit EMFILE stayed queued and was accepted"
     else:
         assert data in (b"first", b"second")
+
+
+@contextlib.contextmanager
+def no_descriptors_left() -> Iterator[None]:
+    """Uses up every file descriptor this process may open, until the block ends."""
+    hoard: list[int] = []
+    try:
+        while True:
+            try:
+                hoard.append(os.dup(0))
+            except OSError as error:
+                if error.errno not in (errno.EMFILE, errno.ENFILE):
+                    raise
+                break
+        yield
+    finally:
+        for fd in hoard:
+            os.close(fd)
+
+
+def test_closing_a_listener_ends_an_accept_that_is_backing_off() -> None:
+    """aclose() wakes the accept at once: it does not sit out the rest of its 100 ms pause (a
+    pause only happens where the connection that hit EMFILE stays queued: Linux)."""
+
+    async def main() -> tuple[bool, bool]:
+        logging.getLogger("porto.net")
+        listener = await net.listen_tcp(LOOPBACK)
+        client = socket.socket()
+        client.connect((LOOPBACK, listener.port))  # queued by the kernel
+        errors: list[BaseException] = []
+
+        async def accept_one() -> None:
+            try:
+                await listener.accept()
+            except porto.ClosedResourceError as error:
+                errors.append(error)
+
+        try:
+            with no_descriptors_left():
+                async with porto.scope() as s:
+                    accepting = s.spawn(accept_one())
+                    await porto.sleep(0.03)  # inside the first pause
+                    assert not accepting.done()
+                    await listener.aclose()
+                    await porto.sleep(0.03)  # well before the pause would have ended
+                    ended = accepting.done()
+        finally:
+            client.close()
+        return ended, bool(errors)
+
+    ended, raised = run(main())
+    assert ended, "the accept was still waiting out its backoff after the listener closed"
+    assert raised
+
+
+def test_the_exhaustion_warning_is_rate_limited_per_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One warning per run however often accept retries; a later run warns again."""
+    logging.getLogger("porto.net")
+
+    async def one_run() -> None:
+        listener = await net.listen_tcp(LOOPBACK)
+        client = socket.socket()
+        client.connect((LOOPBACK, listener.port))
+        try:
+            with no_descriptors_left():
+                async with porto.move_on_after(0.25):
+                    await listener.accept()  # tries, warns, backs off, tries again, ...
+        finally:
+            client.close()
+            await listener.aclose()
+
+    with caplog.at_level(logging.WARNING, logger="porto.net"):
+        run(one_run())
+        first = len([r for r in caplog.records if r.name == "porto.net"])
+        run(one_run())
+        both = len([r for r in caplog.records if r.name == "porto.net"])
+    assert first == 1, "one warning in the first run"
+    assert both == 2, "the second run is not silenced by the first run's limit"
+
+
+def test_accept_goes_on_past_clients_that_reset_before_it_accepted_them() -> None:
+    """A connection reset before accept (ECONNABORTED where the OS reports it, an accepted
+    socket that fails on first read elsewhere) never stops the listener."""
+
+    async def main() -> bytes:
+        async with await net.listen_tcp(LOOPBACK) as listener:
+            for _ in range(5):
+                bad = socket.create_connection((LOOPBACK, listener.port))
+                bad.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                bad.close()
+            good = socket.create_connection((LOOPBACK, listener.port))
+            good.sendall(b"good")
+            try:
+                async with porto.move_on_after(5):
+                    async for stream in listener:
+                        async with stream:
+                            try:
+                                data = await stream.read(8)
+                            except ConnectionResetError:
+                                continue
+                            if data == b"good":
+                                return data
+            finally:
+                good.close()
+        return b""
+
+    assert run(main()) == b"good"
+
+
+def test_several_tasks_may_accept_from_one_listener() -> None:
+    async def main() -> list[bytes]:
+        async with await net.listen_tcp(LOOPBACK) as listener:
+            results: list[bytes] = []
+
+            async def acceptor() -> None:
+                async with await listener.accept() as stream:
+                    results.append(await stream.read(8))
+
+            async with porto.scope() as s:
+                s.spawn(acceptor())
+                s.spawn(acceptor())
+                await porto.sleep(0.01)
+                for word in (b"one", b"two"):
+                    with socket.create_connection((LOOPBACK, listener.port)) as client:
+                        client.sendall(word)
+                        await porto.sleep(0.02)
+            return sorted(results)
+
+    assert run(main()) == [b"one", b"two"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"port": 2**70}, r"port must be an int in 0\.\.=65535"),
+        ({"port": -(2**70)}, r"port must be an int in 0\.\.=65535"),
+        ({"backlog": 2**70}, r"backlog must be an int in 0\.\.=2147483647"),
+        ({"backlog": 2**31}, r"backlog must be an int in 0\.\.=2147483647"),
+    ],
+)
+def test_huge_integers_are_value_errors_not_overflow_errors(
+    kwargs: dict[str, Any], message: str
+) -> None:
+    async def main() -> None:
+        with pytest.raises(ValueError, match=message):
+            await net.listen_tcp(**kwargs)
+
+    run(main())

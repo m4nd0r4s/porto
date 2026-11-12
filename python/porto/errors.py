@@ -14,6 +14,7 @@ from asyncio import CancelledError
 
 __all__ = [
     "BrokenResourceError",
+    "BusyResourceError",
     "Cancelled",
     "ClosedResourceError",
     "EndOfChannel",
@@ -58,6 +59,13 @@ class EndOfChannel(PortoError):
 class BrokenResourceError(PortoError):
     """The resource broke from the other side (for example the peer reset the connection or
     every receiver went away); open a new one."""
+
+
+class BusyResourceError(PortoError):
+    """Two tasks used a resource that serves one at a time: a second task started a read (or a
+    write) on a stream while another task's read (or write) was still waiting. Interleaved
+    writes would corrupt the stream and two readers would split its messages, so let one task
+    read and one task write, or serialize them with a ``porto.Lock``."""
 
 
 class ClosedResourceError(PortoError, OSError):

@@ -24,6 +24,7 @@ import_exception!(porto.errors, RuntimeClosed);
 import_exception!(porto.errors, WouldBlock);
 import_exception!(porto.errors, EndOfChannel);
 import_exception!(porto.errors, BrokenResourceError);
+import_exception!(porto.errors, BusyResourceError);
 import_exception!(porto.errors, ClosedResourceError);
 import_exception!(porto.errors, IncompleteReadError);
 import_exception!(porto.errors, LimitOverrunError);

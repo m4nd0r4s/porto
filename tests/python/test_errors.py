@@ -17,6 +17,7 @@ PORTO_ERRORS: dict[type[BaseException], tuple[type[BaseException], ...]] = {
     errors.WouldBlock: (errors.PortoError,),
     errors.EndOfChannel: (errors.PortoError,),
     errors.BrokenResourceError: (errors.PortoError,),
+    errors.BusyResourceError: (errors.PortoError,),
     errors.ClosedResourceError: (errors.PortoError, OSError),
     errors.IncompleteReadError: (errors.PortoError, EOFError),
     errors.LimitOverrunError: (errors.PortoError,),

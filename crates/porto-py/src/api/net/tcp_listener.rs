@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use socket2::SockAddr;
 
-use super::raw_number;
+use super::{int_in_range, raw_number};
 use crate::driver::ready::{ready, ready_none};
 use crate::driver::step;
 use crate::io::handle::register_on_lane;
@@ -42,8 +42,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 fn listen_tcp(
     py: Python<'_>,
     host: Option<&str>,
-    port: i64,
-    backlog: i64,
+    port: &Bound<'_, PyAny>,
+    backlog: &Bound<'_, PyAny>,
     reuse_port: bool,
     dual_stack: bool,
 ) -> PyResult<TcpListener> {
@@ -58,22 +58,22 @@ fn listen_tcp(
             })
         })
         .transpose()?;
-    let port = u16::try_from(port).map_err(|_| {
-        PyValueError::new_err(format!(
-            "porto: listen_tcp()'s port must be an int in 0..=65535 (0 picks a free one), got \
-             {port}"
-        ))
-    })?;
-    let backlog = i32::try_from(backlog)
-        .ok()
-        .filter(|&backlog| backlog >= 0)
-        .ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "porto: listen_tcp()'s backlog must be an int in 0..={} (the OS caps it \
-                 lower), got {backlog}",
-                i32::MAX
-            ))
-        })?;
+    let port = int_in_range(
+        port,
+        "listen_tcp()",
+        "port",
+        0..=i64::from(u16::MAX),
+        " (0 picks a free one)",
+    )?;
+    let backlog = int_in_range(
+        backlog,
+        "listen_tcp()",
+        "backlog",
+        0..=i64::from(i32::MAX),
+        " (the OS caps it lower)",
+    )?;
+    let port = u16::try_from(port).unwrap_or(u16::MAX);
+    let backlog = i32::try_from(backlog).unwrap_or(i32::MAX);
     // A cancelled task must not open a socket it will not use (C1).
     step::raise_if_cancelled(py)?;
     let socket = tcp::listen(&ListenOptions {

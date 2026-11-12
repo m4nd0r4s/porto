@@ -12,9 +12,12 @@
 //! unlinks the waiter it registered.
 
 use std::cell::RefCell;
+use std::future::{Future, poll_fn};
 use std::io::{self, IoSlice};
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 use std::time::Instant;
 
 use porto_core::time::{Deadline, sleep_until};
@@ -55,6 +58,27 @@ pub(crate) type MidWrite = Arc<AtomicBool>;
 /// The most buffers one vectored send hands the kernel (`IOV_MAX` is 1024 on Linux and macOS).
 const MAX_IOVECS: usize = 64;
 
+/// The right to be the one task reading (or writing) a stream: set when the operation is made
+/// and cleared when it is dropped, whether it completed, failed or was cancelled. A second
+/// operation of the same direction while it is held is refused ([`Claim::acquire`]), because
+/// two writers would interleave their bytes and two readers would split what the peer sent.
+pub(crate) struct Claim(Arc<AtomicBool>);
+
+impl Claim {
+    /// Takes the claim on `flag`, or `None` if another operation holds it.
+    pub(crate) fn acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self(Arc::clone(flag)))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// An operation on a registered socket, and its state between attempts.
 pub(crate) enum IoOp {
     /// Receive at most `max` bytes → `bytes` (empty at end of stream).
@@ -70,11 +94,15 @@ pub(crate) enum IoOp {
         off: usize,
         mid_write: Option<MidWrite>,
     },
-    /// Send all of `buffers`, from byte `written` on, in as few vectored sends as it can → `None`.
-    /// Sets `mid_write` like `Write`.
+    /// Send all of `buffers`, in as few vectored sends as it can → `None`. Sets `mid_write` like
+    /// `Write`. `index` and `offset` are where the next send starts (the buffer, and the byte
+    /// in it), `written` how many bytes went out of `total`.
     WriteV {
         buffers: Vec<PyBufferRef>,
+        index: usize,
+        offset: usize,
         written: usize,
+        total: usize,
         mid_write: Option<MidWrite>,
     },
     /// Accept a connection → `(socket, address)`.
@@ -113,6 +141,28 @@ pub(crate) enum Completed {
 }
 
 impl IoOp {
+    /// A vectored send of `buffers`.
+    pub(crate) fn write_v(buffers: Vec<PyBufferRef>, mid_write: Option<MidWrite>) -> Self {
+        let total = buffers.iter().map(|buffer| buffer.bytes().len()).sum();
+        Self::WriteV {
+            buffers,
+            index: 0,
+            offset: 0,
+            written: 0,
+            total,
+            mid_write,
+        }
+    }
+
+    /// The operation ended, by completing or failing: it no longer marks its stream mid-write
+    /// when dropped. Only a cancellation, which drops it unfinished, leaves the stream broken;
+    /// an OS error is the stream's own to report again (spec 13 §5).
+    fn finish(&mut self) {
+        if let Self::Write { mid_write, .. } | Self::WriteV { mid_write, .. } = self {
+            *mid_write = None;
+        }
+    }
+
     /// The readiness the operation waits for.
     pub(crate) fn interest(&self) -> Interest {
         match self {
@@ -176,25 +226,45 @@ impl IoOp {
                 Ok(Completed::Done)
             }
             Self::WriteV {
-                buffers, written, ..
+                buffers,
+                index,
+                offset,
+                written,
+                total,
+                ..
             } => {
-                let total: usize = buffers.iter().map(|buffer| buffer.bytes().len()).sum();
-                while *written < total {
-                    let mut skip = *written;
-                    let slices: Vec<IoSlice<'_>> = buffers
-                        .iter()
-                        .filter_map(|buffer| {
-                            let bytes = buffer.bytes();
-                            let taken = skip.min(bytes.len());
-                            skip -= taken;
-                            let rest = &bytes[taken..];
-                            (!rest.is_empty()).then(|| IoSlice::new(rest))
-                        })
-                        .take(MAX_IOVECS)
-                        .collect();
-                    match socket.send_vectored_with_flags(&slices, SEND_FLAGS)? {
-                        0 => return Err(io::ErrorKind::WriteZero.into()),
-                        sent => *written += sent,
+                while *written < *total {
+                    let mut slices = [IoSlice::new(&[]); MAX_IOVECS];
+                    let mut count = 0;
+                    let mut first = *offset;
+                    for buffer in &buffers[*index..] {
+                        if count == MAX_IOVECS {
+                            break;
+                        }
+                        let rest = &buffer.bytes()[first..];
+                        first = 0;
+                        if !rest.is_empty() {
+                            slices[count] = IoSlice::new(rest);
+                            count += 1;
+                        }
+                    }
+                    let sent = socket.send_vectored_with_flags(&slices[..count], SEND_FLAGS)?;
+                    if sent == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    *written += sent;
+                    // Move the start past what went out.
+                    let mut left = sent;
+                    while left > 0 {
+                        let room = buffers[*index].bytes().len() - *offset;
+                        if left >= room {
+                            left -= room;
+                            *index += 1;
+                            *offset = 0;
+                        } else {
+                            *offset += left;
+                            left = 0;
+                        }
                     }
                 }
                 Ok(Completed::Done)
@@ -253,18 +323,16 @@ impl Drop for IoOp {
                 mid_write: Some(mid_write),
             } => (mid_write, *off, data.bytes().len()),
             Self::WriteV {
-                buffers,
                 written,
+                total,
                 mid_write: Some(mid_write),
-            } => (
-                mid_write,
-                *written,
-                buffers.iter().map(|buffer| buffer.bytes().len()).sum(),
-            ),
+                ..
+            } => (mid_write, *written, *total),
             _ => return,
         };
-        // Part of the data went out and the rest never will: the stream's bytes now stop in
-        // the middle of what the caller meant to send.
+        // Dropped unfinished (`finish` was not called: a cancellation) with part of the data
+        // out and the rest never to follow: the stream's bytes now stop in the middle of what
+        // the caller meant to send.
         if sent > 0 && sent < total {
             mid_write.store(true, Ordering::Release);
         }
@@ -273,11 +341,10 @@ impl Drop for IoOp {
 
 impl IoOp {
     /// Whether `error` makes this operation wait and try again instead of failing: running out
-    /// of descriptors in an accept leaves the connection queued, so it is retried after a
-    /// pause ([`tcp::ACCEPT_BACKOFF`]).
+    /// of descriptors, buffers or memory in an accept leaves the connection queued, so it is
+    /// retried after a pause ([`tcp::ACCEPT_BACKOFF`]).
     fn backs_off_on(&self, error: &io::Error) -> bool {
-        matches!(self, Self::Accept | Self::AcceptTcp { .. })
-            && tcp::is_descriptor_exhaustion(error)
+        matches!(self, Self::Accept | Self::AcceptTcp { .. }) && tcp::is_resource_exhaustion(error)
     }
 
     /// `error` as the exception this operation raises.
@@ -299,15 +366,23 @@ thread_local! {
         const { RefCell::new(tcp::RateLimit::new(tcp::EXHAUSTION_WARNING_INTERVAL)) };
 }
 
+/// Forgets what the lane keeps of its run for I/O: the rate limit of the exhaustion warning, so
+/// a later run on this thread warns again (the limit is per run, not per thread).
+pub(crate) fn clear_run_state() {
+    // `try_with`: not worth a panic while the thread's locals are destroyed.
+    let _cleared = EXHAUSTION_WARNINGS.try_with(|limit| {
+        *limit.borrow_mut() = tcp::RateLimit::new(tcp::EXHAUSTION_WARNING_INTERVAL);
+    });
+}
 /// Logs (rate limited) that an accept ran out of file descriptors and backs off.
 fn warn_descriptors_exhausted(py: Python<'_>, error: &io::Error) {
     if !EXHAUSTION_WARNINGS.with_borrow_mut(|limit| limit.allow(Instant::now())) {
         return;
     }
     let message = format!(
-        "porto: accept() ran out of file descriptors ({error}); the pending connections wait \
-         and accept retries every {} ms. Close connections you no longer need, or raise the \
-         limit (ulimit -n); this is logged at most once every {} s",
+        "porto: accept() ran out of file descriptors or memory ({error}); the pending \
+         connections wait and accept retries every {} ms. Close connections you no longer \
+         need, or raise the limit (ulimit -n); this is logged at most once every {} s",
         tcp::ACCEPT_BACKOFF.as_millis(),
         tcp::EXHAUSTION_WARNING_INTERVAL.as_secs(),
     );
@@ -437,25 +512,57 @@ const EINPROGRESS: Option<i32> = None;
 pub(crate) fn submit(
     py: Python<'_>,
     registration: &Arc<IoRegistration>,
+    op: IoOp,
+) -> PyResult<Py<PyAny>> {
+    submit_claimed(py, registration, op, None)
+}
+
+/// [`submit`] for an operation holding `claim` (the stream's one reader or writer): the claim
+/// is released when the operation is dropped, which is when it ends however it ends.
+pub(crate) fn submit_claimed(
+    py: Python<'_>,
+    registration: &Arc<IoRegistration>,
     mut op: IoOp,
+    claim: Option<Claim>,
 ) -> PyResult<Py<PyAny>> {
     ensure_same_run(registration)?;
     if !op.waits_only() && step::proceed(py)? {
         match registration.attempt_io(op.interest(), |socket| op.attempt(socket)) {
-            Ok(completed) => return ready(py, completed.into_py(py)?),
+            Ok(completed) => {
+                op.finish();
+                return ready(py, completed.into_py(py)?);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             // The trap tries again after a pause (below), so it fails to the caller never.
             Err(error) if op.backs_off_on(&error) => warn_descriptors_exhausted(py, &error),
-            Err(error) => return Err(op.raise(&error)),
+            Err(error) => {
+                op.finish();
+                return Err(op.raise(&error));
+            }
         }
     }
-    let wait = IoWait::new(wait_for(Arc::clone(registration), op));
+    let wait = IoWait::new(wait_for(Arc::clone(registration), op, claim));
     Ok(trap::fast_new::object(py, Trap::new(TrapKind::Io(wait)))?.into_any())
+}
+
+/// Waits [`tcp::ACCEPT_BACKOFF`], or until `registration` is closed, whichever is first: closing
+/// a listener must end the accept waiting on it at once, not up to a pause later.
+async fn back_off(registration: &IoRegistration) {
+    let mut pause = pin!(sleep_until(Deadline::after(tcp::ACCEPT_BACKOFF)));
+    let mut closed = pin!(registration.closed());
+    poll_fn(|cx| {
+        if pause.as_mut().poll(cx).is_ready() || closed.as_mut().poll(cx).is_ready() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// The slow path of `op`: wait for readiness, attempt, repeat until it does not hit
 /// `WouldBlock`. Dropping it while pending unlinks its waiter and consumes nothing (T3).
-async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp) -> Resume {
+async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option<Claim>) -> Resume {
     let interest = op.interest();
     let result = if op.waits_only() {
         registration
@@ -471,19 +578,22 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp) -> Resume {
                 Err(error) if op.backs_off_on(&error) => {
                     // SAFETY: an `Io` wait is polled by the step loop, on its lane, attached.
                     warn_descriptors_exhausted(unsafe { Python::assume_attached() }, &error);
-                    sleep_until(Deadline::after(tcp::ACCEPT_BACKOFF)).await;
+                    back_off(&registration).await;
                 }
                 result => break result,
             }
         }
     };
+    // It ended by completing or failing, not by a cancellation.
+    op.finish();
     // SAFETY: an `Io` wait is polled by the step loop, on its lane, attached.
     let py = unsafe { Python::assume_attached() };
     let value = result
         .map_err(|error| op.raise(&error))
         .and_then(|completed| completed.into_py(py));
-    // The views the operation holds are released here, attached (P1).
+    // The views the operation holds are released here, attached (P1), and then the claim.
     drop(op);
+    drop(claim);
     match value {
         Ok(value) => Resume::Value(value),
         Err(error) => Resume::Throw(error.into_value(py)),

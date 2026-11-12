@@ -236,6 +236,22 @@ def test_writev_sends_every_buffer_in_order() -> None:
     assert large == b"".join(bulk)
 
 
+def test_writev_resumes_inside_a_buffer_past_the_vector_limit_and_empty_buffers() -> None:
+    """More buffers than one system call takes (64), empty ones among them, and a payload the
+    socket buffers cannot hold, so sends stop inside a buffer and go on from there."""
+    buffers = [bytes([index % 251]) * (0 if index % 7 == 0 else 20_011) for index in range(400)]
+    expected = b"".join(buffers)
+
+    async def main() -> bytes:
+        client, server, listener = await connected()
+        async with client, server, listener, porto.scope() as s:
+            reader = s.spawn(read_exactly, server, len(expected))
+            await client.writev(buffers)
+            return await reader
+
+    assert run(main()) == expected
+
+
 def test_half_close_is_the_end_of_the_stream_for_the_peer() -> None:
     async def main() -> tuple[bytes, bytes, bytes]:
         client, server, listener = await connected()
@@ -376,7 +392,7 @@ def _keepintvl() -> int:
 
 @pytest.mark.parametrize(
     ("idle", "interval", "count"),
-    [(0, 1, 1), (1, 0, 1), (-1, 1, 1), (1, 1, 0), (float("nan"), 1, 1), (float("inf"), 1, 1)],
+    [(0, 1, 1), (1, 0, 1), (-1, 1, 1), (float("nan"), 1, 1), (float("inf"), 1, 1)],
 )
 def test_keepalive_needs_positive_numbers(idle: float, interval: float, count: int) -> None:
     async def main() -> None:
@@ -388,13 +404,38 @@ def test_keepalive_needs_positive_numbers(idle: float, interval: float, count: i
     run(main())
 
 
+@pytest.mark.parametrize("count", [0, -1, 2**32, 2**70])
+def test_keepalive_count_out_of_range_is_a_value_error(count: int) -> None:
+    async def main() -> None:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            with pytest.raises(ValueError, match=r"count must be an int in 1\.\.=4294967295"):
+                client.set_keepalive(1, 1, count)
+
+    run(main())
+
+
+@pytest.mark.parametrize("max_bytes", [2**63, 2**64, 2**70, -(2**70)])
+def test_read_sizes_out_of_range_are_value_errors(max_bytes: int) -> None:
+    async def main() -> None:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            for call in (client.read, client.read_buffer):
+                with pytest.raises(ValueError, match=r"max must be an int in 1\.\.="):
+                    call(max_bytes)
+            with pytest.raises(TypeError):
+                client.read("10")  # pyright: ignore[reportArgumentType]
+
+    run(main())
+
+
 def test_a_read_of_no_bytes_is_refused_because_it_would_look_like_the_end() -> None:
     async def main() -> None:
         client, server, listener = await connected()
         async with client, server, listener:
             for call in (client.read, client.read_buffer):
                 for bad in (0, -1):
-                    with pytest.raises(ValueError, match="max >= 1"):
+                    with pytest.raises(ValueError, match=r"max must be an int in 1\.\."):
                         call(bad)
             with pytest.raises(ValueError, match="buffer is empty"):
                 client.read_into(bytearray())
@@ -521,6 +562,123 @@ def test_a_completed_write_leaves_the_stream_usable_after_a_cancel() -> None:
             return await read_exactly(server, 13)
 
     assert run(main()) == b"completeagain"
+
+
+def test_a_write_that_fails_with_an_os_error_after_a_partial_send_does_not_blame_a_cancel() -> None:
+    """The break is for cancellations only: after a reset the stream's own errors are the
+    answer, not a ``BrokenResourceError`` that says a cancellation left it mid-write."""
+    payload = b"x" * (64 * 1024 * 1024)
+
+    async def main() -> tuple[type[BaseException], type[BaseException]]:
+        listener = await net.listen_tcp(LOOPBACK)
+        async with listener:
+            foreign = socket.create_connection((LOOPBACK, listener.port))
+            server = await listener.accept()
+            async with server:
+
+                async def reset_later() -> None:
+                    await porto.sleep(0.05)  # the write has sent a part and waits
+                    foreign.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    foreign.close()
+
+                async with porto.scope() as s:
+                    s.spawn(reset_later())
+                    with pytest.raises(OSError, match="Errno") as first:
+                        await server.write(payload)
+                with pytest.raises(OSError, match="Errno") as later:
+                    await server.write(b"more")
+                assert not isinstance(later.value, porto.BrokenResourceError)
+                return type(first.value), type(later.value)
+
+    first, later = run(main())
+    assert issubclass(first, (ConnectionResetError, BrokenPipeError))
+    assert issubclass(later, (ConnectionResetError, BrokenPipeError))
+
+
+# One reader and one writer at a time (13-io-driver.md §5)
+
+
+def test_a_second_writer_is_refused_while_a_write_waits() -> None:
+    payload = b"w" * (64 * 1024 * 1024)
+
+    async def main() -> bytes:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            async with porto.scope() as s:
+                first = s.spawn(client.write, payload)
+                await porto.sleep(0.02)  # the first write has sent a part and waits
+                for call in (lambda: client.write(b"intruder"), lambda: client.writev([b"i"])):
+                    with pytest.raises(porto.BusyResourceError, match=r"porto\.Lock") as caught:
+                        call()
+                    assert isinstance(caught.value, porto.PortoError)
+                    assert "one reader and one writer at a time" in str(caught.value)
+                # The refused calls changed nothing: the first write goes on and completes.
+                received = s.spawn(read_exactly, server, len(payload))
+                await first
+            data = await received
+            return data[:4] + data[-4:]
+
+    assert run(main()) == b"wwwwwwww"
+
+
+def test_a_second_reader_is_refused_while_a_read_waits() -> None:
+    async def main() -> bytes:
+        client, server, listener = await connected()
+        async with client, server, listener, porto.scope() as s:
+            first = s.spawn(server.read, 16)
+            await porto.sleep(0.01)  # waiting for data
+            for call in (
+                lambda: server.read(8),
+                lambda: server.read_buffer(8),
+                lambda: server.read_into(bytearray(8)),
+            ):
+                with pytest.raises(porto.BusyResourceError, match="reading from"):
+                    call()
+            await client.write(b"for the first")
+            return await first
+
+    assert run(main()) == b"for the first"
+
+
+def test_a_reader_and_a_writer_may_use_a_stream_at_once() -> None:
+    async def main() -> tuple[bytes, bytes]:
+        client, server, listener = await connected()
+        async with client, server, listener, porto.scope() as s:
+            reading = s.spawn(client.read, 8)
+            await porto.sleep(0.01)
+            await client.write(b"out")  # a write while a read waits
+            await server.write(b"in")
+            reply = await reading
+            return reply, await read_exactly(server, 3)
+
+    assert run(main()) == (b"in", b"out")
+
+
+def test_the_claim_is_released_when_the_operation_ends_however_it_ends() -> None:
+    async def main() -> None:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            # Completed (fast path and slow path), failed, cancelled: each frees the stream.
+            await client.write(b"a")
+            await client.write(b"b")
+            assert await read_exactly(server, 2) == b"ab"
+            async with porto.move_on_after(0.01):
+                await server.read()  # cancelled while waiting
+            await client.write(b"c")
+            assert await server.read(4) == b"c"
+            with pytest.raises(TypeError):
+                server.read_into(b"immutable")  # pyright: ignore[reportArgumentType]
+            await client.write(b"d")
+            assert await server.read(4) == b"d"
+            await client.aclose()
+            assert await server.read() == b""
+            await server.shutdown_write()
+            with pytest.raises(BrokenPipeError):
+                await server.write(b"e")  # failed
+            with pytest.raises(BrokenPipeError):
+                await server.write(b"f")  # and the claim was free again to fail the same way
+
+    run(main())
 
 
 def test_cancelling_a_read_loses_no_bytes() -> None:

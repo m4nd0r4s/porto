@@ -139,6 +139,21 @@ impl<S> Registration<S> {
         }
     }
 
+    /// Completes once the registration is closed (or released by its driver), at once if it
+    /// already is: what a waiting task that is not waiting for readiness selects against to
+    /// end promptly when the resource is closed under it.
+    ///
+    /// It waits on the priority interest, which a TCP source never reports (readiness other
+    /// than a close is forgotten and waited out again), so only [`ClosedResource`] ends it.
+    pub async fn closed(&self) {
+        loop {
+            match self.readiness(Interest::PRIORITY).await {
+                Err(_) => return,
+                Ok(event) => self.clear_readiness(event),
+            }
+        }
+    }
+
     /// Forgets the readiness in `event`, which an operation consumed (it hit `WouldBlock`),
     /// unless newer readiness arrived since it was observed.
     pub fn clear_readiness(&self, event: ReadyEvent) {

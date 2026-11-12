@@ -175,14 +175,77 @@ fn nodelay_and_keepalive_are_set() {
 }
 
 #[test]
-fn descriptor_exhaustion_is_emfile_and_enfile() {
+fn resource_exhaustion_is_no_descriptors_no_buffers_or_no_memory() {
     #[cfg(unix)]
-    {
-        assert!(is_descriptor_exhaustion(&io::Error::from_raw_os_error(24)));
-        assert!(is_descriptor_exhaustion(&io::Error::from_raw_os_error(23)));
+    for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+        assert!(is_resource_exhaustion(&io::Error::from_raw_os_error(code)));
     }
-    assert!(!is_descriptor_exhaustion(&io::Error::from_raw_os_error(2)));
-    assert!(!is_descriptor_exhaustion(&io::ErrorKind::WouldBlock.into()));
+    assert!(!is_resource_exhaustion(&io::Error::from_raw_os_error(2)));
+    assert!(!is_resource_exhaustion(&io::ErrorKind::WouldBlock.into()));
+    // A synthetic out-of-memory error (no OS code) is not the OS running out.
+    assert!(!is_resource_exhaustion(&io::ErrorKind::OutOfMemory.into()));
+}
+
+#[test]
+fn a_connection_that_failed_before_accept_is_skipped_not_raised() {
+    assert!(is_aborted_connection(
+        &io::ErrorKind::ConnectionAborted.into()
+    ));
+    #[cfg(unix)]
+    for code in [
+        libc::ECONNABORTED,
+        libc::EPROTO,
+        libc::EPERM,
+        libc::ENETDOWN,
+    ] {
+        assert!(is_aborted_connection(&io::Error::from_raw_os_error(code)));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    for code in [libc::EHOSTUNREACH, libc::ENETUNREACH, libc::EOPNOTSUPP] {
+        assert!(is_aborted_connection(&io::Error::from_raw_os_error(code)));
+    }
+    // Resource exhaustion, a closed listener and a would-block are something else.
+    #[cfg(unix)]
+    for code in [libc::EMFILE, libc::ENFILE, libc::EBADF, libc::EINVAL] {
+        assert!(!is_aborted_connection(&io::Error::from_raw_os_error(code)));
+    }
+    assert!(!is_aborted_connection(&io::ErrorKind::WouldBlock.into()));
+}
+
+#[cfg(unix)]
+#[test]
+fn accept_skips_a_connection_the_client_reset_and_returns_the_next() {
+    use std::net::Shutdown;
+    let listener = listen(&options()).unwrap();
+    let port = port_of(&listener);
+    for _ in 0..4 {
+        let client = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        client.set_linger(Some(Duration::ZERO)).unwrap();
+        client
+            .connect(&SockAddr::from(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                port,
+            ))))
+            .unwrap();
+        let _ = client.shutdown(Shutdown::Both);
+        drop(client); // RST before the connection was accepted
+    }
+    let mut last = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    last.write_all(b"good").unwrap();
+    // However the OS reports the reset ones (accepted, then reset; or ECONNABORTED, skipped),
+    // accept never raises: it returns connections until the queue is empty.
+    let mut accepted = 0;
+    for _ in 0..500 {
+        match accept(&listener) {
+            Ok(_) => accepted += 1,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && accepted > 0 => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept raised {error}"),
+        }
+    }
+    assert!(accepted >= 1, "the good connection was accepted");
 }
 
 #[test]

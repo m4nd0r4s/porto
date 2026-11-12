@@ -129,6 +129,7 @@ pub(crate) fn run<T>(
     drop(state);
     // The run's pooled buffers go with it (13-io-driver.md §6).
     crate::io::pool::clear();
+    crate::io::op::clear_run_state();
     Ok(output)
 }
 

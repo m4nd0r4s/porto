@@ -101,6 +101,26 @@ fn a_registration_is_driven_by_the_driver_it_was_made_with_only() {
 }
 
 #[test]
+fn closed_completes_when_the_registration_is_closed() {
+    let driver = driver();
+    let (_peer, stream) = socketpair();
+    let registration = register(&driver, stream);
+    let mut closed = std::pin::pin!(registration.closed());
+    let (counter, waker) = CountingWaker::new();
+    let mut cx = Context::from_waker(&waker);
+    assert!(closed.as_mut().poll(&mut cx).is_pending());
+    registration.close().unwrap();
+    assert_eq!(counter.wakes(), 1, "close woke the waiter");
+    assert!(closed.as_mut().poll(&mut cx).is_ready());
+    // Already closed: ready at once.
+    assert!(
+        std::pin::pin!(registration.closed())
+            .poll(&mut cx)
+            .is_ready()
+    );
+}
+
+#[test]
 fn new_registers_and_drop_deregisters() {
     let driver = driver();
     let (_left, right) = socketpair();
