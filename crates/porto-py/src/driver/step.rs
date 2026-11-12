@@ -94,6 +94,18 @@ struct Running {
     stack: Cell<CancelStack>,
 }
 
+impl Drop for Running {
+    fn drop(&mut self) {
+        // A poll that unwound (a Rust panic in the step loop) before it gave the body the handle
+        // `current_task` made: the handle points at a task that is about to be cancelled and
+        // freed, and nothing else would end it (`PyTask::py_handle` was empty). Its outcome is
+        // the task's, and it forgets the pointer.
+        if let Some(handle) = self.made_handle.take() {
+            handle.get().finish(TaskOutcome::Cancelled(None));
+        }
+    }
+}
+
 impl Running {
     /// Runs `f` on the cancel stack. `f` MUST NOT run Python code, which could reach the stack
     /// again.
