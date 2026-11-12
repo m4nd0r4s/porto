@@ -26,13 +26,13 @@ await porto.net.serve_tcp(handler, host=None, port=0, *, tls=None,
 ### 1.1 Stream API (`TcpStream`, `UnixStream`, `TlsStream` share the `porto.abc.ByteStream` protocol)
 | Method | Semantics |
 |---|---|
-| `await read(max=65536) -> bytes` | `b""` at EOF |
+| `await read(max=65536) -> bytes` | `b""` at EOF; takes bytes the buffered reads left in the receive buffer first |
 | `await read_buffer(max=65536) -> porto.Buffer` | zero-copy |
 | `await read_into(buf) -> int` | writable buffer protocol |
-| `await read_exact(n) -> bytes` | raises `porto.IncompleteReadError(partial)` |
+| `await read_exact(n) -> bytes` | exactly `n` bytes; raises `porto.IncompleteReadError(partial, n)` if the stream ends first |
 | `await read_until(sep: bytes, *, limit=65536) -> bytes` | includes sep; raises `porto.LimitOverrunError` |
-| `await readline(limit=65536)` | `read_until(b"\n")` |
-| `await read_to_end(*, limit) -> bytes` | |
+| `await readline(limit=65536) -> bytes` | `read_until(b"\n", limit=limit)` |
+| `await read_to_end(*, limit) -> bytes` | until EOF; `limit` is required |
 | `await write(data)` | writes **all** (buffer protocol); backpressure aware |
 | `await writev(list_of_buffers)` | vectored |
 | `await sendfile(file, offset=0, count=None)` | zero-copy where the OS supports it |
@@ -48,10 +48,14 @@ Details of the implemented subset:
 - A `write`/`writev` cancelled after it sent part of its data leaves the stream broken: later writes raise `porto.BrokenResourceError` (message: an earlier write was cancelled, or failed with an error that did not end the connection, after sending part of its data; close it and open a new connection). Reads and `aclose` still work (13 §5). One that failed after a partial send breaks the stream too, unless its error is a lost connection (reset, broken pipe, not connected, timed out) that later writes repeat on their own.
 - `shutdown_write` after which a `write` raises `BrokenPipeError`; a peer reset raises `ConnectionResetError` with `errno` (§5).
 - `aclose()` closes at once and is idempotent; it closes even when the calling task is cancelled. Operations waiting on the stream, and every later one, raise `porto.ClosedResourceError` (13 §4). `async with stream` calls it.
-- `TcpStream` is a `porto.abc.ByteStream`: a `runtime_checkable` `Protocol` of the methods the stream types share. It holds the methods above now; the buffered reads and `sendfile` join it with their beads.
+- `TcpStream` is a `porto.abc.ByteStream`: a `runtime_checkable` `Protocol` of the methods the stream types share. It holds the methods above now; `sendfile` joins it with its bead.
 - `porto.net._connect_tcp_numeric(host, port, *, nodelay=True)` is the private core of `connect_tcp` (a numeric address, no resolution, no Happy Eyeballs), kept until `connect_tcp` replaces it.
 
-**Internal read buffer:** each stream owns a lane-pooled receive buffer. `read_until`/`readline` scan it without copying until the delimiter is found. Cancel safety (T3) is guaranteed because unconsumed bytes stay in the buffer.
+**Buffered reads and the internal read buffer.** Each stream owns a receive buffer of the bytes received and not consumed yet, in storage from the lane's pool (13 §6): taken when the first bytes are buffered, handed back as soon as the buffer is empty, so a stream idle between messages holds none. `read_exact`, `read_until`, `readline` and `read_to_end` receive into it and take their result out of it; `read`, `read_buffer` and `read_into` return buffered bytes first (without waiting for the socket; `read_buffer` and `read_into` copy them, the zero-copy receive is for bytes that were not buffered) and only receive when the buffer is empty. Bytes leave the buffer only when an operation completes with them, so cancelling any read loses nothing: what it received is still buffered for the next read of any kind (T3). A read on a closed stream raises `porto.ClosedResourceError`, buffered bytes or not.
+- `read_until(sep, *, limit=65536)` scans the buffer without copying, resuming where the last scan of the call stopped (a delimiter that arrives in many small segments costs one pass over the bytes, not one per segment). `sep` is any non-empty bytes-like object (`ValueError` for an empty one, `TypeError` for a `str`); `limit >= len(sep)` (`ValueError` otherwise). The separator must end within the first `limit` bytes: if it does not, `porto.LimitOverrunError` is raised, **nothing is consumed** (the bytes received so far, at most `limit`, stay buffered: read them with `read()`, or call again with a larger limit) and the buffer never grows past `limit` for the call.
+- `read_exact(n)` receives no more than the `n` bytes it needs from the socket (anything extra a previous `read_until` buffered counts first). `n >= 0`; `read_exact(0)` returns `b""` at once. `read_to_end(*, limit)` takes `limit` as a required keyword: an unbounded read of a peer's data is a memory bug waiting to happen, so the caller says how much is too much; more than `limit` bytes raise `LimitOverrunError` with the first `limit + 1` bytes left buffered.
+- End of stream: `read_exact` and `read_until` raise `porto.IncompleteReadError` whose `.partial` holds the bytes that arrived (consumed, since nothing more can complete them) and `.expected` is `n` (`None` for `read_until`). `readline` is `read_until(b"\n", limit=limit)` and so also raises it at EOF, with `partial == b""` when the stream ended on a line boundary: `while True: try: line = await s.readline() except porto.IncompleteReadError as e: ...` is the loop, with `e.partial` the unterminated last line, if any. `read_to_end` returns what arrived, possibly `b""`. A peer reset raises `ConnectionResetError`, not `IncompleteReadError`.
+- A buffered read takes the stream's one reader like `read` does: a second concurrent read of any kind raises `porto.BusyResourceError`.
 
 ### 1.2 Listener
 `await accept() -> TcpStream`, `async for conn in listener`, `port`, `sockname`, `fileno()`, `aclose()` (also `async with`). On Linux and the BSDs, `accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)` is used; elsewhere `accept` then `fcntl`/`ioctl`, so accepted sockets are nonblocking and close-on-exec everywhere. Cancelling an `accept()` loses no connection (T3). Closing the listener makes a waiting `accept()` raise `porto.ClosedResourceError` and ends an `async for` over it (`StopAsyncIteration`); connections not yet accepted are dropped by the OS.

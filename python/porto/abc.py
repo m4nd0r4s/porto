@@ -2,8 +2,7 @@
 
 ``ByteStream`` is the protocol ``porto.net.TcpStream`` implements (and, as they land,
 ``UnixStream`` and ``TlsStream``), so code that reads and writes bytes can take any of them.
-The buffered reads (``read_exact``, ``read_until``, ``readline``, ``read_to_end``) and
-``sendfile`` join it with the stream types that implement them.
+``sendfile`` joins it with the stream types that implement it.
 """
 
 from collections.abc import Awaitable, Iterable
@@ -31,6 +30,22 @@ class ByteStream(Protocol):
 
     def read_into(self, buffer: bytearray | memoryview | Buffer, /) -> Awaitable[int]:
         """Receives into a writable buffer; the number of bytes, 0 at the end of the stream."""
+        ...
+
+    def read_exact(self, n: int, /) -> Awaitable[bytes]:
+        """Receives exactly ``n`` bytes; ``porto.IncompleteReadError`` if the stream ends first."""
+        ...
+
+    def read_until(self, sep: _Bytes, *, limit: int = 65536) -> Awaitable[bytes]:
+        """Receives up to and including ``sep``; ``porto.LimitOverrunError`` past ``limit``."""
+        ...
+
+    def readline(self, limit: int = 65536) -> Awaitable[bytes]:
+        """``read_until(b"\\n", limit=limit)``."""
+        ...
+
+    def read_to_end(self, *, limit: int) -> Awaitable[bytes]:
+        """Receives until the end of the stream; ``porto.LimitOverrunError`` past ``limit``."""
         ...
 
     def write(self, data: _Bytes, /) -> Awaitable[None]:

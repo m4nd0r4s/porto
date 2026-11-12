@@ -98,20 +98,38 @@ impl IoHandle {
     /// Receives at most `max` bytes: `bytes`, empty at end of stream.
     #[pyo3(signature = (max = DEFAULT_MAX, /))]
     fn read(&self, py: Python<'_>, max: usize) -> PyResult<Py<PyAny>> {
-        self.submit(py, IoOp::Read { max })
+        self.submit(
+            py,
+            IoOp::Read {
+                max,
+                buffered: None,
+            },
+        )
     }
 
     /// Receives at most `max` bytes into a `porto.Buffer` from the lane's pool, without the
     /// copy into `bytes`: the buffer, empty at end of stream.
     #[pyo3(signature = (max = DEFAULT_MAX, /))]
     fn read_buffer(&self, py: Python<'_>, max: usize) -> PyResult<Py<PyAny>> {
-        self.submit(py, IoOp::ReadBuffer { max })
+        self.submit(
+            py,
+            IoOp::ReadBuffer {
+                max,
+                buffered: None,
+            },
+        )
     }
 
     /// Receives into `buffer`, a writable bytes-like object: the number of bytes received.
     fn read_into(&self, py: Python<'_>, buffer: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let buf = PyBufferMut::new(buffer, "read_into()'s buffer")?;
-        self.submit(py, IoOp::ReadInto { buf })
+        self.submit(
+            py,
+            IoOp::ReadInto {
+                buf,
+                buffered: None,
+            },
+        )
     }
 
     /// Sends all of `data`: `None` once the last byte went out.

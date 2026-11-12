@@ -30,6 +30,7 @@ use socket2::{SockAddr, Socket};
 
 use super::buffer::Buffer;
 use super::buffer_view::{PyBufferMut, PyBufferRef};
+use super::buffered::{BufferedRead, Outcome, SharedRecvBuffer};
 use super::handle::IoHandle;
 use super::pool::PooledBytes;
 use super::sockaddr;
@@ -81,12 +82,26 @@ impl Drop for Claim {
 
 /// An operation on a registered socket, and its state between attempts.
 pub(crate) enum IoOp {
-    /// Receive at most `max` bytes → `bytes` (empty at end of stream).
-    Read { max: usize },
-    /// Receive at most `max` bytes into a pooled buffer → `porto.Buffer` (no `bytes` copy).
-    ReadBuffer { max: usize },
+    /// Receive at most `max` bytes → `bytes` (empty at end of stream). A stream's receive
+    /// buffer (`buffered`), if it has bytes, answers without the socket.
+    Read {
+        max: usize,
+        buffered: Option<SharedRecvBuffer>,
+    },
+    /// Receive at most `max` bytes into a pooled buffer → `porto.Buffer` (no `bytes` copy, unless
+    /// the bytes come out of the stream's receive buffer).
+    ReadBuffer {
+        max: usize,
+        buffered: Option<SharedRecvBuffer>,
+    },
     /// Receive into a writable buffer → the number of bytes received.
-    ReadInto { buf: PyBufferMut },
+    ReadInto {
+        buf: PyBufferMut,
+        buffered: Option<SharedRecvBuffer>,
+    },
+    /// `read_exact`, `read_until`, `readline` or `read_to_end`: receive into the stream's
+    /// buffer until the bytes asked for are there → `bytes`.
+    ReadBuffered(BufferedRead),
     /// Send all of `data`, from `off` on → `None`. Sends what it can at each attempt. If it
     /// ends having sent only part of `data` (cancelled, or failed with an error that did not end the
     /// connection), it sets `mid_write`.
@@ -127,6 +142,8 @@ pub(crate) enum IoOp {
 pub(crate) enum Completed {
     /// Bytes received.
     Bytes(Vec<u8>),
+    /// How a buffered read ended (`read_exact` and the like).
+    Buffered(Outcome),
     /// Bytes received into a pooled buffer.
     Buffer(PooledBytes),
     /// A byte count.
@@ -175,6 +192,7 @@ impl IoOp {
             Self::Read { .. }
             | Self::ReadBuffer { .. }
             | Self::ReadInto { .. }
+            | Self::ReadBuffered(_)
             | Self::Accept
             | Self::AcceptTcp { .. }
             | Self::RecvFrom { .. }
@@ -192,6 +210,40 @@ impl IoOp {
         matches!(self, Self::WaitReadable | Self::WaitWritable)
     }
 
+    /// Completes the operation from bytes the stream already buffered, without the socket: the
+    /// result, or `None` when it has to receive. Such a read must not wait for readiness: the
+    /// bytes it needs are in the buffer, and the socket may never become readable again.
+    pub(crate) fn complete_from_buffer(&mut self) -> Option<io::Result<Completed>> {
+        match self {
+            Self::Read {
+                max,
+                buffered: Some(buffered),
+            } => {
+                let mut buffered = buffered.lock();
+                (!buffered.is_empty()).then(|| Ok(Completed::Bytes(buffered.take(*max))))
+            }
+            Self::ReadBuffer {
+                max,
+                buffered: Some(buffered),
+            } => {
+                let mut buffered = buffered.lock();
+                (!buffered.is_empty()).then(|| buffered.take_pooled(*max).map(Completed::Buffer))
+            }
+            Self::ReadInto {
+                buf,
+                buffered: Some(buffered),
+            } => {
+                let mut buffered = buffered.lock();
+                (!buffered.is_empty())
+                    .then(|| Ok(Completed::Count(buffered.take_into(buf.spare()))))
+            }
+            Self::ReadBuffered(read) => read
+                .complete_from_buffer()
+                .map(|outcome| Ok(Completed::Buffered(outcome))),
+            _ => None,
+        }
+    }
+
     /// Attempts the operation once, nonblocking (retrying on `EINTR`). `WouldBlock` when the
     /// socket is not ready; a partial send keeps its progress for the next attempt.
     pub(crate) fn attempt(&mut self, socket: &Socket) -> io::Result<Completed> {
@@ -204,15 +256,19 @@ impl IoOp {
     }
 
     fn attempt_once(&mut self, socket: &Socket) -> io::Result<Completed> {
+        if let Some(completed) = self.complete_from_buffer() {
+            return completed;
+        }
         match self {
-            Self::Read { max } => {
+            Self::ReadBuffered(read) => read.attempt(socket).map(Completed::Buffered),
+            Self::Read { max, .. } => {
                 let mut bytes = receive_buffer(*max)?;
                 let received = socket.recv(bytes.spare_capacity_mut())?;
                 // SAFETY: `recv` initialized the first `received` bytes.
                 unsafe { bytes.set_len(received) };
                 Ok(Completed::Bytes(bytes))
             }
-            Self::ReadBuffer { max } => {
+            Self::ReadBuffer { max, .. } => {
                 let mut bytes = PooledBytes::with_capacity(*max)?;
                 let spare = &mut bytes.vec_mut().spare_capacity_mut()[..*max];
                 let received = socket.recv(spare)?;
@@ -220,7 +276,7 @@ impl IoOp {
                 unsafe { bytes.vec_mut().set_len(received) };
                 Ok(Completed::Buffer(bytes))
             }
-            Self::ReadInto { buf } => socket.recv(buf.spare()).map(Completed::Count),
+            Self::ReadInto { buf, .. } => socket.recv(buf.spare()).map(Completed::Count),
             Self::Write { data, off, .. } => {
                 let bytes = data.bytes();
                 while *off < bytes.len() {
@@ -441,6 +497,7 @@ impl Completed {
     fn into_py(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(match self {
             Self::Bytes(bytes) => PyBytes::new(py, &bytes).into_any().unbind(),
+            Self::Buffered(outcome) => return outcome.into_py(py),
             Self::Buffer(bytes) => Py::new(py, Buffer::from_pooled(bytes))?.into_any(),
             Self::Count(count) => count.into_pyobject(py)?.into_any().unbind(),
             Self::Done => py.None(),
@@ -627,7 +684,18 @@ async fn back_off(registration: &IoRegistration) {
 /// `WouldBlock`. Dropping it while pending unlinks its waiter and consumes nothing (T3).
 async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option<Claim>) -> Resume {
     let interest = op.interest();
-    let result = if op.waits_only() {
+    // A closed stream answers nothing, buffered bytes or not: like the fast path, which fails
+    // on the closed registration before it looks at the buffer.
+    let from_buffer = if registration.is_closed() {
+        None
+    } else {
+        op.complete_from_buffer()
+    };
+    let result = if let Some(completed) = from_buffer {
+        // The bytes were buffered already (the fast path was skipped, out of budget): there is
+        // nothing to wait for.
+        completed
+    } else if op.waits_only() {
         registration
             .readiness(interest)
             .await

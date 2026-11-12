@@ -30,6 +30,12 @@ async def check_stream_methods(stream: net.TcpStream) -> None:
     assert_type(await stream.read_buffer(), porto.Buffer)
     assert_type(await stream.read_into(bytearray(8)), int)
     assert_type(await stream.read_into(porto.Buffer(8)), int)
+    assert_type(await stream.read_exact(4), bytes)
+    assert_type(await stream.read_until(b"\r\n"), bytes)
+    assert_type(await stream.read_until(bytearray(b"\n"), limit=1024), bytes)
+    assert_type(await stream.readline(), bytes)
+    assert_type(await stream.readline(limit=100), bytes)
+    assert_type(await stream.read_to_end(limit=1 << 20), bytes)
     assert_type(await stream.write(b"data"), None)
     assert_type(await stream.write(memoryview(b"data")), None)
     assert_type(await stream.writev([b"a", bytearray(b"b"), porto.Buffer(1)]), None)
@@ -51,6 +57,8 @@ def check_a_tcp_stream_is_a_byte_stream(stream: net.TcpStream) -> abc.ByteStream
 async def check_code_over_any_byte_stream(stream: abc.ByteStream) -> bytes:
     await stream.write(b"ping")
     data = await stream.read(4)
+    data += await stream.read_exact(2) + await stream.readline()
+    data += await stream.read_until(b"\0") + await stream.read_to_end(limit=100)
     await stream.shutdown_write()
     await stream.aclose()
     return data
@@ -60,4 +68,8 @@ def check_wrong_calls_are_errors(stream: net.TcpStream) -> None:
     stream.read("10")  # pyright: ignore[reportArgumentType]
     stream.write("text")  # pyright: ignore[reportArgumentType]
     stream.set_keepalive(1.0)  # pyright: ignore[reportCallIssue]
+    stream.read_exact("4")  # pyright: ignore[reportArgumentType]
+    stream.read_until("\n")  # pyright: ignore[reportArgumentType]
+    stream.read_until(b"\n", 10)  # pyright: ignore[reportCallIssue]
+    stream.read_to_end()  # pyright: ignore[reportCallIssue]
     net.listen_tcp(port="80")  # pyright: ignore[reportArgumentType, reportUnusedCoroutine]

@@ -453,6 +453,30 @@ class TcpStream:
         """Receives into the writable ``buffer`` (not empty): the number of bytes received, 0
         at the end of the stream."""
 
+    def read_exact(self, n: int, /) -> Awaitable[bytes]:
+        """Receives exactly ``n`` bytes (``n >= 0``). If the stream ends first it raises
+        ``porto.IncompleteReadError`` whose ``.partial`` holds the bytes that arrived (and
+        which are consumed). Bytes a cancelled read received stay buffered for the next read."""
+
+    def read_until(
+        self, sep: bytes | bytearray | memoryview | Buffer, *, limit: int = 65536
+    ) -> Awaitable[bytes]:
+        """Receives up to and including the first ``sep`` (not empty), which has to end within
+        the first ``limit`` bytes (``limit >= len(sep)``): otherwise ``porto.LimitOverrunError``,
+        with the bytes received so far left buffered. If the stream ends first it raises
+        ``porto.IncompleteReadError`` (``.partial`` is what arrived). Scans the stream's receive
+        buffer without copying; a cancelled call loses nothing."""
+
+    def readline(self, limit: int = 65536) -> Awaitable[bytes]:
+        """``read_until(b"\\n", limit=limit)``: one line, newline included. Raises
+        ``porto.IncompleteReadError`` at the end of the stream, also for an empty one: a loop
+        reading lines ends on it."""
+
+    def read_to_end(self, *, limit: int) -> Awaitable[bytes]:
+        """Receives until the end of the stream (``b""`` when it is empty). If more than
+        ``limit`` bytes come, ``porto.LimitOverrunError``, with the bytes received so far left
+        buffered."""
+
     def write(self, data: bytes | bytearray | memoryview | Buffer, /) -> Awaitable[None]:
         """Sends all of ``data``, waiting while the socket's buffers are full. If the task is
         cancelled after part of it was sent, the stream is broken: later writes raise

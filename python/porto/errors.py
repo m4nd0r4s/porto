@@ -97,8 +97,10 @@ class IncompleteReadError(PortoError, EOFError):
 
 
 class LimitOverrunError(PortoError):
-    """A read went past its buffer limit without finding the separator; raise the stream's
-    limit, or read in chunks."""
+    """A read went past its ``limit`` without finding the separator (``read_until``,
+    ``readline``) or reaching the end of the stream (``read_to_end``). Nothing was consumed: the
+    bytes received so far are still buffered. Read them with ``read()``, pass a larger ``limit``,
+    or close the stream if the peer should not send this much."""
 
 
 class Lagged(PortoError):

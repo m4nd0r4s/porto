@@ -2,8 +2,11 @@
 //! with the driver of the run that made it, whose methods return the awaitables of the
 //! [`IoOp`]s. It implements `porto.abc.ByteStream`.
 //!
-//! The stream keeps three facts of its own (13-io-driver.md §5):
+//! The stream keeps four things of its own (13-io-driver.md §5, 17-networking-tls-dns.md §1.1):
 //!
+//! - its receive buffer, the bytes received and not consumed yet: the buffered reads
+//!   (`read_exact`, `read_until`, `readline`, `read_to_end`) fill and drain it, and every read
+//!   takes buffered bytes before it receives, so what a cancelled read received is never lost;
 //! - whether a write was cancelled, or failed with an error that did not end the connection,
 //!   after it sent part of its data: the bytes on the wire then stop in the middle of what the
 //!   caller meant to send, so later writes raise
@@ -17,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use porto_net::tcp;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -27,10 +31,12 @@ use crate::driver::ready::{ready, ready_none};
 use crate::driver::step;
 use crate::errors::{BrokenResourceError, BusyResourceError};
 use crate::io::buffer_view::{PyBufferMut, PyBufferRef};
+use crate::io::buffered::{BufferedRead, ReadMode, SharedRecvBuffer};
 use crate::io::handle::register_on_lane;
 use crate::io::op::{
     Claim, IoOp, IoRegistration, MidWrite, os_error, start_connect, submit, submit_claimed,
 };
+use crate::io::recv_buffer::RecvBuffer;
 use crate::io::sockaddr;
 
 /// The most bytes one `read` asks for by default.
@@ -42,6 +48,8 @@ pub(crate) struct TcpStream {
     registration: Arc<IoRegistration>,
     /// Set when a write ended after sending part of its data and the connection lives on.
     mid_write: MidWrite,
+    /// The bytes received and not consumed yet.
+    incoming: SharedRecvBuffer,
     /// Held by the operation of the task reading the stream.
     reading: Arc<AtomicBool>,
     /// Held by the operation of the task writing the stream.
@@ -53,12 +61,25 @@ pub(crate) struct TcpStream {
 }
 
 impl TcpStream {
+    /// A buffered read of `mode`, claiming the stream's one reader.
+    fn buffered_read(&self, py: Python<'_>, call: &str, mode: ReadMode) -> PyResult<Py<PyAny>> {
+        let claim = self.claim_reader(call)?;
+        let read = BufferedRead::new(Arc::clone(&self.incoming), mode);
+        submit_claimed(
+            py,
+            &self.registration,
+            IoOp::ReadBuffered(read),
+            Some(claim),
+        )
+    }
+
     /// A stream over `socket` (nonblocking), registered with the driver of the run on this
     /// thread. `peer` is the peer's address, if the accept gave it.
     pub(crate) fn adopt(_py: Python<'_>, socket: Socket, peer: Option<SockAddr>) -> PyResult<Self> {
         Ok(Self {
             registration: register_on_lane(socket, "a TcpStream")?,
             mid_write: Arc::new(AtomicBool::new(false)),
+            incoming: Arc::new(Mutex::new(RecvBuffer::default())),
             reading: Arc::new(AtomicBool::new(false)),
             writing: Arc::new(AtomicBool::new(false)),
             peer: peer.map_or_else(OnceLock::new, OnceLock::from),
@@ -117,6 +138,35 @@ fn busy(call: &str, doing: &str, verb: &str) -> PyErr {
     ))
 }
 
+/// The separator of `read_until`: a bytes-like object with at least one byte.
+fn separator(sep: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let view = PyBufferRef::new(sep, "read_until()'s sep")?;
+    let separator = view.bytes().to_vec();
+    if separator.is_empty() {
+        return Err(PyValueError::new_err(
+            "porto: read_until()'s sep is empty, which matches everywhere; pass the bytes that \
+             end a message (b\"\\n\", b\"\\r\\n\")",
+        ));
+    }
+    Ok(separator)
+}
+
+/// The `limit` of a search for a separator of `separator_len` bytes: at least that, because the
+/// separator has to fit.
+fn search_limit(
+    limit: Option<&Bound<'_, PyAny>>,
+    call: &str,
+    separator_len: usize,
+) -> PyResult<usize> {
+    let Some(limit) = limit else {
+        return Ok(DEFAULT_MAX);
+    };
+    let minimum = i64::try_from(separator_len).unwrap_or(i64::MAX);
+    let hint = format!(" (the separator is {separator_len} bytes: it has to fit)");
+    let limit = int_in_range(limit, call, "limit", minimum..=i64::MAX, &hint)?;
+    Ok(usize::try_from(limit).unwrap_or(usize::MAX))
+}
+
 /// `max`, the optional argument of a read, as the length of a receive: at least 1, because a
 /// receive of 0 bytes returns 0, which reads as the end of the stream.
 fn receive_length(max: Option<&Bound<'_, PyAny>>, call: &str) -> PyResult<usize> {
@@ -137,7 +187,13 @@ impl TcpStream {
     fn read(&self, py: Python<'_>, max: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let max = receive_length(max, "read()")?;
         let claim = self.claim_reader("read()")?;
-        submit_claimed(py, &self.registration, IoOp::Read { max }, Some(claim))
+        let buffered = Some(Arc::clone(&self.incoming));
+        submit_claimed(
+            py,
+            &self.registration,
+            IoOp::Read { max, buffered },
+            Some(claim),
+        )
     }
 
     /// Receives at most `max` bytes into a `porto.Buffer` from the lane's pool, without the
@@ -149,7 +205,10 @@ impl TcpStream {
         submit_claimed(
             py,
             &self.registration,
-            IoOp::ReadBuffer { max },
+            IoOp::ReadBuffer {
+                max,
+                buffered: Some(Arc::clone(&self.incoming)),
+            },
             Some(claim),
         )
     }
@@ -165,7 +224,80 @@ impl TcpStream {
             ));
         }
         let claim = self.claim_reader("read_into()")?;
-        submit_claimed(py, &self.registration, IoOp::ReadInto { buf }, Some(claim))
+        let buffered = Some(Arc::clone(&self.incoming));
+        submit_claimed(
+            py,
+            &self.registration,
+            IoOp::ReadInto { buf, buffered },
+            Some(claim),
+        )
+    }
+
+    /// Receives exactly `n` bytes: `bytes`. If the stream ends first, `IncompleteReadError` with
+    /// the bytes that arrived. Bytes received by a cancelled read stay buffered.
+    fn read_exact(&self, py: Python<'_>, n: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let count = int_in_range(
+            n,
+            "read_exact()",
+            "n",
+            0..=i64::MAX,
+            " (the number of bytes)",
+        )?;
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        self.buffered_read(py, "read_exact()", ReadMode::Exact(count))
+    }
+
+    /// Receives up to and including the first `sep`: `bytes`. `LimitOverrunError` if `sep` does
+    /// not end within the first `limit` bytes (they stay buffered); `IncompleteReadError` if the
+    /// stream ends first.
+    #[pyo3(signature = (sep, *, limit = None))]
+    fn read_until(
+        &self,
+        py: Python<'_>,
+        sep: &Bound<'_, PyAny>,
+        limit: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let separator = separator(sep)?;
+        let limit = search_limit(limit, "read_until()", separator.len())?;
+        self.buffered_read(
+            py,
+            "read_until()",
+            ReadMode::Until {
+                call: "read_until()",
+                separator,
+                limit,
+            },
+        )
+    }
+
+    /// `read_until(b"\n", limit=limit)`: one line, its newline included.
+    #[pyo3(signature = (limit = None))]
+    fn readline(&self, py: Python<'_>, limit: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        let limit = search_limit(limit, "readline()", 1)?;
+        self.buffered_read(
+            py,
+            "readline()",
+            ReadMode::Until {
+                call: "readline()",
+                separator: b"\n".to_vec(),
+                limit,
+            },
+        )
+    }
+
+    /// Receives until the end of the stream: `bytes`. `LimitOverrunError` if the stream sends
+    /// more than `limit` bytes (they stay buffered).
+    #[pyo3(signature = (*, limit))]
+    fn read_to_end(&self, py: Python<'_>, limit: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let limit = int_in_range(
+            limit,
+            "read_to_end()",
+            "limit",
+            0..=i64::MAX,
+            " (the most bytes to return)",
+        )?;
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.buffered_read(py, "read_to_end()", ReadMode::ToEnd { limit })
     }
 
     /// Sends all of `data`, waiting while the socket's buffers are full: `None` once the last
