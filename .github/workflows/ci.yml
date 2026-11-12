@@ -75,20 +75,21 @@ jobs:
       # nextest does not run doctests.
       - run: cargo test --workspace --exclude porto-py --doc
 
+  # The wheel is built here (release, one per OS and Python: porto is not abi3, ADR-024), installed
+  # into a venv that has the dev tools but no porto, and the tests run against that installed
+  # wheel, never the source tree. Build and test share a job on purpose: a separate wheel job that
+  # `needs` a whole matrix would skip every py-test when one wheel fails, and a skipped required
+  # check passes. The wheel is kept as an artifact for a few days.
   py-test:
     name: py-test (${{ matrix.os }}, ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, windows-latest]
-        python: ["3.11", "3.14"]
-        event: ["${{ github.event_name }}"]
-        # The repository is private, so minutes count (macOS 10x, Windows 2x): pull requests test
-        # 3.11 on Linux only; pushes to main run the full matrix.
-        exclude:
-          - { os: macos-15, python: "3.11", event: pull_request }
-          - { os: windows-latest, python: "3.11", event: pull_request }
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
+        # Pull requests try the oldest and newest Python on every OS; pushes to main (and manual
+        # runs) run every version (51-build-ci-release.md §2).
+        python: ${{ fromJSON(github.event_name == 'pull_request' && '["3.11", "3.14"]' || '["3.11", "3.12", "3.13", "3.14"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
@@ -96,15 +97,29 @@ jobs:
         with:
           # One Rust cache per Python: porto-py is built against that interpreter.
           key: py${{ matrix.python }}
-      # Sets UV_PYTHON, so `uv sync` makes the venv with this Python and maturin builds the
-      # editable porto (pyo3 included) against that same interpreter.
+      # Sets UV_PYTHON, so the venv below and maturin's wheel use this Python.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
           cache-dependency-glob: "**/pyproject.toml"
-      - run: uv sync
-      - run: uv run pytest -q
+      # The dev tools without porto: `uv sync` would build an editable one.
+      - run: uv sync --no-install-package porto
+      - run: uv run --no-sync --directory packaging/porto maturin build --release --out ../../dist
+      - run: uv pip install --no-deps dist/*.whl
+        shell: bash
+      # The tests import the wheel from site-packages, not python/ or an editable install.
+      - run: >-
+          uv run --no-sync python -c
+          "import pathlib, porto; path = pathlib.Path(porto.__file__).resolve();
+          assert 'site-packages' in path.parts, path; print(path)"
+      # --no-sync: a sync would replace the wheel with an editable build.
+      - run: uv run --no-sync pytest -q
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.python }}
+          path: dist/*.whl
+          retention-days: 3
 
   # porto built without --release, so the debug_asserts of porto-core and porto-py run under
   # the Python tests (porto-szb.114: a waiter left filed with its scope only panicked there).
