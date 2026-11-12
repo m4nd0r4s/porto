@@ -26,6 +26,8 @@ Linux-only paths (epoll, io_uring) are measured in the Docker Desktop Linux VM o
 | 1M sleeping tasks | RSS < 2.5 GB; spawn ≥ 1M/s/lane |
 | §11 §11 table | absolute targets |
 
+**TCP echo (M1 exit).** One op is one 1 KiB round trip on one of 100 persistent connections; the server runs in the benchmark's process (porto `serve_tcp` + `read_exact` + `write`; asyncio and uvloop `start_server` + `readexactly` + `write` + `drain`) and the load comes from one external generator for all of them (`bench/micro/echo_client.py`: 4 uvloop client processes, timing itself), so only the server is measured and the ratio of times is the ratio of servers. Status (2026-11-12, `bench/results/2026-11-12-tcp-echo.md`): **not met**; porto is at parity with uvloop streams (0.8-1.06×), because more than 90 % of both servers' time is in `recv`/`send`/`kevent`; the gate's definition is open (porto-vw8.19).
+
 ¹ Not 2×: the interpreter's own share of the op is too large. On the reference machine (2026-11-06) asyncio+uvloop takes ~176 ns per op, so 2× would leave 88 ns; CPython's work for `async with` (two special-method lookups and calls, two `GET_AWAITABLE`/`SEND` rounds) plus the body's attribute read, method call and int add is ~60–65 ns of it, measured with samply on porto's 90 ns op. Porto's share is ~24 ns: the lock and the T2 checks at entry and exit, the guard (one object per entry), and the `StopIteration` that 3.12+ `SEND` needs to deliver the guard. The asyncio twin pays for none of these, since it reads and writes a plain attribute. Measured: 1.9× (93 ns vs 176 ns, porto-szb.118).
 
 ## 3. Free-threaded scaling (3.14t)
