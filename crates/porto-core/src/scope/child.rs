@@ -119,6 +119,13 @@ impl TaskScope {
         })
     }
 
+    /// Whether this is a reference to `scope`.
+    pub fn is_for<E>(&self, scope: &Arc<ScopeNode<E>>) -> bool {
+        // A `ScopeNode` is `repr(C)` with its vtable reference first, so the node's address is
+        // the field's (see `try_attach`).
+        self.node.as_ptr().cast_const().cast::<ScopeNode<E>>() == std::ptr::from_ref(&**scope)
+    }
+
     /// Tells the scope how its child ended and releases the child's reference to it.
     pub fn end(self, end: TaskEnd) {
         let node = self.node;

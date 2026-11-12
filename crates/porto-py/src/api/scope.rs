@@ -30,8 +30,11 @@
 //! `finally:`), a scope is a cancel scope only: entering and leaving it do not await, and
 //! spawning into it raises.
 //!
-//! Not yet: names, `start()` (§3), `Task.cancel()` (§4), and spawning from other lanes or
-//! threads (C10).
+//! `Scope.start()` (§3) runs a task in a hidden scope the caller waits in until the task calls
+//! `started.set(value)`, which moves it into this scope (`started.rs`). `Task.cancel()` (§4) is
+//! in `task.rs`.
+//!
+//! Not yet: names, and spawning from other lanes or threads (C10).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -49,6 +52,7 @@ use super::run::{closing_on_error, coroutine_from};
 use super::scope_deadline::{self, ScopeDeadline, seconds};
 use super::scope_exit;
 use super::scope_exit::ScopeExit;
+use super::started::Started;
 use super::task::Task;
 use crate::async_slots;
 use crate::driver::pytask::{self, PyScopeNode, PyScopeRef, Spawned};
@@ -62,13 +66,15 @@ use crate::errors::{Cancelled, NoRuntimeError};
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Scope>()?;
     module.add_class::<ScopeExit>()?;
+    module.add_class::<Started>()?;
     // Right after `add_class`, before anything can see the type (see `async_slots`).
     async_slots::install_iter_slots::<ScopeExit>(module.py(), scope_exit::scope_exit_iternext)?;
     freelist::install::<ScopeExit>(module.py(), &exit_freelist::SLOTS)?;
     module.add_function(wrap_pyfunction!(scope, module)?)?;
     module.add_function(wrap_pyfunction!(timeout, module)?)?;
     module.add_function(wrap_pyfunction!(move_on_after, module)?)?;
-    module.add_function(wrap_pyfunction!(shield, module)?)
+    module.add_function(wrap_pyfunction!(shield, module)?)?;
+    module.add_function(wrap_pyfunction!(hidden_scope, module)?)
 }
 
 freelist::gil_freelist!(exit_freelist, 64);
@@ -92,6 +98,13 @@ fn scope(
         .map(|value| seconds("porto.scope()", "deadline", value))
         .transpose()?;
     Ok(Scope::new(timeout, deadline, raise_on_timeout).shielded(shield))
+}
+
+/// `_hidden_scope()`: the scope `Scope.start` runs a task in until it reports: a nursery whose
+/// exit raises a single failure bare.
+#[pyfunction(name = "_hidden_scope")]
+fn hidden_scope() -> Scope {
+    Scope::new(None, None, false).bare()
 }
 
 /// `porto.shield(*, timeout=None)`: `porto.scope(shield=True, timeout=timeout)` (C8), also
@@ -141,6 +154,10 @@ pub struct Scope {
     deadline: ScopeDeadline,
     /// Whether the exit raises `TimeoutError` when the deadline cut the block short (C3).
     raise_on_timeout: bool,
+    /// Whether the exit raises the one failure of a scope that has a single, as it is, instead
+    /// of a group: the hidden scope of `Scope.start` (15 §3), whose child's exception must
+    /// reach the caller of `start` bare.
+    bare_error: bool,
 }
 
 /// The bits of `Scope::flags`.
@@ -176,6 +193,9 @@ enum Phase {
     Closed,
 }
 
+/// `porto._bridge.start`: the coroutine behind `Scope.start`.
+static START: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
 /// `BaseExceptionGroup`, built in since 3.11.
 static BASE_EXCEPTION_GROUP: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
@@ -206,6 +226,57 @@ impl Scope {
                 };
             self.spawn_child(&coro_or_fn, &args, options)
         })
+    }
+
+    /// `await s.start(fn, *args, name=None)`: spawns `fn(*args, started=Started())` into a
+    /// hidden scope the caller waits in, waits until the task calls `started.set(value)`, and
+    /// returns `value`; the task is then a child of this scope (15 §3, Trio's
+    /// `nursery.start`). What the task raises before `set` is raised from `start` as it is,
+    /// and cancelling the caller meanwhile cancels the task. Calls `fn` with keyword
+    /// `started` only.
+    #[pyo3(signature = (fn_, /, *args, name=None, **kwargs))]
+    fn start<'py>(
+        slf: &Bound<'py, Self>,
+        fn_: Bound<'py, PyAny>,
+        args: Bound<'py, PyTuple>,
+        name: Option<Bound<'py, PyAny>>,
+        kwargs: Option<Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        if let Some(kwargs) = kwargs.filter(|kwargs| !kwargs.is_empty()) {
+            let names = kwargs.keys().str()?;
+            return Err(PyTypeError::new_err(format!(
+                "porto: Scope.start() got keyword arguments it does not take: {names}; it \
+                 passes only positional arguments to the function and `started=` itself: wrap \
+                 the function, s.start(functools.partial(work, key=value)) (start itself takes \
+                 name=)"
+            )));
+        }
+        if let Some(name) = &name
+            && !name.is_none()
+            && !name.is_instance_of::<PyString>()
+        {
+            return Err(PyTypeError::new_err(format!(
+                "porto: Scope.start() name= must be a str, got {}; pass name=str(...), or leave \
+                 it out to name the task after its function",
+                name.get_type().fully_qualified_name()?
+            )));
+        }
+        let start = START.import(py, "porto._bridge", "start")?;
+        start.call1((slf, fn_, args, name))
+    }
+
+    /// For `Scope.start`: the `Started` that will move a task into this scope. Raises what
+    /// `spawn` raises for a scope tasks cannot be spawned into.
+    #[pyo3(name = "_new_started")]
+    fn new_started(&self) -> PyResult<Started> {
+        if !lane::is_active() {
+            return Err(NoRuntimeError::new_err(
+                "porto: Scope.start() must be called from a task running under porto.run(); \
+                 start the program with porto.run(main) and open the scope inside main",
+            ));
+        }
+        Ok(Started::new_for(self.open_node()?))
     }
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
@@ -523,7 +594,14 @@ impl Scope {
             shield_lock: Mutex::new(()),
             deadline: ScopeDeadline::new(timeout, deadline),
             raise_on_timeout,
+            bare_error: false,
         }
+    }
+
+    /// A scope whose exit raises a single failure bare, see `bare_error`.
+    fn bare(mut self) -> Self {
+        self.bare_error = true;
+        self
     }
 
     /// [`Scope::spawn`], without closing a rejected coroutine.
@@ -540,22 +618,7 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         };
-        if self.has(ScopeFlags::SYNC) {
-            return Err(PyRuntimeError::new_err(
-                "porto: a scope entered with sync `with` is only a cancel scope and cannot \
-                 spawn tasks; enter it with `async with` to spawn into it",
-            ));
-        }
-        let node = match (self.phase(), self.node.get_arc()) {
-            (Phase::Open, Some(node)) => node,
-            (Phase::Closed, _) => return Err(scope_closed()),
-            _ => {
-                return Err(PyRuntimeError::new_err(
-                    "porto: the scope is not entered yet; spawn inside its block: \
-                     `async with porto.scope() as s: s.spawn(...)`",
-                ));
-            }
-        };
+        let node = self.open_node()?;
         let coro = coroutine_from(coro_or_fn, args, "Scope.spawn")?;
         let pinned = options.pin.unwrap_or_else(step::running_is_pinned);
         let label = options.name.unwrap_or_else(|| coro_or_fn.clone()).unbind();
@@ -571,6 +634,30 @@ impl Scope {
         };
         task.get().bind(&body);
         Ok(task)
+    }
+
+    /// The node of a scope that tasks can be spawned into: entered with `async with` and not
+    /// closed. Errors say what to do, as `spawn` and `start` raise them.
+    pub(crate) fn open_node(&self) -> PyResult<PyScopeRef> {
+        if self.has(ScopeFlags::SYNC) {
+            return Err(PyRuntimeError::new_err(
+                "porto: a scope entered with sync `with` is only a cancel scope and cannot \
+                 spawn tasks; enter it with `async with` to spawn into it",
+            ));
+        }
+        match (self.phase(), self.node.get_arc()) {
+            (Phase::Open, Some(node)) => Ok(node),
+            (Phase::Closed, _) => Err(scope_closed()),
+            _ => Err(PyRuntimeError::new_err(
+                "porto: the scope is not entered yet; spawn inside its block: \
+                 `async with porto.scope() as s: s.spawn(...)`",
+            )),
+        }
+    }
+
+    /// The scope's node, once entered.
+    pub(crate) fn node(&self) -> Option<PyScopeRef> {
+        self.node.get_arc()
     }
 
     fn phase(&self) -> Phase {
@@ -688,12 +775,16 @@ impl Scope {
             };
             self.flags.fetch_or(flags, Ordering::AcqRel);
         }
-        let errors = self.close();
+        let mut errors = self.close();
         if errors.is_empty() {
             if timed_out && self.raise_on_timeout {
                 return Err(scope_deadline::timeout_error(py, exc)?);
             }
             return Ok(absorbed);
+        }
+        if self.bare_error && errors.len() == 1 && (exc.is_none() || absorbed) {
+            let error = errors.remove(0);
+            return Err(PyErr::from_value(error.into_bound(py).into_any()));
         }
         let exceptions = PyList::empty(py);
         if !exc.is_none() && !absorbed {
@@ -786,7 +877,7 @@ impl<'py> SpawnOptions<'py> {
 }
 
 /// What spawning into a closed scope raises (C7).
-fn scope_closed() -> PyErr {
+pub(crate) fn scope_closed() -> PyErr {
     PyRuntimeError::new_err(
         "porto: scope is closed: its `async with` block has exited, so it cannot spawn more \
          tasks; spawn from inside the block, or open a new scope",

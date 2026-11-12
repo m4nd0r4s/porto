@@ -6,13 +6,13 @@ pub(super) use crate::sync::primitives::{Mutex, MutexGuard};
 #[cfg(not(all(test, loom)))]
 pub(super) use std::sync::{
     Arc,
-    atomic::{AtomicU8, AtomicU64},
+    atomic::{AtomicPtr, AtomicU8, AtomicU64},
 };
 
 #[cfg(all(test, loom))]
 pub(super) use loom::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicU8, AtomicU64},
+    atomic::{AtomicPtr, AtomicU8, AtomicU64},
 };
 
 /// Bumped (after the scope's own bits and epochs) by every change that can alter a walk's

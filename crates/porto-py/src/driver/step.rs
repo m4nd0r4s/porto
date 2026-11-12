@@ -51,7 +51,7 @@ use std::ptr;
 use std::task::{Context, Poll, Waker};
 
 use porto_core::coop;
-use porto_core::scope::CancelReason;
+use porto_core::scope::{CancelReason, TaskEnd, TaskScope};
 use porto_core::task::{Header, TaskFlags};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
@@ -160,6 +160,50 @@ pub(crate) fn current_lane() -> Option<u16> {
         // SAFETY: as in `current_task`: the header is alive for the whole poll.
         unsafe { &*running.header }.owner_lane()
     })
+}
+
+/// Moves the task running on this thread from `hidden`, the scope it was started in, into
+/// `target`, the scope `Scope.start` was called on (spec 15 §3): the task counts in `target`
+/// from now on (its live count, its failures, its exit wait), and `hidden`, which the scopes the
+/// task entered are nested in, is adopted by `target`, so `target`'s cancel, deadline and shield
+/// reach the task and the caller's no longer do. The caller waiting for `hidden` to empty is woken.
+///
+/// Raises `RuntimeError`, changing nothing, if no task runs here, the task was not started in
+/// `hidden`, or `target` is closed.
+pub(crate) fn move_running_task(hidden: &PyScopeRef, target: &PyScopeRef) -> PyResult<()> {
+    let Some(running) = running() else {
+        return Err(PyRuntimeError::new_err(
+            "porto: Started.set() must be called from the task Scope.start() started; call it \
+             inside that task's coroutine",
+        ));
+    };
+    // SAFETY: `poll` publishes `Running` only while it polls the task behind `header`, alive for
+    // that whole time (the run reference).
+    let header = unsafe { &*running.header };
+    // SAFETY: the Python code that called us runs inside this task's step, so this lane holds
+    // RUNNING: nothing else touches the header's scope slot.
+    if !unsafe { header.counts_in(hidden) } {
+        return Err(PyRuntimeError::new_err(
+            "porto: Started.set() must be called by the task Scope.start() started, which is the \
+             one that got this `started`; do not pass it to other tasks (start them with \
+             their own scope.start(...)), and call set() before the task is moved",
+        ));
+    }
+    let counted = TaskScope::try_attach(target).ok_or_else(|| {
+        PyRuntimeError::new_err(
+            "porto: Started.set() found the scope Scope.start() was called on closed: its \
+             `async with` block exited, so it cannot take the task over; keep the scope open \
+             until start() returns",
+        )
+    })?;
+    hidden.adopt(target);
+    // SAFETY: as above.
+    let hidden_count = unsafe { header.replace_scope(counted) };
+    if let Some(hidden_count) = hidden_count {
+        // Counts the task out of the hidden scope and wakes the caller waiting for it to empty.
+        hidden_count.end(TaskEnd::Completed);
+    }
+    Ok(())
 }
 
 /// Whether the task with this header is the one running on this thread (its waker's data is

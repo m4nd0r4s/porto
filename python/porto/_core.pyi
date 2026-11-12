@@ -176,6 +176,28 @@ class Scope:
         ``porto.run``), ``TypeError`` for an option of the wrong type or an unknown keyword; a
         refused coroutine object is closed."""
 
+    async def start(
+        self,
+        fn: Callable[..., Awaitable[object]],
+        /,
+        *args: Any,
+        name: str | None = None,
+    ) -> Any:
+        """Starts ``fn(*args, started=Started())`` as a task and waits until it calls
+        ``started.set(value)``, then returns ``value`` (Trio's ``nursery.start``, 15 §3). Until
+        then the task runs in a hidden scope the caller waits in: what it raises is raised from
+        ``start`` as it is (not in a group), and cancelling the caller cancels the task. After
+        ``set`` the task is a child of this scope: it counts there, and a failure is this
+        scope's.
+
+        ``fn`` must accept the keyword ``started``; ``name`` names the task (default: the
+        function's ``__qualname__``). Raises ``RuntimeError`` if the task finishes without
+        calling ``started.set()``, and what ``spawn`` raises for a scope that cannot take
+        tasks."""
+
+    def _new_started(self) -> Started[Any]:
+        """For ``Scope.start``: the ``Started`` that moves a task into this scope."""
+
     def cancel(self, reason: str | None = None) -> None:
         """Cancels the scope: every task in it, and in the scopes nested in it, gets
         ``porto.Cancelled`` at its next await; waiting tasks are woken. Safe from any thread;
@@ -242,6 +264,31 @@ class Scope:
         /,
     ) -> bool: ...
     def _waiter_count(self) -> int: ...
+
+@final
+class Started(Generic[_T]):
+    """What ``Scope.start()`` passes the task it starts, as the keyword ``started``: the task
+    calls ``set(value)`` once it is ready, which ends the ``start`` and returns ``value`` to its
+    caller. Made by ``start``, not by you."""
+
+    @overload
+    def set(self: Started[None], value: None = None, /) -> None: ...
+    @overload
+    def set(self, value: _T, /) -> None:
+        """Reports that the task is ready and moves it into the scope ``start`` was called on.
+        Call it once, from the started task, while that scope is open: otherwise it raises
+        ``RuntimeError``."""
+
+    def _bind(self, hidden: Scope, /) -> None:
+        """For ``Scope.start``: the hidden scope the task is spawned into."""
+
+    def _was_set(self) -> bool:
+        """For ``Scope.start``: whether ``set`` was called."""
+
+    def _result(self) -> Any:
+        """For ``Scope.start``: what ``set`` was given; ``RuntimeError`` if it was not called."""
+
+    def __class_getitem__(cls, item: object, /) -> object: ...
 
 @final
 class Task(Generic[_T_co]):
@@ -960,6 +1007,10 @@ def _run(coro: Coroutine[Any, Any, _T], /) -> _T:
 
     Tasks it spawned that are still running when it returns are closed.
     """
+
+def _hidden_scope() -> Scope:
+    """The scope ``Scope.start`` runs a task in until it reports: a nursery whose exit raises
+    a single failure as it is, not in a group."""
 
 def _root_scope() -> Scope:
     """The root scope of the running ``porto.run`` (what ``Runtime.root_scope`` will return):

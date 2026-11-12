@@ -270,3 +270,26 @@ async def task_handles() -> int:
 def check_lowlevel_calls_are_typed() -> None:
     porto.lowlevel.trap_wait_notify(porto.Lock())  # pyright: ignore[reportArgumentType]
     porto.lowlevel.current_lane(1)  # pyright: ignore[reportCallIssue]
+
+
+async def serve(port: int, *, started: porto.Started[int]) -> None:
+    started.set(port)
+
+
+async def serve_nothing(*, started: porto.Started[None]) -> None:
+    started.set()
+    started.set(None)
+
+
+async def check_start_and_started_are_typed() -> None:
+    async with porto.scope() as s:
+        listening: int = await s.start(serve, 80)
+        await s.start(serve_nothing, name="quiet")
+        assert_type(listening, int)
+
+
+def check_started_values_are_typed(started: porto.Started[int], quiet: porto.Started[None]) -> None:
+    started.set(1)
+    started.set("one")  # pyright: ignore[reportCallIssue, reportArgumentType]
+    started.set()  # pyright: ignore[reportCallIssue]
+    quiet.set()

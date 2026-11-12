@@ -138,6 +138,27 @@ impl Header {
         unsafe { (*self.scope.get()).is_some() }
     }
 
+    /// Whether the task counts in `scope` now (see [`TaskScope::is_for`]).
+    ///
+    /// # Safety
+    /// The caller holds RUNNING (it is polling the task), so no other thread writes the slot.
+    pub unsafe fn counts_in<E>(&self, scope: &crate::scope::ScopeRef<E>) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { (*self.scope.get()).as_ref() }.is_some_and(|task_scope| task_scope.is_for(scope))
+    }
+
+    /// Makes the task count in `scope` instead of the one it counts in: for a task moved to
+    /// another scope while it runs (`Scope.start`, 15 §3). Returns the old reference, which the
+    /// caller ends or drops outside any scope lock.
+    ///
+    /// # Safety
+    /// The caller holds RUNNING (it is polling the task): the slot is otherwise only touched by
+    /// whoever completes the task, which is the same thread afterwards.
+    pub unsafe fn replace_scope(&self, scope: TaskScope) -> Option<TaskScope> {
+        // SAFETY: the caller's contract.
+        unsafe { (*self.scope.get()).replace(scope) }
+    }
+
     /// Takes the task's scope reference out, leaving `None`: the task is ending. A task outside
     /// any scope pays this one null check.
     ///

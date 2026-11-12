@@ -74,8 +74,13 @@ async def server(port: int, *, started: porto.Started[int]) -> None:
     ...
 port = await s.start(server, 0)
 ```
-- `start` spawns the task with `started=Started()` injected as a keyword argument. It awaits until `started.set(v)` and returns `v`.
-- Until `set`, the task belongs to a hidden scope owned by the caller. Exceptions before `set` propagate to the caller of `start`. After `set`, the task is re-parented into `s`. This matches Trio's `nursery.start` semantics.
+- `start` spawns the task with `started=Started()` injected as a keyword argument (it takes no other keyword but `name`; `functools.partial` binds the rest). It awaits until `started.set(v)` and returns `v`.
+- Until `set`, the task belongs to a hidden scope owned by the caller. Exceptions before `set` propagate to the caller of `start`, as they are, not in a group. After `set`, the task is re-parented into `s`. This matches Trio's `nursery.start` semantics.
+
+Mechanics, so that the rules above hold with the scope tree of §1:
+- The hidden scope is an ordinary scope nested in the scope the caller is in, and the caller waits at its exit (C5), which ends when the task has called `set` or has ended. So cancelling the caller (its scope, a deadline) reaches the task through the walk and cancels it, and the caller's wait ends with its own cancellation (`start` raises `Cancelled`, not a complaint that the task never reported). A failure of the task before `set` is C4's: it cancels the hidden scope and is raised from `start` bare (a hidden scope with one failure raises it as is).
+- `set(v)` moves the task, which must be the one `start` started (otherwise it raises `RuntimeError`), in two steps: the task counts in `s` from then on (its `live_children`, its failures, its exit wait) and is counted out of the hidden scope, which ends the caller's wait; and the hidden scope is *adopted* by `s` (`ScopeNode::adopt`): the walk, the cancel propagation and the waiter wake-ups (C10) of everything below it (the task, the scopes it entered before `set` and their tasks) see `s` as its parent from then on, and the caller's scopes no longer. If `s` is cancelled by then the task is cancelled at its next checkpoint, as for any spawn into a cancelled scope (C6). If `s` closed meanwhile (C7), `set` raises `RuntimeError` and the task stays in the hidden scope.
+- A task that ends without calling `set` makes `start` raise `RuntimeError` (unless the caller was cancelled: then `Cancelled`).
 
 ## 4. Task cancellation
 `task.cancel()` cancels an implicit per-task scope that wraps the task's coroutine. It is equivalent to the task having been spawned inside `porto.scope()` and that scope being cancelled. It does not cancel siblings, and the absorbed `Cancelled` does not count as a failure. It is level-triggered like any cancel (C1): a task that catches the `Cancelled` gets it again at its next checkpoint. It cancels everything the task runs in scopes it entered (they are nested in the implicit scope), and a shield the task entered holds it off until it is left (C8). Cancelling a task that finished, or cancelling again, does nothing. Safe from any thread (C10).

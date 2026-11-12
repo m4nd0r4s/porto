@@ -486,3 +486,70 @@ mod deadline {
         });
     }
 }
+
+/// A scope is adopted by a new parent while another thread cancels that parent (`Scope.start`
+/// re-parenting its hidden scope): whichever came first, the adopted scope ends up cancelled,
+/// and its waiter, registered before, was woken by the cancel or by the adoption: never
+/// neither, which would leave a started task asleep in a cancelled scope.
+#[test]
+fn adopt_vs_the_new_parents_cancel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let old = ScopeNode::new_child(&root, 1, false);
+        let new = ScopeNode::new_child(&root, 1, false);
+        let hidden = ScopeNode::new_child(&old, 1, false);
+        let wakes = std::sync::Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&wakes));
+        assert!(!hidden.register_waiter(1, &waker));
+        let canceller = {
+            let new = Arc::clone(&new);
+            thread::spawn(move || assert!(new.cancel(CancelReason::Explicit)))
+        };
+
+        assert!(hidden.adopt(&new));
+
+        canceller.join().unwrap();
+        assert!(hidden.effective_cancellation().is_some());
+        assert!(
+            wakes.0.load(Ordering::SeqCst) >= 1,
+            "the waiter was never woken"
+        );
+        hidden.unregister_waiter(1);
+    });
+}
+
+/// A scope is adopted while its last reference is dropped on another thread: the child lists
+/// of both parents stay consistent (the debug asserts of the parents' drops check they are
+/// empty).
+#[test]
+fn adopt_vs_the_scopes_drop() {
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let old = ScopeNode::new_child(&root, 1, false);
+        let new = ScopeNode::new_child(&root, 1, false);
+        let sibling = ScopeNode::new_child(&old, 1, false);
+        let hidden = ScopeNode::new_child(&old, 1, false);
+        let adopter = {
+            let new = Arc::clone(&new);
+            let hidden = Arc::clone(&hidden);
+            thread::spawn(move || {
+                assert!(hidden.adopt(&new));
+            })
+        };
+        drop(sibling);
+        adopter.join().unwrap();
+        drop(hidden);
+        assert!(new.lock_state().child_scopes_is_empty());
+    });
+}

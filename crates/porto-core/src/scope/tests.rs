@@ -533,3 +533,122 @@ fn a_task_cancel_is_a_reason_of_its_own() {
         Some(CancelReason::TaskCancelled)
     );
 }
+
+mod adoption {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    use super::*;
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn counting_waker() -> (Arc<CountWakes>, Waker) {
+        let wakes = Arc::new(CountWakes(AtomicUsize::new(0)));
+        (wakes.clone(), Waker::from(wakes))
+    }
+
+    #[test]
+    fn an_adopted_scope_follows_its_new_parent_and_leaves_the_old_one() {
+        let root = Scope::new_root(0);
+        let old = child(&root);
+        let new = child(&root);
+        let hidden = child(&old);
+        let nested = child(&hidden);
+        assert!(hidden.adopt(&new));
+        assert_eq!(hidden.parent().unwrap().id(), new.id());
+        assert!(old.lock_state().child_scopes_is_empty());
+        assert!(!new.lock_state().child_scopes_is_empty());
+
+        assert!(old.cancel(CancelReason::Explicit));
+        assert!(
+            !cancelled(&hidden),
+            "the old parent's cancel no longer reaches it"
+        );
+        assert!(!cancelled(&nested));
+        assert!(new.cancel(CancelReason::Explicit));
+        assert!(cancelled(&hidden));
+        assert!(
+            cancelled(&nested),
+            "what is nested in the adopted scope follows it"
+        );
+    }
+
+    #[test]
+    fn a_scope_is_adopted_once_and_a_root_never() {
+        let root = Scope::new_root(0);
+        let first = child(&root);
+        let second = child(&root);
+        let hidden = child(&root);
+        assert!(hidden.adopt(&first));
+        assert!(!hidden.adopt(&second), "adopted already");
+        assert_eq!(hidden.parent().unwrap().id(), first.id());
+        assert!(!root.adopt(&first), "a root has no parent to replace");
+    }
+
+    #[test]
+    fn an_adopted_scope_is_woken_by_its_new_parents_cancel_not_the_old_ones() {
+        let root = Scope::new_root(0);
+        let old = child(&root);
+        let new = child(&root);
+        let hidden = child(&old);
+        let (woken, waker) = counting_waker();
+        assert!(!hidden.register_waiter(1, &waker));
+        assert!(hidden.adopt(&new));
+        assert!(old.cancel(CancelReason::Explicit));
+        assert_eq!(woken.0.load(Ordering::Relaxed), 0);
+        assert!(new.cancel(CancelReason::Explicit));
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        hidden.unregister_waiter(1);
+    }
+
+    #[test]
+    fn adopting_into_a_cancelled_scope_cancels_the_adopted_one_and_wakes_its_waiters() {
+        let root = Scope::new_root(0);
+        let old = child(&root);
+        let new = child(&root);
+        let hidden = child(&old);
+        let (woken, waker) = counting_waker();
+        assert!(!hidden.register_waiter(1, &waker));
+        assert!(new.cancel(CancelReason::Explicit));
+        assert!(hidden.adopt(&new));
+        assert!(cancelled(&hidden));
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1, "the adoption woke it");
+        hidden.unregister_waiter(1);
+    }
+
+    #[test]
+    fn dropping_adopted_scopes_unlinks_them_from_the_new_parent() {
+        let root = Scope::new_root(0);
+        let old = child(&root);
+        let new = child(&root);
+        let first = child(&old);
+        let second = child(&old);
+        assert!(first.adopt(&new));
+        assert!(second.adopt(&new));
+        drop(first);
+        assert!(!new.lock_state().child_scopes_is_empty());
+        drop(second);
+        assert!(new.lock_state().child_scopes_is_empty());
+        assert!(old.lock_state().child_scopes_is_empty());
+        // The old parent is held until the adopted scope is gone, and no longer.
+        assert!(Arc::strong_count(&old) == 1);
+    }
+
+    #[test]
+    fn a_task_counts_in_the_scope_it_was_moved_to() {
+        let root = Scope::new_root(0);
+        let hidden = child(&root);
+        let target = child(&root);
+        let task_scope = TaskScope::attach(&hidden);
+        assert!(task_scope.is_for(&hidden));
+        assert!(!task_scope.is_for(&target));
+        task_scope.end(TaskEnd::Completed);
+        assert_eq!(hidden.lock_state().live_children, 0);
+    }
+}

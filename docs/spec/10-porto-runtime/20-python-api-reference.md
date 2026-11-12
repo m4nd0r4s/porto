@@ -75,8 +75,8 @@ class Scope:   # async context manager (and sync CM for shield-only usage)
     @property name: str
     @property tasks: Sequence[Task[Any]]    # live children snapshot
 
-class Started[T]:
-    def set(self, value: T = None) -> None
+class Started[T]:                        # made by Scope.start, not by you
+    def set(self, value: T = None) -> None   # once, from the started task; RuntimeError twice, from another task, or into a closed scope (15 §3)
 
 class Task[T]:     # awaitable
     id: int; name: str

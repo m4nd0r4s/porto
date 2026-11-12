@@ -10,7 +10,9 @@ use std::sync::atomic::Ordering;
 use std::task::Waker;
 
 use super::child::{ChildVTableRef, child_vtable};
-use super::sync::{Arc, AtomicU8, AtomicU64, CANCEL_GENERATION, Mutex, MutexGuard, UnsafeCell};
+use super::sync::{
+    Arc, AtomicPtr, AtomicU8, AtomicU64, CANCEL_GENERATION, Mutex, MutexGuard, UnsafeCell,
+};
 use crate::sched::WeakHandle;
 use crate::time::Deadline;
 use crate::time::wheel::TimerEntry;
@@ -74,6 +76,11 @@ pub struct ScopeNode<E> {
     child_vtable: ChildVTableRef,
     id: u64,
     parent: Option<Arc<ScopeNode<E>>>,
+    /// Null, or the scope that adopted this one in place of `parent` ([`ScopeNode::adopt`]):
+    /// a leaked `Box` of the `Arc`, published once and freed when this node is. From then on
+    /// the walk and the child lists see it as the parent; `parent` stays held, only to keep
+    /// what it points at alive.
+    adopted: AtomicPtr<Arc<ScopeNode<E>>>,
     /// The task whose `async with` created the scope.
     owner_task: u64,
     /// The cancel reason and the shield bit, so the walk reads them without locking. Written
@@ -243,6 +250,7 @@ impl<E: Send + 'static> ScopeNode<E> {
             child_vtable: child_vtable::<E>(),
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             parent,
+            adopted: AtomicPtr::new(ptr::null_mut()),
             owner_task,
             status: AtomicU8::new(if shield { SHIELD } else { 0 }),
             cancel_epoch: AtomicU64::new(0),
@@ -274,9 +282,16 @@ impl<E> ScopeNode<E> {
         self.id
     }
 
-    /// The enclosing scope, `None` for a root.
+    /// The enclosing scope, `None` for a root: the one that adopted this scope, if any.
     pub fn parent(&self) -> Option<&Arc<Self>> {
-        self.parent.as_ref()
+        let adopted = self.adopted.load(Ordering::Acquire);
+        // SAFETY: non-null is a `Box<Arc<_>>` published by `adopt` (Acquire pairs with its
+        // Release) and freed only when this node is dropped, which the borrow of `self` rules
+        // out.
+        match unsafe { adopted.as_ref() } {
+            Some(adopted) => Some(adopted),
+            None => self.parent.as_ref(),
+        }
     }
 
     /// The task whose `async with` created the scope.
@@ -469,7 +484,93 @@ impl<E> ScopeNode<E> {
             if status & SHIELD != 0 {
                 return None;
             }
-            node = node.parent.as_deref()?;
+            node = node.parent()?;
+        }
+    }
+
+    /// Makes `new_parent` this scope's parent in place of the one it was nested in: the walk
+    /// from here, the cancels `new_parent` propagates and its subtree waiters (C10) reach it
+    /// from now on, and the old parent's do not. For `Scope.start` (15 §3): the hidden scope a
+    /// started task runs in until it reports is adopted by the scope it is started in.
+    ///
+    /// Safe from any thread. At most once: returns `false`, changing nothing, if this scope
+    /// was adopted already, or has no parent (a root).
+    pub fn adopt(&self, new_parent: &Arc<Self>) -> bool {
+        let Some(old_parent) = &self.parent else {
+            return false;
+        };
+        let published = Box::into_raw(Box::new(Arc::clone(new_parent)));
+        if self
+            .adopted
+            .compare_exchange(
+                ptr::null_mut(),
+                published,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: `published` came from `Box::into_raw` above and was not stored.
+            drop(unsafe { Box::from_raw(published) });
+            return false;
+        }
+        // Out of the old parent's child list, then into the new one's: never in both, so
+        // each list is only touched under its own lock. In between, a cancel of either parent
+        // misses this scope's subtree, which the wake-up below makes up for.
+        old_parent.unlink_child(self);
+        new_parent.link_child(self);
+        // Everything the walk from here (or below) saw is stale: the parent changed.
+        let mut wake = Vec::new();
+        let state = self.lock_state();
+        self.bump_subtree(
+            &state,
+            self.effective_cancellation().is_some().then_some(&mut wake),
+        );
+        drop(state);
+        CANCEL_GENERATION.fetch_add(1, Ordering::Release);
+        wake_all(wake);
+        true
+    }
+
+    /// Links `child` at the head of this scope's child list.
+    fn link_child(&self, child: &ScopeNode<E>) {
+        let child_ptr: *const ScopeNode<E> = child;
+        let mut state = self.lock_state();
+        let old_head = state.child_scopes.head;
+        // SAFETY: this scope's lock is held, which guards the links of its children, and
+        // `old_head` (if any) is a linked child, so it is alive; `child` is linked nowhere.
+        unsafe {
+            child.siblings.with_mut(|links| {
+                (*links).prev = ptr::null();
+                (*links).next = old_head;
+            });
+            if let Some(old_head) = old_head.as_ref() {
+                old_head
+                    .siblings
+                    .with_mut(|links| (*links).prev = child_ptr);
+            }
+        }
+        state.child_scopes.head = child_ptr;
+    }
+
+    /// Unlinks `child` from this scope's child list.
+    fn unlink_child(&self, child: &ScopeNode<E>) {
+        let mut state = self.lock_state();
+        // SAFETY: this scope's lock is held, which guards the links of its children; the
+        // linked neighbours are alive, and `child` is linked here (the caller's contract).
+        unsafe {
+            let (prev, next) = child.siblings.with(|links| ((*links).prev, (*links).next));
+            match prev.as_ref() {
+                Some(prev) => prev.siblings.with_mut(|links| (*links).next = next),
+                None => state.child_scopes.head = next,
+            }
+            if let Some(next) = next.as_ref() {
+                next.siblings.with_mut(|links| (*links).prev = prev);
+            }
+            child.siblings.with_mut(|links| {
+                (*links).prev = ptr::null();
+                (*links).next = ptr::null();
+            });
         }
     }
 }
@@ -492,22 +593,19 @@ impl<E> Drop for ScopeNode<E> {
             self.lock_state().waiter_count() == 0,
             "a waiter outlived its scope, but waiting tasks hold their scope alive"
         );
-        let Some(parent) = &self.parent else {
+        // The scope that adopted this one holds its links now; the original parent only keeps
+        // what it points at alive.
+        let adopted = self.adopted.load(Ordering::Acquire);
+        let adopted = (!adopted.is_null())
+            // SAFETY: `adopt` leaked this box and nothing else frees it.
+            .then(|| unsafe { Box::from_raw(adopted) });
+        let Some(parent) = adopted.as_deref().or(self.parent.as_ref()) else {
             return;
         };
-        let mut parent_state = parent.lock_state();
-        // SAFETY: the parent's lock is held, which guards our links and our neighbours'; linked
-        // neighbours are alive.
-        unsafe {
-            let (prev, next) = self.siblings.with(|links| ((*links).prev, (*links).next));
-            match prev.as_ref() {
-                Some(prev) => prev.siblings.with_mut(|links| (*links).next = next),
-                None => parent_state.child_scopes.head = next,
-            }
-            if let Some(next) = next.as_ref() {
-                next.siblings.with_mut(|links| (*links).prev = prev);
-            }
-        }
+        parent.unlink_child(self);
+        // Dropped after the unlink, which took the parent's lock: a parent freed by this drop
+        // would take its own.
+        drop(adopted);
     }
 }
 
