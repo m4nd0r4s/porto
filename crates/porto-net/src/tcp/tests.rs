@@ -2,7 +2,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 
@@ -172,4 +172,27 @@ fn nodelay_and_keepalive_are_set() {
         assert_eq!(connection.tcp_keepalive_interval().unwrap().as_secs(), 3);
         assert_eq!(connection.tcp_keepalive_retries().unwrap(), 4);
     }
+}
+
+#[test]
+fn descriptor_exhaustion_is_emfile_and_enfile() {
+    #[cfg(unix)]
+    {
+        assert!(is_descriptor_exhaustion(&io::Error::from_raw_os_error(24)));
+        assert!(is_descriptor_exhaustion(&io::Error::from_raw_os_error(23)));
+    }
+    assert!(!is_descriptor_exhaustion(&io::Error::from_raw_os_error(2)));
+    assert!(!is_descriptor_exhaustion(&io::ErrorKind::WouldBlock.into()));
+}
+
+#[test]
+fn the_rate_limit_lets_one_event_through_per_interval() {
+    let mut limit = RateLimit::new(Duration::from_secs(10));
+    let start = Instant::now();
+    assert!(limit.allow(start));
+    assert!(!limit.allow(start + Duration::from_secs(9)));
+    assert!(limit.allow(start + Duration::from_secs(10)));
+    assert!(!limit.allow(start + Duration::from_secs(11)));
+    // A clock that reads earlier than the last event never panics.
+    assert!(!limit.allow(start));
 }

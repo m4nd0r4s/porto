@@ -16,6 +16,8 @@ async def check_listen_and_accept() -> None:
     assert_type(listener.sockname, tuple[str, int] | tuple[str, int, int, int])
     stream = await listener.accept()
     assert_type(stream, net.TcpStream)
+    async for connection in listener:
+        assert_type(connection, net.TcpStream)
     async with listener as same:
         assert_type(same, net.TcpListener)
     await net.listen_tcp()

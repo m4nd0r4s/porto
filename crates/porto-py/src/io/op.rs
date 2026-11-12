@@ -11,13 +11,16 @@
 //! resolves the wait at once, so dropping a pending wait (a cancellation) never loses data; it
 //! unlinks the waiter it registered.
 
+use std::cell::RefCell;
 use std::io::{self, IoSlice};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
+use porto_core::time::{Deadline, sleep_until};
 use porto_io::{ClosedResource, Interest, Registration};
 use porto_net::tcp;
-use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError};
+use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use socket2::{SockAddr, Socket};
@@ -76,8 +79,9 @@ pub(crate) enum IoOp {
     },
     /// Accept a connection → `(socket, address)`.
     Accept,
-    /// Accept a TCP connection → `porto.net.TcpStream`.
-    AcceptTcp,
+    /// Accept a TCP connection → `porto.net.TcpStream`; with `ending_iteration`, a listener
+    /// closed under it ends an `async for` (`StopAsyncIteration`) instead of raising.
+    AcceptTcp { ending_iteration: bool },
     /// Finish a nonblocking connect → `None`, or the connect's error (`SO_ERROR`).
     Connect,
     /// Receive one datagram of at most `max` bytes → `(bytes, address)`.
@@ -116,7 +120,7 @@ impl IoOp {
             | Self::ReadBuffer { .. }
             | Self::ReadInto { .. }
             | Self::Accept
-            | Self::AcceptTcp
+            | Self::AcceptTcp { .. }
             | Self::RecvFrom { .. }
             | Self::WaitReadable => Interest::READABLE,
             Self::Write { .. }
@@ -199,7 +203,7 @@ impl IoOp {
                 let (connection, address) = tcp::accept(socket)?;
                 Ok(Completed::Accepted(connection, address))
             }
-            Self::AcceptTcp => {
+            Self::AcceptTcp { .. } => {
                 let (connection, address) = tcp::accept(socket)?;
                 Ok(Completed::AcceptedTcp(connection, address))
             }
@@ -264,6 +268,55 @@ impl Drop for IoOp {
         if sent > 0 && sent < total {
             mid_write.store(true, Ordering::Release);
         }
+    }
+}
+
+impl IoOp {
+    /// Whether `error` makes this operation wait and try again instead of failing: running out
+    /// of descriptors in an accept leaves the connection queued, so it is retried after a
+    /// pause ([`tcp::ACCEPT_BACKOFF`]).
+    fn backs_off_on(&self, error: &io::Error) -> bool {
+        matches!(self, Self::Accept | Self::AcceptTcp { .. })
+            && tcp::is_descriptor_exhaustion(error)
+    }
+
+    /// `error` as the exception this operation raises.
+    fn raise(&self, error: &io::Error) -> PyErr {
+        match self {
+            Self::AcceptTcp {
+                ending_iteration: true,
+            } if ClosedResource::of(error).is_some_and(|closed| !closed.by_driver()) => {
+                PyStopAsyncIteration::new_err(())
+            }
+            _ => os_error(error),
+        }
+    }
+}
+
+thread_local! {
+    /// When the lane last warned that accept ran out of descriptors.
+    static EXHAUSTION_WARNINGS: RefCell<tcp::RateLimit> =
+        const { RefCell::new(tcp::RateLimit::new(tcp::EXHAUSTION_WARNING_INTERVAL)) };
+}
+
+/// Logs (rate limited) that an accept ran out of file descriptors and backs off.
+fn warn_descriptors_exhausted(py: Python<'_>, error: &io::Error) {
+    if !EXHAUSTION_WARNINGS.with_borrow_mut(|limit| limit.allow(Instant::now())) {
+        return;
+    }
+    let message = format!(
+        "porto: accept() ran out of file descriptors ({error}); the pending connections wait \
+         and accept retries every {} ms. Close connections you no longer need, or raise the \
+         limit (ulimit -n); this is logged at most once every {} s",
+        tcp::ACCEPT_BACKOFF.as_millis(),
+        tcp::EXHAUSTION_WARNING_INTERVAL.as_secs(),
+    );
+    let logged = py
+        .import("logging")
+        .and_then(|logging| logging.call_method1("getLogger", ("porto.net",)))
+        .and_then(|logger| logger.call_method1("warning", (message,)));
+    if let Err(failure) = logged {
+        failure.write_unraisable(py, None);
     }
 }
 
@@ -391,7 +444,9 @@ pub(crate) fn submit(
         match registration.attempt_io(op.interest(), |socket| op.attempt(socket)) {
             Ok(completed) => return ready(py, completed.into_py(py)?),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(os_error(&error)),
+            // The trap tries again after a pause (below), so it fails to the caller never.
+            Err(error) if op.backs_off_on(&error) => warn_descriptors_exhausted(py, &error),
+            Err(error) => return Err(op.raise(&error)),
         }
     }
     let wait = IoWait::new(wait_for(Arc::clone(registration), op));
@@ -408,14 +463,24 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp) -> Resume {
             .await
             .map(|_| Completed::Done)
     } else {
-        registration
-            .async_io(interest, |socket| op.attempt(socket))
-            .await
+        loop {
+            let result = registration
+                .async_io(interest, |socket| op.attempt(socket))
+                .await;
+            match result {
+                Err(error) if op.backs_off_on(&error) => {
+                    // SAFETY: an `Io` wait is polled by the step loop, on its lane, attached.
+                    warn_descriptors_exhausted(unsafe { Python::assume_attached() }, &error);
+                    sleep_until(Deadline::after(tcp::ACCEPT_BACKOFF)).await;
+                }
+                result => break result,
+            }
+        }
     };
     // SAFETY: an `Io` wait is polled by the step loop, on its lane, attached.
     let py = unsafe { Python::assume_attached() };
     let value = result
-        .map_err(|error| os_error(&error))
+        .map_err(|error| op.raise(&error))
         .and_then(|completed| completed.into_py(py));
     // The views the operation holds are released here, attached (P1).
     drop(op);

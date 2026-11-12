@@ -7,9 +7,17 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
+
+/// How long `accept` waits after `EMFILE` or `ENFILE` before it tries again: the pending
+/// connection stays queued, and every attempt would fail the same way until a descriptor is
+/// freed, so trying at once would spin a core (17 §1.2).
+pub const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The most often the warning about running out of descriptors is logged.
+pub const EXHAUSTION_WARNING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What a listening socket is opened with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +165,20 @@ pub fn accept(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
     }
 }
 
+/// Whether `error` is the OS running out of file descriptors (`EMFILE`: this process has no
+/// more, `ENFILE`: the system has none; `WSAEMFILE` on Windows): the connection that caused it
+/// is still queued, so `accept` backs off ([`ACCEPT_BACKOFF`]) instead of failing.
+pub fn is_descriptor_exhaustion(error: &io::Error) -> bool {
+    // 24 and 23 are the same on Linux, the BSDs and macOS.
+    #[cfg(unix)]
+    const CODES: [i32; 2] = [24, 23];
+    #[cfg(windows)]
+    const CODES: [i32; 1] = [10024];
+    #[cfg(not(any(unix, windows)))]
+    const CODES: [i32; 0] = [];
+    matches!(error.raw_os_error(), Some(code) if CODES.contains(&code))
+}
+
 /// `TCP_NODELAY`: send small writes at once instead of waiting to coalesce them (Nagle).
 ///
 /// # Errors
@@ -188,6 +210,35 @@ pub fn set_keepalive(
 
 fn round_up_to_seconds(duration: Duration) -> Duration {
     Duration::from_secs(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
+}
+
+/// Lets an event through at most once per interval: the rate limit of the warning about
+/// running out of descriptors, which `accept` repeats every [`ACCEPT_BACKOFF`] while it lasts.
+#[derive(Debug)]
+pub struct RateLimit {
+    interval: Duration,
+    last: Option<Instant>,
+}
+
+impl RateLimit {
+    /// A limit that lets one event through per `interval`.
+    pub const fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    /// Whether an event at `now` goes through (the first always does); if so, it counts.
+    pub fn allow(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(last) if now.saturating_duration_since(last) < self.interval => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
 }
 
 #[cfg(test)]

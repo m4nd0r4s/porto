@@ -485,8 +485,12 @@ class TcpListener:
     """A listening TCP socket: ``porto.net.TcpListener``, made by ``porto.net.listen_tcp``."""
 
     def accept(self) -> Awaitable[TcpStream]:
-        """Waits for a connection and accepts it."""
+        """Waits for a connection and accepts it. When the process or the system is out of file
+        descriptors it waits 100 ms and tries again (logging a warning on the ``porto.net``
+        logger at most every 10 s) instead of failing."""
 
+    def __aiter__(self) -> Self: ...
+    def __anext__(self) -> Awaitable[TcpStream]: ...
     @property
     def port(self) -> int:
         """The port the listener is bound to (the one the OS picked, for ``port=0``)."""
@@ -500,7 +504,8 @@ class TcpListener:
 
     def aclose(self) -> Awaitable[None]:
         """Stops listening: an ``accept()`` waiting on it fails with
-        ``porto.ClosedResourceError``. Closing again does nothing."""
+        ``porto.ClosedResourceError`` and an ``async for`` over it ends. Closing again does
+        nothing."""
 
     def __aenter__(self) -> Awaitable[Self]: ...
     def __aexit__(self, *exception: object) -> Awaitable[None]: ...

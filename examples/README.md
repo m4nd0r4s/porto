@@ -22,6 +22,7 @@ well under a second. `tests/python/test_examples.py` runs them all in CI. Run on
 | [`worker_pool.py`](worker_pool.py) | A producer, N workers and a collector joined by channels | `uv run python examples/worker_pool.py [--jobs 200] [--workers 8]` |
 | [`threads.py`](threads.py) | OS threads and async code: `blocking_send`, `blocking_recv`, `Event.blocking_wait`, `Notify.blocking_notified`, and the `blocking_*` of oneshot, watch and `Semaphore` | `uv run python examples/threads.py` |
 | [`buffers.py`](buffers.py) | `porto.Buffer`: `memoryview`, `bytes(buf)`, `resize`/`extend`, `BufferError` while a view is held | `uv run python examples/buffers.py` |
+| [`tcp_echo.py`](tcp_echo.py) | `porto.net.listen_tcp`, `TcpListener` (`port`, `async for`, `aclose`), `TcpStream` (`read_buffer`, `write`, `writev`, `shutdown_write`, `async with`), serving each connection in its own task, `ClosedResourceError` on a closed listener | `uv run python examples/tcp_echo.py` |
 | [`fan_out.py`](fan_out.py) | Many tasks in one scope, against asyncio and uvloop | `uv run python examples/fan_out.py [--tasks 10000] [--backend porto\|asyncio\|uvloop]` |
 | [`ping_pong.py`](ping_pong.py) | Two tasks switching on every hit, against asyncio and uvloop | `uv run python examples/ping_pong.py [--rounds 100000] [--backend porto\|asyncio\|uvloop]` |
 

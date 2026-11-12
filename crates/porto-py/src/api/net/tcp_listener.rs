@@ -2,6 +2,8 @@
 //! §1, §1.2): a listening socket registered with the driver of the run that made it, whose
 //! `accept()` returns the awaitable of an [`IoOp::AcceptTcp`].
 //!
+//! Running out of file descriptors does not fail an accept: it waits ([`IoOp`] backs off) and
+//! tries again, so a server sheds load by not accepting rather than by crashing.
 
 use std::io;
 use std::net::IpAddr;
@@ -101,8 +103,31 @@ fn listen_error(error: &io::Error) -> PyErr {
 #[pymethods]
 impl TcpListener {
     /// Waits for a connection and accepts it: a `TcpStream`, nonblocking and close-on-exec.
+    /// If the process or the system is out of file descriptors it waits 100 ms and tries again,
+    /// logging a warning (at most every 10 s) on the `porto.net` logger.
     fn accept(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        submit(py, &self.registration, IoOp::AcceptTcp)
+        submit(
+            py,
+            &self.registration,
+            IoOp::AcceptTcp {
+                ending_iteration: false,
+            },
+        )
+    }
+
+    fn __aiter__(slf: &Bound<'_, Self>) -> Py<Self> {
+        slf.clone().unbind()
+    }
+
+    /// Like `accept()`; an `async for` over the listener ends when the listener is closed.
+    fn __anext__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        submit(
+            py,
+            &self.registration,
+            IoOp::AcceptTcp {
+                ending_iteration: true,
+            },
+        )
     }
 
     /// The port the listener is bound to (the one the OS picked, for `port=0`).

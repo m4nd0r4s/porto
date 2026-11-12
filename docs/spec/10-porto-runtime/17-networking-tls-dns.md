@@ -19,6 +19,8 @@ await porto.net.serve_tcp(handler, host=None, port=0, *, tls=None,
 ```
 `connect_tcp` resolves DNS (§4) and performs RFC 8305 Happy Eyeballs v2 using a scope of racing attempts. Timeouts come from the enclosing scope's deadline.
 
+**`listen_tcp` arguments.** `host` is a numeric IP address, or `None` for every interface; until the resolver (§4) lands, a host name is a `ValueError` that says to resolve it first. `None` with `dual_stack=True` listens on `::` with `IPV6_V6ONLY` off (IPv4 peers show as IPv4-mapped IPv6 addresses), falling back to `0.0.0.0` on a host without IPv6; with `dual_stack=False` it listens on `0.0.0.0` (IPv4 only). For an IPv6 `host`, `dual_stack` sets `IPV6_V6ONLY` to its opposite. `port` is 0..=65535 (`ValueError` otherwise; 0 picks a free port, `listener.port` reports it). `reuse_port` sets `SO_REUSEPORT` (`NotImplementedError` where the OS has none, as on Windows); `SO_REUSEADDR` is set on Unix, not on Windows. `tls` other than `None` raises `NotImplementedError` until §3 lands. The call is cancellable (a cancelled task opens nothing) and raises `RuntimeError` outside a run; OS refusals are `OSError` with their errno (`EADDRINUSE`, `EACCES`). Every socket porto opens or accepts is close-on-exec and nonblocking.
+
 **Runs.** A socket is registered with the driver of the run that opened it (13 §4) and belongs to it: any operation from another run raises `RuntimeError` at the call, saying to open the socket in the run that uses it.
 
 ### 1.1 Stream API (`TcpStream`, `UnixStream`, `TlsStream` share the `porto.abc.ByteStream` protocol)
@@ -50,7 +52,9 @@ Details of the implemented subset:
 **Internal read buffer:** each stream owns a lane-pooled receive buffer. `read_until`/`readline` scan it without copying until the delimiter is found. Cancel safety (T3) is guaranteed because unconsumed bytes stay in the buffer.
 
 ### 1.2 Listener
-`await accept() -> TcpStream`, `async for conn in listener`, `port`, `aclose()`. On Linux, `accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)` is used. `EMFILE`/`ENFILE` handling: back off 100 ms and log a rate-limited warning; never busy-loop.
+`await accept() -> TcpStream`, `async for conn in listener`, `port`, `sockname`, `fileno()`, `aclose()` (also `async with`). On Linux and the BSDs, `accept4(SOCK_NONBLOCK|SOCK_CLOEXEC)` is used; elsewhere `accept` then `fcntl`/`ioctl`, so accepted sockets are nonblocking and close-on-exec everywhere. Cancelling an `accept()` loses no connection (T3). Closing the listener makes a waiting `accept()` raise `porto.ClosedResourceError` and ends an `async for` over it (`StopAsyncIteration`); connections not yet accepted are dropped by the OS.
+
+`EMFILE`/`ENFILE` handling: `accept` does not fail; it logs a warning on the `porto.net` logger (at most one every 10 s per lane), waits 100 ms and tries again, so a server sheds load by not accepting instead of crashing or spinning a core. On Linux the connection that hit the limit stays queued and is accepted by a later retry; macOS drops it in the kernel.
 
 ## 2. UDP and Unix
 - `await porto.net.bind_udp(host, port, *, reuse_port=False, broadcast=False) -> UdpSocket` with `send_to`, `recv_from`, `connect`, `send`, `recv`.
