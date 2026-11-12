@@ -1,0 +1,78 @@
+# cargo-deny policy (docs/spec/50-engineering/51-build-ci-release.md §2, audit job; supply chain
+# in docs/spec/30-douro-framework/40-security-and-limits.md §2). Run: `cargo deny check`.
+# CI runs it in .github/workflows/audit.yml, together with `cargo audit` and `pip-audit`.
+
+[graph]
+# All targets (the default): Windows-only crates (windows-sys) and Linux-only ones are checked
+# from any host. All features, so an optional dependency cannot hide a banned crate.
+all-features = true
+
+[advisories]
+# RustSec advisories fail the check. Ignoring one needs an id and a reason here:
+#   ignore = [{ id = "RUSTSEC-0000-0000", reason = "unreachable: we never call X" }]
+version = 2
+yanked = "deny"
+ignore = [
+    # Unmaintained since its repository was archived. Only the loom models (dev-dependency of
+    # porto-core and porto-io, tests only) pull it in; no wheel contains it. Drop this entry when
+    # loom stops depending on pin-utils. Mirrored in .cargo/audit.toml for `cargo audit`.
+    { id = "RUSTSEC-2026-0441", reason = "dev-only, through loom; not shipped" },
+]
+
+[licenses]
+version = 2
+# porto ships as MIT OR Apache-2.0 (ADR-029): only permissive licenses can be linked into the
+# wheels. The shipped crates' notices are generated into THIRD_PARTY_LICENSES.md
+# (scripts/third_party_licenses.py). GPL, LGPL, AGPL, MPL and CDDL are not listed on purpose.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+# The allowlist names licenses the graph does not use today; that is not a finding.
+unused-allowed-license = "allow"
+
+[[licenses.exceptions]]
+# aws-lc-rs, the default TLS crypto provider (ADR-026, from porto-net/douro), bundles AWS-LC,
+# which carries OpenSSL-style notices next to ISC and BSD. That license is allowed for these two
+# crates and nothing else.
+crate = "aws-lc-sys"
+allow = ["OpenSSL"]
+
+[[licenses.exceptions]]
+crate = "aws-lc-fips-sys"
+allow = ["OpenSSL"]
+
+[bans]
+# Duplicate versions are reported (warn) in general; the runtime's core crates may not appear
+# twice, see `deny` below.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true # path dependencies inside this workspace
+highlight = "all"
+deny = [
+    # ADR-026: no OpenSSL anywhere. TLS is rustls, with aws-lc-rs (default) or ring.
+    { crate = "openssl", reason = "ADR-026: rustls only" },
+    { crate = "openssl-sys", reason = "ADR-026: rustls only" },
+    { crate = "openssl-src", reason = "ADR-026: rustls only" },
+    { crate = "native-tls", reason = "ADR-026: it links OpenSSL on Linux" },
+    # Two majors of the same async or HTTP crate in one binary means two runtimes or two
+    # protocol stacks. Taking one in needs an entry under `skip` with the reason.
+    { crate = "tokio", deny-multiple-versions = true, reason = "one runtime-facing major only" },
+    { crate = "hyper", deny-multiple-versions = true, reason = "one HTTP stack major only" },
+]
+# `skip = [{ crate = "name@major", reason = "..." }]` silences a duplicate that cannot be removed.
+skip = []
+
+[sources]
+# crates.io only. A git or alternative-registry dependency needs an entry here, with the reason.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

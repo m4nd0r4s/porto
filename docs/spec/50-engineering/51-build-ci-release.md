@@ -21,7 +21,7 @@
 | conformance | h2spec, Autobahn |
 | perf | nightly on the reference machine (`53` §1, ADR-033: a local script on the maintainer's Mac for now); regressions > 5% fail; results committed to `bench/results` |
 | soak | weekly 72 h |
-| audit | `cargo deny`, `cargo audit`, `pip-audit` |
+| audit | `cargo deny check` (`deny.toml`: permissive licenses only, aws-lc excepted for its OpenSSL-style notice; no `openssl`/`openssl-sys`/`native-tls` (ADR-026); one major of `tokio` and `hyper`; crates.io only; RustSec advisories), `cargo audit --deny warnings` (`.cargo/audit.toml`) and `pip-audit` over the dev dependencies (`uv export`, since `uv.lock` is not committed). Runs on pull requests that touch a manifest or the policy files, on pushes to main with the same paths, and daily; not a required check. An ignored advisory needs an id and a reason in both files |
 
 ## 3. PGO (dist profile)
 Train with `bench/http` JSON and plaintext scenarios + `bench/micro` task benchmarks, merge profiles, and rebuild. Applied to release wheels only.

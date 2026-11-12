@@ -1,0 +1,10 @@
+# `cargo audit` policy (docs/spec/50-engineering/51-build-ci-release.md §2, audit job). It reads
+# Cargo.lock only, so unlike cargo-deny it cannot tell dev-dependencies from shipped ones: the
+# same ignore as deny.toml, with the same reason.
+[advisories]
+ignore = [
+    # pin-utils is unmaintained; only loom (dev-dependency, tests) uses it. Not shipped.
+    "RUSTSEC-2026-0441",
+]
+# Unmaintained and yanked crates are findings too, not just vulnerabilities.
+informational_warnings = ["unmaintained", "unsound", "notice"]

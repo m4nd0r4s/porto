@@ -1,0 +1,74 @@
+name: audit
+
+# cargo deny (deny.toml: licenses, bans, sources, advisories), cargo audit (.cargo/audit.toml) and
+# pip-audit (51-build-ci-release.md §2, 40-security-and-limits.md §2). Pull requests run it when
+# they touch a dependency manifest or the policy files; a daily run catches advisories published
+# against dependencies nobody changed. Not a required check: a pull request that touches none of
+# these paths does not start it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - deny.toml
+      - .cargo/audit.toml
+      - pyproject.toml
+      - packaging/*/pyproject.toml
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/*/Cargo.toml
+      - deny.toml
+      - .cargo/audit.toml
+      - pyproject.toml
+      - packaging/*/pyproject.toml
+      - .github/workflows/audit.yml
+  schedule:
+    - cron: "43 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo:
+    name: cargo deny, cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-deny,cargo-audit
+      # Licenses, bans (ADR-026: no OpenSSL; one major of tokio and hyper), sources and advisories.
+      - run: cargo deny check
+      # The RustSec database against Cargo.lock; warnings (unmaintained, unsound, yanked) fail too.
+      - run: cargo audit --deny warnings
+
+  # uv.lock is not committed, so the dev dependencies (pyproject.toml, which holds the build tool
+  # maturin too) are resolved fresh and the result is audited. The porto wheel has no Python
+  # dependencies of its own.
+  pip-audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.14"
+      - run: uv export --no-emit-workspace --no-hashes --no-header --group dev -o requirements-audit.txt
+      # The requirements are fully pinned by uv, so pip-audit audits them as they are (--no-deps)
+      # without resolving again.
+      - run: uvx --from pip-audit==2.10.1 pip-audit -r requirements-audit.txt --no-deps --disable-pip --progress-spinner off
