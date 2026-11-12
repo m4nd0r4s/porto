@@ -26,8 +26,10 @@ use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration, PyTypeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use porto_core::sync::broadcast::TryRecvError as BroadcastTryRecvError;
 use porto_core::sync::mpsc::{TryRecvError, TrySendError};
 
+use super::broadcast::{self, BroadcastRecvSide};
 use super::channel::{
     PyObj, RecvSide, SendSide, collect_many, recv_closed_error, send_closed_error,
 };
@@ -37,7 +39,7 @@ use crate::async_slots::{guard_send, stop_iteration};
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
 use crate::driver::{lane, step};
-use crate::errors::NoRuntimeError;
+use crate::errors::{Lagged, NoRuntimeError};
 use crate::throw_args::thrown_exception;
 
 /// What the awaitable does.
@@ -69,6 +71,14 @@ pub(super) enum Op {
     /// A watch receiver's `__anext__()`: the latest value after a change; the end is
     /// `StopAsyncIteration`.
     WatchNext { side: Arc<Waitable<WatchRecvSide>> },
+    /// A broadcast receiver's `recv()`.
+    BroadcastRecv {
+        side: Arc<Waitable<BroadcastRecvSide>>,
+    },
+    /// A broadcast receiver's `__anext__()`: the end is `StopAsyncIteration`.
+    BroadcastNext {
+        side: Arc<Waitable<BroadcastRecvSide>>,
+    },
 }
 
 impl Op {
@@ -83,6 +93,8 @@ impl Op {
             Self::OneshotNext { .. } => "anext(oneshot receiver)",
             Self::WatchChanged { .. } => "WatchReceiver.changed()",
             Self::WatchNext { .. } => "anext(watch receiver)",
+            Self::BroadcastRecv { .. } => "BroadcastReceiver.recv()",
+            Self::BroadcastNext { .. } => "anext(broadcast receiver)",
         }
     }
 
@@ -149,6 +161,22 @@ impl Op {
                 }
                 Err(TryRecvError::Closed) => Err(PyStopAsyncIteration::new_err(())),
             },
+            Self::BroadcastRecv { side } => match side.0.try_recv() {
+                // A new reference to the shared message; the `Arc` drops attached.
+                Ok(message) => Ok(Some(message.clone_ref(py))),
+                Err(BroadcastTryRecvError::Empty) => Ok(None),
+                Err(BroadcastTryRecvError::Closed) => Err(broadcast::recv_closed_error(&side.0)),
+                Err(BroadcastTryRecvError::Lagged(skipped)) => Err(Lagged::new_err(skipped)),
+            },
+            Self::BroadcastNext { side } => match side.0.try_recv() {
+                Ok(message) => Ok(Some(message.clone_ref(py))),
+                Err(BroadcastTryRecvError::Empty) => Ok(None),
+                Err(BroadcastTryRecvError::Closed) if side.0.is_handle_closed() => {
+                    Err(broadcast::recv_closed_error(&side.0))
+                }
+                Err(BroadcastTryRecvError::Closed) => Err(PyStopAsyncIteration::new_err(())),
+                Err(BroadcastTryRecvError::Lagged(skipped)) => Err(Lagged::new_err(skipped)),
+            },
         }
     }
 
@@ -161,6 +189,7 @@ impl Op {
             }
             Self::OneshotRecv { side } | Self::OneshotNext { side } => side.target(),
             Self::WatchChanged { side } | Self::WatchNext { side } => side.target(),
+            Self::BroadcastRecv { side } | Self::BroadcastNext { side } => side.target(),
         }
     }
 }

@@ -293,6 +293,51 @@ def test_the_watch_sample_runs() -> None:
     assert porto.run(watch_roundtrip) == 2
 
 
+async def check_broadcast_is_typed() -> None:
+    tx, rx = porto.broadcast[str](8)
+    assert_type(tx, porto.BroadcastSender[str])
+    assert_type(rx, porto.BroadcastReceiver[str])
+    assert_type(tx.capacity, int)
+    tx.send("hello")  # never waits: not awaited
+    assert_type(await rx.recv(), str)
+    assert_type(rx.try_recv(), str)
+    assert_type(rx.blocking_recv(), str)
+    assert_type(rx.clone(), porto.BroadcastReceiver[str])
+    assert_type(tx.clone(), porto.BroadcastSender[str])
+    assert_type(tx.subscribe(), porto.BroadcastReceiver[str])
+    try:
+        await rx.recv()
+    except porto.Lagged as lag:
+        assert_type(lag.skipped, int)
+    async for message in rx:
+        assert_type(message, str)
+    async with tx:
+        pass
+
+
+def check_broadcast_misuse_is_a_type_error() -> None:
+    porto.broadcast[int]()  # pyright: ignore[reportCallIssue]
+    porto.broadcast[int]("8")  # pyright: ignore[reportArgumentType]
+    tx, rx = porto.broadcast[int](8)
+    tx.send("one")  # pyright: ignore[reportArgumentType]
+    rx.recv_many(2)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+    objects: porto.BroadcastReceiver[object] = porto.broadcast[int](1)[1]
+    ints: porto.BroadcastSender[int] = porto.broadcast[object](1)[0]
+    del objects, ints
+
+
+async def broadcast_roundtrip() -> list[int]:
+    tx, first = porto.broadcast[int](4)
+    second = first.clone()
+    tx.send(1)
+    tx.send(2)
+    return [await first.recv(), await second.recv(), await second.recv()]
+
+
+def test_the_broadcast_sample_runs() -> None:
+    assert porto.run(broadcast_roundtrip) == [1, 1, 2]
+
+
 def test_the_channel_sample_runs() -> None:
     assert porto.run(pipeline, ["a", "b", "c"]) == ["a", "b", "c"]
 

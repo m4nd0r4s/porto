@@ -1031,6 +1031,90 @@ class WatchReceiver(Generic[_T_co]):
 
 def _watch(initial: Any, /) -> tuple[WatchSender[Any], WatchReceiver[Any]]: ...
 
+# Broadcast channel (porto.broadcast): every receiver gets every message. Sending never waits,
+# so ``send`` is a plain call.
+
+@final
+class BroadcastSender(Generic[_T_contra]):
+    """The sending end of a broadcast channel. Clone it for more producers.
+
+    Closing it (``close()``, ``async with``, or dropping the last reference) is per handle:
+    once every sender is closed, receivers drain what is kept and then see the end.
+    """
+
+    def send(self, message: _T_contra, /) -> None:
+        """Sends ``message`` to every receiver; never waits, so it is not awaited. When the
+        channel keeps ``capacity`` messages already, the oldest is overwritten and receivers
+        that had not read it get ``porto.Lagged``. Raises ``porto.BrokenResourceError`` if no
+        receiver is open (``subscribe()`` makes one), ``porto.ClosedResourceError`` if this
+        sender was closed."""
+
+    def subscribe(self) -> BroadcastReceiver[_T_contra]:
+        """A new receiver that starts at the next message sent: it sees nothing sent before.
+        Works while no other receiver is open. Raises ``porto.ClosedResourceError`` if this
+        sender was closed."""
+
+    def clone(self) -> BroadcastSender[_T_contra]:
+        """Another sender on the same channel. A clone of a closed sender is closed."""
+
+    def close(self) -> None:
+        """Closes this sender; other clones are unaffected. Closing twice does nothing."""
+
+    def is_closed(self) -> bool:
+        """Whether sends through this sender fail: it was closed, or no receiver is open."""
+
+    @property
+    def capacity(self) -> int:
+        """How many messages the channel keeps for receivers that fall behind."""
+
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> None: ...
+
+@final
+class BroadcastReceiver(Generic[_T_co]):
+    """The receiving end of a broadcast channel. Clone it for another receiver at the same
+    position: each one gets every message from there.
+
+    A receiver that falls more than ``capacity`` messages behind gets ``porto.Lagged`` with
+    the exact number it missed, and its next receive returns the oldest message still kept.
+    """
+
+    def recv(self) -> Awaitable[_T_co]:
+        """The next message, waiting while there is none. Raises ``porto.Lagged`` if messages
+        were overwritten before this receiver read them, ``porto.EndOfChannel`` once every
+        sender is closed and every kept message was received,
+        ``porto.ClosedResourceError`` if this receiver was closed. Nothing happens until it is
+        awaited; one freed unawaited emits ``RuntimeWarning``."""
+
+    def try_recv(self) -> _T_co:
+        """The next message if one was sent; raises ``porto.WouldBlock`` if nothing new was,
+        and the errors of ``recv``."""
+
+    def blocking_recv(self) -> _T_co:
+        """``recv`` from a thread that does not run porto, blocking that thread while there is
+        no message. Raises ``RuntimeError`` on a porto lane thread."""
+
+    def clone(self) -> BroadcastReceiver[_T_co]:
+        """Another receiver at this receiver's position. A clone of a closed receiver is
+        closed."""
+
+    def close(self) -> None:
+        """Closes this receiver; other receivers are unaffected. Waits through it raise
+        ``porto.ClosedResourceError``. Closing twice does nothing."""
+
+    def __aiter__(self) -> Self: ...
+    def __anext__(self) -> Awaitable[_T_co]:
+        """``async for message in rx``: like ``recv``; the end of the channel ends the loop. A
+        lag raises ``porto.Lagged`` out of the loop."""
+
+def _broadcast(capacity: int, /) -> tuple[BroadcastSender[Any], BroadcastReceiver[Any]]: ...
+
 @final
 class _Trap:
     """A request to the driver. Awaiting it yields the trap, then returns what the driver sends.

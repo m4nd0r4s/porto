@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from porto import _core
 from porto._core import (
+    BroadcastReceiver,
+    BroadcastSender,
     OneshotReceiver,
     OneshotSender,
     Receiver,
@@ -94,3 +96,28 @@ class watch(Generic[_T]):
                     "pass the value receivers read before the first send"
                 )
             return _core._watch(initial)
+
+
+class broadcast(Generic[_T]):
+    """A channel where every receiver gets every message: ``tx, rx = porto.broadcast[str](64)``.
+
+    The channel keeps the last ``capacity`` (>= 1) messages. ``tx.send(message)`` never waits;
+    when the channel is full it overwrites the oldest message, and a receiver that had not read
+    it gets ``porto.Lagged(skipped=n)`` with the exact count and carries on from the oldest
+    message kept. ``rx.clone()`` is another receiver at the same position and ``tx.subscribe()``
+    one that sees only later messages.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, capacity: int) -> tuple[BroadcastSender[_T], BroadcastReceiver[_T]]: ...
+
+    else:
+
+        def __new__(cls, capacity=_MISSING):
+            if capacity is _MISSING:
+                raise TypeError(
+                    "porto: porto.broadcast() needs a capacity, as in porto.broadcast[T](64): "
+                    "pass how many messages the channel keeps for receivers that fall behind"
+                )
+            return _core._broadcast(capacity)

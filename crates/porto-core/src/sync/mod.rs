@@ -30,6 +30,8 @@
 //!   the lane.
 //! - [`mpsc`]: bounded and unbounded multi-producer multi-consumer channels.
 //! - [`oneshot`]: a channel for one value.
+//! - [`broadcast`]: every receiver gets every message; a receiver that falls behind is told how
+//!   many it missed.
 //! - [`watch`]: a channel for the latest value, with change notification.
 //! - [`SetOnce`]: an `Arc` set at most once and read with one atomic load.
 //!
@@ -41,6 +43,7 @@
 
 mod barrier;
 mod blocking;
+pub mod broadcast;
 mod condvar;
 mod event;
 mod join_waiters;
@@ -71,6 +74,9 @@ mod oneshot_tests;
 #[cfg(all(test, not(loom)))]
 mod watch_tests;
 
+#[cfg(all(test, not(loom)))]
+mod broadcast_tests;
+
 #[cfg(test)]
 mod join_waiters_tests;
 
@@ -88,6 +94,9 @@ mod loom_oneshot_tests;
 
 #[cfg(all(test, loom))]
 mod loom_watch_tests;
+
+#[cfg(all(test, loom))]
+mod loom_broadcast_tests;
 
 #[cfg(all(test, not(loom)))]
 mod semaphore_tests;
