@@ -353,6 +353,7 @@ unsafe fn complete<B: TaskBody, S: Schedule>(
         let notified = panic::catch_unwind(AssertUnwindSafe(|| scope.end(end)));
         unhandled = unhandled.or(notified.err());
     }
+    super::unregister_completed(&cell.header, &cell.scheduler);
     cell.scheduler.task_completed(&cell.header);
     if cell.header.state.ref_dec() {
         // SAFETY: the decrement released the last reference.
@@ -392,6 +393,14 @@ unsafe fn drop_body<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
 /// # Safety
 /// `ptr` is a `BodyCell<B, S>` whose refcount just reached zero.
 unsafe fn dealloc<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
+    // A task that never completed (or completed off its lane) may still be linked in its
+    // registry: it is taken off first, or handed to the lane that owns the list.
+    // SAFETY: the refcount reached zero, so the allocation is ours until the `Box` below.
+    if !unsafe {
+        super::unregister_before_free(ptr, std::ptr::from_ref(&cell::<B, S>(ptr).scheduler))
+    } {
+        return;
+    }
     // SAFETY: allocated by `Box` in `new_body_task_in`, and no reference is left to observe it.
     let cell = unsafe { Box::from_raw(ptr.cast::<BodyCell<B, S>>().as_ptr()) };
     // A task that never completed still holds its scope: it ends as freed once what it owns

@@ -44,6 +44,8 @@ impl fmt::Debug for TaskEnd {
 pub(super) struct ChildVTable {
     /// Tells the scope one of its children ended and releases the child's reference to it.
     child_ended: unsafe fn(NonNull<ChildVTableRef>, TaskEnd),
+    /// The scope's id, for introspection.
+    scope_id: unsafe fn(NonNull<ChildVTableRef>) -> u64,
 }
 
 /// The first field of every `ScopeNode<E>`: what a [`TaskScope`] points at.
@@ -54,7 +56,17 @@ pub(super) type ChildVTableRef = &'static ChildVTable;
 pub(super) fn child_vtable<E: Send + 'static>() -> ChildVTableRef {
     &ChildVTable {
         child_ended: child_ended::<E>,
+        scope_id: scope_id::<E>,
     }
+}
+
+/// # Safety
+/// `node` is a counted reference to a `ScopeNode<E>` (see [`TaskScope::attach`]), alive for the
+/// call.
+unsafe fn scope_id<E: Send + 'static>(node: NonNull<ChildVTableRef>) -> u64 {
+    // SAFETY: the caller's contract; a `ScopeNode` is `repr(C)` with its vtable reference
+    // first, so the node's address is the field's. Only shared access.
+    unsafe { node.cast::<ScopeNode<E>>().as_ref() }.id()
 }
 
 /// # Safety
@@ -124,6 +136,15 @@ impl TaskScope {
         // A `ScopeNode` is `repr(C)` with its vtable reference first, so the node's address is
         // the field's (see `try_attach`).
         self.node.as_ptr().cast_const().cast::<ScopeNode<E>>() == std::ptr::from_ref(&**scope)
+    }
+
+    /// The id of the scope this is a reference to.
+    pub fn scope_id(&self) -> u64 {
+        // SAFETY: we hold a counted reference to the node, which starts with its vtable
+        // reference, never written after construction.
+        let vtable = unsafe { *self.node.as_ptr() };
+        // SAFETY: the vtable is the node's own, and the reference outlives the call.
+        unsafe { (vtable.scope_id)(self.node) }
     }
 
     /// Tells the scope how its child ended and releases the child's reference to it.

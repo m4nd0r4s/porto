@@ -19,6 +19,7 @@ pub mod config;
 pub mod coop;
 #[cfg(all(test, loom))]
 mod loom_support;
+pub mod registry;
 pub mod sched;
 pub mod scope;
 pub mod sync;
@@ -26,4 +27,5 @@ pub mod task;
 pub mod time;
 
 pub use blocking::{BlockingError, BlockingStats, WorkerHooks};
+pub use registry::{LiveTask, SnapshotError, TaskKind, TaskRecord, TaskSnapshotRequest, TaskState};
 pub use sched::{Builder, Handle, ParkHook, Runtime, WeakHandle, spawn, spawn_blocking};

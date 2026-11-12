@@ -82,8 +82,18 @@ impl Lane {
         &self.handle.shared
     }
 
-    fn remote(&self) -> &Remote {
+    pub(crate) fn remote(&self) -> &Remote {
         &self.shared().lanes[self.index]
+    }
+
+    /// Links a task that is about to run on this lane into its registry (a no-op for one that
+    /// is linked already). Called on the lane's own thread, for what it spawns and for what it
+    /// takes from the injector.
+    #[inline]
+    pub(crate) fn register(&self, task: &Notified) {
+        // SAFETY: the lane's own thread (the callers' contract), and a queued task is live
+        // with the provenance of its allocation.
+        unsafe { self.remote().registry.link_if_new(task.ptr()) };
     }
 
     /// The ticks so far, wrapping.
@@ -121,6 +131,7 @@ impl Lane {
         if tick.is_multiple_of(GLOBAL_QUEUE_INTERVAL)
             && let Some(task) = shared.inject.pop()
         {
+            self.register(&task);
             return Some(task);
         }
         let mut local = self.local.borrow_mut();
@@ -129,7 +140,15 @@ impl Lane {
         }
         // A fair share of the injector, so other lanes find some too.
         let batch = (shared.inject.len() / shared.lanes.len() + 1).min(INJECT_BATCH);
-        shared.inject.pop_batch(&mut local, batch)
+        let queued = local.len();
+        let first = shared.inject.pop_batch(&mut local, batch)?;
+        // Tasks spawned from other threads reach the registry here.
+        self.register(&first);
+        local
+            .iter()
+            .skip(queued)
+            .for_each(|task| self.register(task));
+        Some(first)
     }
 
     /// Polls the driver without blocking, fires the expired timers and runs the deferred work.
@@ -138,7 +157,36 @@ impl Lane {
         let events = self.poll_driver();
         let fired = self.fire_expired_timers();
         let deferred = self.run_deferred();
-        events + fired + deferred > 0
+        let freed = self.free_zombies();
+        events + fired + deferred + freed > 0
+    }
+
+    /// Frees the tasks that were freed off this lane while linked in its registry: the last
+    /// reference went on another thread, which handed them here. Returns how many. A
+    /// panicking destructor does not lose the rest: every task is freed, then the first panic
+    /// goes on.
+    fn free_zombies(&self) -> usize {
+        let registry = &self.remote().registry;
+        if !registry.has_zombies() {
+            return 0;
+        }
+        // SAFETY: the lane's own thread, with the registry open (the runtime lives).
+        let zombies = unsafe { registry.take_zombies() };
+        let freed = zombies.len();
+        let mut first = None;
+        for task in zombies {
+            // SAFETY: from `take_zombies`: unlinked, refcount zero.
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                crate::task::free_zombie(task);
+            }));
+            if let Err(payload) = outcome {
+                first.get_or_insert(payload);
+            }
+        }
+        if let Some(payload) = first {
+            panic::resume_unwind(payload);
+        }
+        freed
     }
 
     fn fire_expired_timers(&self) -> usize {
@@ -192,6 +240,7 @@ impl Lane {
         !self.local.borrow().is_empty()
             || !shared.inject.is_empty()
             || !self.remote().deferred.is_empty()
+            || self.remote().registry.has_zombies()
     }
 
     /// Parks the lane until it is notified, or until the earliest timer is due, unless work

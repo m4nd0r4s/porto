@@ -19,9 +19,12 @@ use super::inject::Inject;
 use super::park::Parking;
 use super::timers::Timers;
 use crate::blocking::{BlockingConfig, BlockingError, BlockingPool, BlockingStats};
+use crate::registry::{
+    LiveTask, SnapshotCell, SnapshotError, TaskRecord, TaskRegistry, TaskSnapshotRequest, record_of,
+};
 use crate::scope::{ScopeClosed, ScopeRef, TaskScope};
 use crate::task::{
-    JoinHandle, Notified, Schedule, TaskBody, TaskBodyRef, TaskFlags, new_body_task,
+    JoinHandle, Notified, Registration, Schedule, TaskBody, TaskBodyRef, TaskFlags, new_body_task,
     new_body_task_in, new_joinable_task, new_joinable_task_in,
 };
 use crate::time::{Deadline, RuntimeClock};
@@ -57,6 +60,8 @@ pub(crate) struct Shared {
 
 /// The part of one lane other threads can reach.
 pub(crate) struct Remote {
+    /// The lane's registry of live tasks (`23-observability.md` §1).
+    pub(crate) registry: TaskRegistry,
     pub(crate) parking: Parking,
     /// Whether the lane parks in the driver's `turn` rather than on its thread: an unpark then
     /// wakes the driver.
@@ -67,8 +72,9 @@ pub(crate) struct Remote {
 }
 
 impl Remote {
-    fn new() -> Self {
+    fn new(introspection: bool) -> Self {
         Self {
+            registry: TaskRegistry::new(introspection),
             parking: Parking::new(),
             parks_in_driver: AtomicBool::new(false),
             deferred: Inject::new(),
@@ -97,6 +103,31 @@ impl Shared {
         for index in 0..self.lanes.len() {
             self.notify_lane(index);
         }
+    }
+
+    /// What lane `index` copies for a task snapshot: its registry's live tasks, plus (lane 0)
+    /// the tasks the injector still holds, which no lane linked yet. `None` once the registry
+    /// is closed. Runs on the lane's own thread.
+    fn collect_records(&self, index: usize) -> Option<Vec<TaskRecord>> {
+        let registry = &self.lanes[index].registry;
+        if registry.is_closed() {
+            return None;
+        }
+        let mut records = Vec::new();
+        // SAFETY: on the lane thread of an open registry; the callback only reads.
+        unsafe { registry.for_each_live(|task| records.push(record_of(&task))) };
+        if index == 0 {
+            // The injector serves every lane, so lane 0 reports what it holds: tasks spawned from
+            // other threads that no lane took yet.
+            self.inject.for_each(|queued| {
+                let header = queued.header();
+                if !header.registry.is_linked_relaxed() {
+                    // SAFETY: a queued task is nobody's to poll or end until a lane takes it.
+                    records.push(unsafe { TaskRecord::of(header, header.state().load()) });
+                }
+            });
+        }
+        Some(records)
     }
 
     fn unpark(&self, index: usize) {
@@ -160,11 +191,12 @@ impl Handle {
         driver: Option<Arc<dyn Driver>>,
         lanes: usize,
         blocking: BlockingConfig,
+        introspection: bool,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inject: Inject::new(),
-                lanes: (0..lanes).map(|_| Remote::new()).collect(),
+                lanes: (0..lanes).map(|_| Remote::new(introspection)).collect(),
                 clock,
                 timers: Timers::new(timer_resolution),
                 driver,
@@ -196,9 +228,7 @@ impl Handle {
         F::Output: Send + 'static,
     {
         let (task, join) = new_joinable_task(future, self.clone());
-        if let Err(task) = self.schedule_local(task) {
-            self.clone().schedule_remote(task);
-        }
+        self.enqueue_new(task);
         join
     }
 
@@ -207,9 +237,7 @@ impl Handle {
     /// which keeps the outcome and the joiners itself.
     pub fn spawn_body<B: TaskBody>(&self, body: B, flags: TaskFlags) -> TaskBodyRef<B> {
         let (task, body) = new_body_task(body, self.clone(), flags);
-        if let Err(task) = self.schedule_local(task) {
-            self.clone().schedule_remote(task);
-        }
+        self.enqueue_new(task);
         body
     }
 
@@ -233,9 +261,7 @@ impl Handle {
             return Err(ScopeClosed(future));
         };
         let (task, join) = new_joinable_task_in(future, self.clone(), Some(scope));
-        if let Err(task) = self.schedule_local(task) {
-            self.clone().schedule_remote(task);
-        }
+        self.enqueue_new(task);
         Ok(join)
     }
 
@@ -259,10 +285,79 @@ impl Handle {
             return Err(ScopeClosed(body));
         };
         let (task, body) = new_body_task_in(body, self.clone(), flags, Some(scope));
-        if let Err(task) = self.schedule_local(task) {
+        self.enqueue_new(task);
+        Ok(body)
+    }
+
+    /// Queues a task that was just spawned: on the local queue of the lane this thread runs,
+    /// linked into its registry, else on the injector (the lane that takes it from there links it).
+    fn enqueue_new(&self, task: Notified) {
+        if let Err(task) = context::push_new(self, task) {
             self.clone().schedule_remote(task);
         }
-        Ok(body)
+    }
+
+    /// Calls `f` on every live task of this runtime's registry, newest first, if this thread is
+    /// running its lane; returns whether it did (`false` from any other thread, or once the
+    /// runtime is shutting down). A task is live from its spawn until it completes. `f` must
+    /// not spawn tasks or let any end.
+    ///
+    /// This is how `Scope.tasks` lists a scope's tasks (`15-structured-concurrency` §1): the
+    /// registry is the one list of tasks, so a scope keeps none of its own.
+    pub fn with_live_tasks(&self, f: impl FnMut(LiveTask<'_>)) -> bool {
+        context::with_lane_of(self, |lane| {
+            let registry = &lane.shared().lanes[lane.index()].registry;
+            if registry.is_closed() {
+                return false;
+            }
+            // SAFETY: this thread runs the lane of an open registry (`with_lane_of`).
+            unsafe { registry.for_each_live(f) };
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// Requests a snapshot of every live task from each lane: copied at the lane's next
+    /// maintenance tick, or at once if it is parked (the request wakes it). On a lane's own
+    /// thread its share is taken right away. See [`TaskSnapshotRequest`].
+    pub fn request_task_snapshot(&self) -> TaskSnapshotRequest {
+        let lanes = self.shared.lanes.len();
+        let cell = SnapshotCell::new(lanes);
+        let current = context::with_lane_of(self, |lane| lane.index());
+        for index in 0..lanes {
+            if current == Some(index) {
+                cell.deliver(self.shared.collect_records(index));
+                continue;
+            }
+            let handle = self.clone();
+            let delivery = Arc::clone(&cell);
+            let work = move || delivery.deliver(handle.shared.collect_records(index));
+            match self.shared.lanes[index].deferred.push(Box::new(work)) {
+                Ok(()) => self.shared.notify_lane(index),
+                Err(work) => {
+                    // Closed: the runtime is gone, and the request never runs.
+                    drop(work);
+                    cell.deliver(None);
+                }
+            }
+        }
+        TaskSnapshotRequest::new(cell)
+    }
+
+    /// A snapshot of every live task: [`Handle::request_task_snapshot`], waited for. From a
+    /// lane's own thread (a task, or `block_on`) it returns at once. From another thread it
+    /// waits for the lane to take it, so the runtime must be running.
+    ///
+    /// # Errors
+    /// [`SnapshotError::RuntimeClosed`] if the runtime is dropped first.
+    pub fn task_snapshot(&self) -> Result<Vec<TaskRecord>, SnapshotError> {
+        self.request_task_snapshot().wait()
+    }
+
+    /// Whether tasks record their timing (first poll, time in polls, step start): the
+    /// introspection switch of [`Builder::introspection`](crate::Builder::introspection).
+    pub fn introspection(&self) -> bool {
+        self.shared.lanes[0].registry.introspection()
     }
 
     /// Runs `work` on lane 0 at its next maintenance tick (every 61 tasks, and before it
@@ -354,6 +449,19 @@ unsafe impl Schedule for Handle {
 
     fn handle(&self) -> Option<&Handle> {
         Some(self)
+    }
+
+    fn registration(&self) -> Option<Registration<'_>> {
+        // One lane: every task belongs to lane 0 (M2 picks the lane a task was spawned on).
+        Some(Registration {
+            registry: &self.shared.lanes[0].registry,
+            on_lane: self.is_current_lane(),
+        })
+    }
+
+    fn zombie_pushed(&self) {
+        // The lane frees the task at its next maintenance tick: make sure there is one soon.
+        self.shared.notify_lane(0);
     }
 
     fn schedule_remote(self, task: Notified) {

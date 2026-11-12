@@ -29,6 +29,36 @@ impl TaskRef {
         Self(task)
     }
 
+    /// A new reference to the task at `ptr`, or `None` if its last reference is gone already (the
+    /// task is being freed): the upgrade of a non-owning pointer, for the registry's walks.
+    ///
+    /// # Safety
+    /// `ptr` is a task header with the provenance of its allocation, which is not freed while
+    /// this runs (it is linked in a registry whose lock the caller holds).
+    pub(crate) unsafe fn try_new(ptr: std::ptr::NonNull<Header>) -> Option<Self> {
+        // SAFETY: the caller's contract.
+        let header = unsafe { ptr.as_ref() };
+        if !header.state.try_ref_inc() {
+            return None;
+        }
+        // SAFETY: the increment above created the reference the `TaskRef` takes over.
+        Some(Self(unsafe { RawTask::from_raw(ptr) }))
+    }
+
+    /// Cancels the task, as [`JoinHandle::abort`](super::JoinHandle::abort) does: if it has not
+    /// completed it is not polled again, and its future is dropped on whoever polls it next, which
+    /// here is the thread that drops the queue entry once the scheduler is closed. Consumes this
+    /// reference.
+    pub(crate) fn cancel(self) {
+        use super::state::WakeAction;
+        match self.header().state.transition_to_cancel_requested() {
+            WakeAction::DoNothing => {}
+            // SAFETY: the transition added the reference the queue now owns and set SCHEDULED.
+            WakeAction::Submit => unsafe { self.0.schedule() },
+            WakeAction::Dealloc => unreachable!("a cancel request never drops a reference"),
+        }
+    }
+
     /// Gives the reference back to the caller, without touching the count.
     pub(crate) fn into_raw(self) -> RawTask {
         let task = self.0;

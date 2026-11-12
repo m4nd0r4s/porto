@@ -1,7 +1,17 @@
 # 23 — Observability
 
 ## 1. Task registry
-Every task (Rust and Python) is linked into a per-lane intrusive list on spawn and unlinked on completion. The lane owns the list, so the hot path needs no locks. Snapshots use a seqlock-style handshake: the requester posts a request to every lane's inbox, and each lane copies its list at its next maintenance tick (≤ `event_interval` tasks or immediately if idle). Deterministic and cheap.
+Every task (Rust and Python) is linked into a per-lane intrusive list on spawn and unlinked on completion. The lane owns the list, so the hot path needs no locks and no atomic read-modify-write: a spawn on the lane links the task at the head, and the completion of a task on the lane unlinks it, with plain loads and stores (the node is two pointers in the header, `RegistryNode`, inside the 64 B budget). Everything another thread does about a task goes around the list:
+
+- **A spawn from another thread** does not link: the task goes on the injector, and the lane that takes it from there links it. A snapshot counts what the injector still holds, so it is exact all the same.
+- **A task freed off its lane while still linked** (its last reference was a waker dropped on another thread) is pushed on a lock-free stack of freed tasks, and the lane unlinks and frees it at its next maintenance tick (the push wakes a parked lane). The body's destructor, and so its Python references, runs on the lane (25 P1).
+- **Shutdown.** When the runtime is dropped the lane's ownership ends: the stack is drained, and from then on every list operation, from any thread, takes the registry's lock (the shutdown path is the only one that walks). The registry then **cancels every task that is still linked**, with the injector closed so the cancellation completes each one where it is, and repeats until no task is left. So no task outlives its runtime however its references are held: a task kept alive only by wakers (a task waiting on something that holds its own waker, a waker cycle) is cancelled and freed with the runtime instead of waiting for a wake that never comes (11 §3.2).
+
+A snapshot is a request posted to every lane's deferred-work inbox (the same inbox `Handle::defer` uses): the lane copies its list at its next maintenance tick (≤ `event_interval` tasks), or immediately if it is idle (the request wakes it), and the requester waits for each lane's copy. On a lane's own thread the lane's copy is taken at once. Deterministic and cheap; a snapshot is exactly the set of tasks that were live (linked, not complete) when the lane copied, plus the injector's. The raw record is `TaskRecord { id, kind, state, type_name, flags, owner_lane, scope_id, cancel_requested }`; `porto.inspect` (M5) shapes it into `TaskInfo`.
+
+The **introspection switch** (`Builder::introspection`, off by default) turns on the per-task timing fields of 11 §2 (`first_poll`, `total_poll_ns`, `last_step_start`): they need a clock read per step, so with the switch off the hot path reads no clock. The registry and its snapshots work either way.
+
+The lane's own code can also walk its list (`Handle::with_live_tasks`): `Scope.tasks` is derived that way (15, 20), so a scope keeps no list of its own tasks.
 
 ```python
 @dataclass(frozen=True)

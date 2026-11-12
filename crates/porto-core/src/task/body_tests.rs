@@ -141,6 +141,9 @@ fn a_parked_body_is_freed_with_its_last_waker() {
     drop(task);
     assert!(freed.upgrade().is_some(), "the parked waker keeps it");
     drop(parked.lock().unwrap().take());
+    // Dropped off the lane (this thread is not running it), so the lane frees the task: at its
+    // next maintenance tick (`crate::registry`).
+    rt.run_until_idle();
     assert!(freed.upgrade().is_none(), "the last waker did not free it");
 }
 

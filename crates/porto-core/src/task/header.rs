@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use super::flags::TaskFlags;
 use super::raw::TaskVTable;
 use super::state::State;
+use crate::registry::RegistryNode;
 use crate::scope::TaskScope;
 
 /// The fixed prefix of every task (`11-task-model-and-trap-protocol.md` §1).
@@ -32,32 +33,12 @@ pub struct Header {
     /// by the lane that completes it (holding RUNNING), or by `dealloc` if it never completed.
     /// Nothing else touches it.
     scope: UnsafeCell<Option<TaskScope>>,
-    /// Intrusive run-queue link for the injector.
-    #[allow(dead_code, reason = "used by the intrusive injector queue (M2)")]
-    pub(crate) queue_next: UnsafeCell<*const Header>,
-    /// Intrusive node in the per-lane task registry (introspection).
-    #[allow(dead_code, reason = "linked by the task registry (porto-szb.24)")]
+    /// Intrusive link of a queue the task is in: today the registry's list of tasks freed off
+    /// their lane (`crate::registry`), which only holds a task no run queue owns; the intrusive
+    /// injector (M2) shares it for the same reason.
+    queue_next: UnsafeCell<*mut Header>,
+    /// Intrusive node in the per-lane task registry (introspection), see `crate::registry`.
     pub(crate) registry: RegistryNode,
-}
-
-/// A node in the intrusive, doubly linked list of live tasks.
-///
-/// A placeholder with the final size; the task registry (porto-szb.24) owns the linking logic.
-#[repr(C)]
-pub struct RegistryNode {
-    #[allow(dead_code, reason = "linked by the task registry (porto-szb.24)")]
-    prev: UnsafeCell<*const Header>,
-    #[allow(dead_code, reason = "linked by the task registry (porto-szb.24)")]
-    next: UnsafeCell<*const Header>,
-}
-
-impl RegistryNode {
-    const fn unlinked() -> Self {
-        Self {
-            prev: UnsafeCell::new(ptr::null()),
-            next: UnsafeCell::new(ptr::null()),
-        }
-    }
 }
 
 const _: () = assert!(
@@ -97,9 +78,28 @@ impl Header {
             vtable,
             id: next_id(),
             scope: UnsafeCell::new(scope),
-            queue_next: UnsafeCell::new(ptr::null()),
+            queue_next: UnsafeCell::new(ptr::null_mut()),
             registry: RegistryNode::unlinked(),
         }
+    }
+
+    /// The registry's link for a task freed off its lane.
+    ///
+    /// # Safety
+    /// The caller holds the last reference (no queue owns the task), and writes before
+    /// publishing the task to the registry's list.
+    pub(crate) unsafe fn set_queue_next(&self, next: *mut Header) {
+        // SAFETY: the caller's contract.
+        unsafe { *self.queue_next.get() = next };
+    }
+
+    /// The registry's link, see [`Header::set_queue_next`].
+    ///
+    /// # Safety
+    /// The task was published to the registry's list by `set_queue_next`'s caller.
+    pub(crate) unsafe fn queue_next(&self) -> *mut Header {
+        // SAFETY: the caller's contract.
+        unsafe { *self.queue_next.get() }
     }
 
     /// The task's id: unique for the process lifetime and increasing in spawn order.
@@ -157,6 +157,17 @@ impl Header {
     pub unsafe fn replace_scope(&self, scope: TaskScope) -> Option<TaskScope> {
         // SAFETY: the caller's contract.
         unsafe { (*self.scope.get()).replace(scope) }
+    }
+
+    /// The id of the scope the task counts in, if any.
+    ///
+    /// # Safety
+    /// No other thread writes the slot: the caller holds RUNNING, is the lane thread of a
+    /// single-lane runtime reading a task that is not running, or otherwise knows the task does
+    /// not end or move meanwhile (see [`crate::registry::LiveTask`]).
+    pub(crate) unsafe fn scope_id(&self) -> Option<u64> {
+        // SAFETY: the caller's contract.
+        unsafe { (*self.scope.get()).as_ref() }.map(TaskScope::scope_id)
     }
 
     /// Takes the task's scope reference out, leaving `None`: the task is ending. A task outside

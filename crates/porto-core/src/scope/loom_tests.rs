@@ -335,6 +335,7 @@ mod deadline {
             None,
             1,
             crate::blocking::BlockingConfig::default(),
+            false,
         )
     }
 

@@ -104,6 +104,16 @@ impl<T> Inject<T> {
         std::mem::take(&mut queue.items)
     }
 
+    /// Calls `f` on every item, front to back, under the lock: `f` must be quick and must not
+    /// touch the queue.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&T)) {
+        if self.is_empty() {
+            return;
+        }
+        let queue = self.lock();
+        queue.items.iter().for_each(&mut f);
+    }
+
     /// Takes everything in it, leaving it open.
     pub(crate) fn take_all(&self) -> VecDeque<T> {
         if self.is_empty() {

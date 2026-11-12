@@ -36,6 +36,27 @@ pub(crate) fn push_local(handle: &Handle, task: Notified) -> Result<(), Notified
     task.map_or(Ok(()), Err)
 }
 
+/// Pushes a task that was just spawned onto the local queue, linking it into the lane's
+/// registry first, if this thread is running one of `handle`'s lanes: one lookup of the lane
+/// for both. Hands the task back otherwise.
+pub(crate) fn push_new(handle: &Handle, task: Notified) -> Result<(), Notified> {
+    let mut task = Some(task);
+    with_lane(|lane| {
+        if lane.handle.same_runtime(handle)
+            && let Some(task) = task.take()
+        {
+            lane.register(&task);
+            lane.local.borrow_mut().push_back(task);
+        }
+    });
+    task.map_or(Ok(()), Err)
+}
+
+/// Calls `f` with the lane of `handle`'s runtime that this thread is running, if it is one.
+pub(crate) fn with_lane_of<R>(handle: &Handle, f: impl FnOnce(&Lane) -> R) -> Option<R> {
+    with_lane(|lane| lane.handle.same_runtime(handle).then(|| f(lane))).flatten()
+}
+
 /// Calls `f` with the handle of the runtime running on this thread, if any (without cloning
 /// it).
 pub(crate) fn with_current_handle<R>(f: impl FnOnce(&Handle) -> R) -> Option<R> {

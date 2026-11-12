@@ -29,6 +29,8 @@ use std::future::Future;
 use crate::task::JoinHandle;
 
 pub(crate) use context::{current_handle, current_time, with_current_handle};
+#[cfg(all(test, loom))]
+pub(crate) use inject::Inject;
 pub use park::ParkHook;
 pub use runtime::{Builder, Runtime};
 pub use shared::{DeferredWork, Handle, WeakHandle};

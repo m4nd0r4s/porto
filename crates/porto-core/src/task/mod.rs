@@ -39,10 +39,11 @@ mod loom_tests;
 
 use std::fmt;
 use std::mem;
+use std::ptr::NonNull;
 
 pub use body::{TaskBody, TaskBodyRef};
 pub use flags::TaskFlags;
-pub use header::{Header, RegistryNode};
+pub use header::Header;
 pub use join::{JoinError, JoinHandle};
 pub use raw::TaskVTable;
 pub use task_ref::TaskRef;
@@ -52,6 +53,8 @@ pub(crate) use body::{new_body_task, new_body_task_in};
 pub(crate) use harness::new_task;
 pub(crate) use harness::{new_joinable_task, new_joinable_task_in};
 use raw::RawTask;
+
+use crate::registry::BeforeFree;
 
 /// Where a woken task goes. Implemented by a cheap, cloneable scheduler handle that is stored
 /// inside every task it spawned.
@@ -92,6 +95,85 @@ pub unsafe trait Schedule: Clone + Send + Sync + 'static {
     fn handle(&self) -> Option<&crate::Handle> {
         None
     }
+
+    /// The registry this scheduler's tasks are linked into, with whether the calling thread is
+    /// the lane that owns it (`crate::registry`); `None` for a scheduler with no registry,
+    /// whose tasks are never linked.
+    fn registration(&self) -> Option<Registration<'_>> {
+        None
+    }
+
+    /// Called after a task freed off its lane was handed to the registry's lane, which frees it
+    /// at its next maintenance tick: the scheduler wakes the lane for it. `self` is an owned
+    /// clone.
+    fn zombie_pushed(&self) {}
+}
+
+/// Where a scheduler registers its tasks, see [`Schedule::registration`].
+pub struct Registration<'a> {
+    /// The registry of the lane the task belongs to.
+    pub registry: &'a crate::registry::TaskRegistry,
+    /// Whether the calling thread is that lane's thread.
+    pub on_lane: bool,
+}
+
+/// A task completed on this thread: unlinks it from its registry if it is linked, which the
+/// scheduler's lane does for a task it completes itself.
+#[inline]
+fn unregister_completed<S: Schedule>(header: &Header, scheduler: &S) {
+    if header.registry.is_linked_relaxed() {
+        unregister_completed_slow(header, scheduler);
+    }
+}
+
+#[inline(never)]
+fn unregister_completed_slow<S: Schedule>(header: &Header, scheduler: &S) {
+    if let Some(registration) = scheduler.registration() {
+        registration
+            .registry
+            .completed(header, registration.on_lane);
+    }
+}
+
+/// The last reference to the task at `ptr` is gone: takes it off its registry before it is
+/// freed. Returns whether to go on freeing it: `false` means the registry handed the task to its
+/// lane, which frees it later, and the caller must not touch it again.
+///
+/// # Safety
+/// `ptr` is a task header with the provenance of its allocation, whose refcount just reached zero,
+/// with scheduler `scheduler` (the one in the allocation). A pointer, not a reference: the task may
+/// be freed by its lane while this runs, which a reference argument must not see.
+#[inline]
+unsafe fn unregister_before_free<S: Schedule>(ptr: NonNull<Header>, scheduler: *const S) -> bool {
+    // SAFETY: the caller's contract.
+    if !unsafe { ptr.as_ref() }.registry.is_linked() {
+        return true;
+    }
+    // SAFETY: as above.
+    unsafe { unregister_before_free_slow(ptr, scheduler) }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn unregister_before_free_slow<S: Schedule>(
+    ptr: NonNull<Header>,
+    scheduler: *const S,
+) -> bool {
+    // An owned handle: once the task is handed to the lane it may be freed at once, and the
+    // scheduler inside it with it.
+    // SAFETY: the caller's contract: the allocation is ours, so the scheduler is alive.
+    let scheduler = unsafe { &*scheduler }.clone();
+    let Some(registration) = scheduler.registration() else {
+        return true;
+    };
+    // SAFETY: the caller's contract: the last reference is ours.
+    match unsafe { registration.registry.before_free(ptr, registration.on_lane) } {
+        BeforeFree::Proceed => true,
+        BeforeFree::Deferred => {
+            scheduler.zombie_pushed();
+            false
+        }
+    }
 }
 
 /// A run-queue entry: owns one reference to a task in the SCHEDULED state.
@@ -128,6 +210,11 @@ impl Notified {
     /// The task's header.
     pub fn header(&self) -> &Header {
         self.0.header()
+    }
+
+    /// The task's pointer, with the provenance of its allocation: what the registry links.
+    pub(crate) fn ptr(&self) -> NonNull<Header> {
+        self.0.as_ptr()
     }
 
     /// A new counted reference to the task, independent of this queue entry.
@@ -178,4 +265,15 @@ impl fmt::Debug for Notified {
             .field("state", header.state())
             .finish()
     }
+}
+
+/// Frees a task the registry handed back after it was freed off its lane (the last reference
+/// went on another thread): the lane, which owns the registry's list, calls it once the task is
+/// unlinked.
+///
+/// # Safety
+/// `ptr` came from [`crate::registry::TaskRegistry::take_zombies`], whose refcount is zero.
+pub(crate) unsafe fn free_zombie(ptr: NonNull<Header>) {
+    // SAFETY: the caller's contract; the task is unlinked now, so `dealloc` frees it.
+    unsafe { RawTask::from_raw(ptr).dealloc() }
 }

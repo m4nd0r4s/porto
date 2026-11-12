@@ -3,7 +3,7 @@
 use std::fmt;
 use std::future::Future;
 use std::mem;
-use std::panic;
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,9 +44,19 @@ pub struct Builder {
     driver: Option<Arc<dyn Driver>>,
     coop_budget: Option<u32>,
     blocking: BlockingConfig,
+    introspection: bool,
 }
 
 impl Builder {
+    /// Turns the introspection switch on: tasks record their timing (first poll, time spent in
+    /// polls, start of the current step), which costs clock reads on every step, so it is off by
+    /// default (`11-task-model-and-trap-protocol.md` §2, `23-observability.md`). The registry
+    /// itself and its snapshots work either way.
+    pub fn introspection(mut self, on: bool) -> Self {
+        self.introspection = on;
+        self
+    }
+
     /// Calls `hook` around every park of the lane thread.
     pub fn park_hook(mut self, hook: impl ParkHook) -> Self {
         self.park_hook = Some(Box::new(hook));
@@ -146,6 +156,7 @@ impl Builder {
             self.driver,
             1,
             self.blocking,
+            self.introspection,
         );
         Runtime {
             lane: Lane::new(
@@ -168,6 +179,7 @@ impl fmt::Debug for Builder {
             .field("coop_budget", &self.coop_budget)
             .field("blocking_threads", &self.blocking.max_threads)
             .field("blocking_keepalive", &self.blocking.keepalive)
+            .field("introspection", &self.introspection)
             .finish()
     }
 }
@@ -210,6 +222,8 @@ impl Runtime {
         F::Output: Send + 'static,
     {
         let (task, join) = new_joinable_task(future, self.lane.handle.clone());
+        // This thread owns the runtime, so it is the lane's for the registry's purposes.
+        self.lane.register(&task);
         self.lane.local.borrow_mut().push_back(task);
         join
     }
@@ -299,6 +313,19 @@ impl Drop for Runtime {
         if !waited.get() {
             shared.blocking.shutdown();
         }
+        // The registry's lane ends here: tasks freed off the lane while linked are freed now,
+        // and from now on every operation on its list takes its lock, from any thread, since
+        // wakers may complete and drop tasks on other threads for as long as they live.
+        let registry = &shared.lanes[self.lane.index()].registry;
+        let mut panicked = None;
+        // SAFETY: we own the runtime: no thread runs its lane, and none will.
+        for task in unsafe { registry.close() } {
+            // SAFETY: from `close`: unlinked, refcount zero.
+            let freed = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+                crate::task::free_zombie(task);
+            }));
+            panicked = panicked.or(freed.err());
+        }
         // Dropping a queue entry cancels its task and drops its future, whose destructor may
         // wake other tasks; with the injector closed (and no lane entered), those wakes cancel
         // their task instead of queueing it. Deferred work still runs here, on the thread
@@ -312,19 +339,31 @@ impl Drop for Runtime {
         if let Some(driver) = &shared.driver {
             driver.shutdown();
         }
-        let mut panicked = None;
         loop {
             let local = mem::take(&mut *self.lane.local.borrow_mut());
             let had_timers = shared.timers.drop_all();
             let deferred = shared.lanes[self.lane.index()].deferred.take_all();
-            if local.is_empty() && remote.is_empty() && !had_timers && deferred.is_empty() {
-                break;
-            }
+            let quiet = local.is_empty() && remote.is_empty() && !had_timers && deferred.is_empty();
             drop(local);
             drop(remote);
             let failed = run_each(deferred);
             panicked = panicked.or(failed);
+            // Whatever is left alive is kept by wakers alone (a task waiting on a primitive that
+            // holds its waker, which the task holds): a cycle nothing else ever ends. Every task
+            // is on the registry, so cancel them all: their futures are dropped and their wakers
+            // with them, which frees what the cycle held.
+            let cancelled = panic::catch_unwind(AssertUnwindSafe(|| registry.cancel_all()));
+            let cancelled = match cancelled {
+                Ok(cancelled) => cancelled,
+                Err(payload) => {
+                    panicked = panicked.or(Some(payload));
+                    true
+                }
+            };
             remote = shared.inject.close();
+            if quiet && !cancelled {
+                break;
+            }
         }
         let failed = run_each(shared.lanes[self.lane.index()].deferred.close());
         panicked = panicked.or(failed);

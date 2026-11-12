@@ -213,12 +213,14 @@ fn dropping_the_runtime_frees_queued_and_parked_tasks() {
     let guard = DropCounter(drops.clone());
     rt.spawn(async move { drop(guard) });
     drop(rt);
+    // Both are freed with the runtime: the queued one with its queue, the parked one by the
+    // registry, which cancels every task a runtime leaves behind.
     assert_eq!(
         drops.load(Ordering::SeqCst),
-        1,
-        "the queued task is freed with the runtime"
+        2,
+        "the queued task and the parked one are freed with the runtime"
     );
-    // Waking the parked task after shutdown frees it instead of queueing it forever.
+    // Waking the parked task after shutdown does nothing: it is complete.
     parked.lock().unwrap().take().unwrap().wake();
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 }
@@ -293,7 +295,7 @@ fn a_task_spawned_from_another_thread_is_joined_on_the_lane() {
 }
 
 #[test]
-fn shutdown_cancels_queued_and_later_woken_tasks_for_their_joiners() {
+fn shutdown_cancels_queued_and_parked_tasks_for_their_joiners() {
     let parked: Arc<Mutex<Option<Waker>>> = Arc::default();
     let rt = Runtime::new();
     let parked_in_task = parked.clone();
@@ -313,8 +315,9 @@ fn shutdown_cancels_queued_and_later_woken_tasks_for_their_joiners() {
         queued.is_err_and(|e| e.is_cancelled()),
         "dropped with the runtime"
     );
-    assert!(!parked_join.is_finished());
-    // A wake after shutdown cancels the task instead of queueing it forever.
+    // The registry cancelled the parked task with the runtime: a wake after shutdown finds it
+    // complete.
+    assert!(parked_join.is_finished());
     parked.lock().unwrap().take().unwrap().wake();
     assert!(cancelled(parked_join));
 }

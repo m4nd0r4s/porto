@@ -111,8 +111,9 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 ## 11. Shutdown of the scheduler
 1. `Shared.shutdown = true`.
 2. Lanes finish the current task, then drain: they cancel all remaining tasks by dropping them (Rust tasks) or by throwing `Cancelled` and running to completion with a 2 s budget (Python tasks; see §26 for the full sequence).
-3. Lanes join.
-4. Driver closed.
+3. The task registry (23 §1) closes, then cancels every task still linked in it, until none is left: this is what ends tasks kept alive only by wakers.
+4. Lanes join.
+5. Driver closed.
 
 ## 12. Required tests
 - loom: wake/steal/inbox races (3 lanes, 3 tasks).

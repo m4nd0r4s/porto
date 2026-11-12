@@ -35,6 +35,7 @@ fn handle(clock: &HandClock) -> Handle {
         None,
         1,
         crate::blocking::BlockingConfig::default(),
+        false,
     )
 }
 
