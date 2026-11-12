@@ -246,6 +246,13 @@ impl Handle {
         context::current_handle()
     }
 
+    /// The runtime's I/O driver, if it has one: what sources are registered with
+    /// ([`porto_io::Registration::new`]) so the lane waits for their readiness
+    /// (`13-io-driver.md` §4).
+    pub fn driver(&self) -> Option<&Arc<dyn Driver>> {
+        self.shared.driver.as_ref()
+    }
+
     pub(crate) fn same_runtime(&self, other: &Handle) -> bool {
         Arc::ptr_eq(&self.shared, &other.shared)
     }

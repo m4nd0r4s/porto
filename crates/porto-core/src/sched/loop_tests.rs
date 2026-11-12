@@ -430,6 +430,22 @@ fn an_idle_lane_parks_in_the_driver_and_a_remote_spawn_wakes_it() {
 }
 
 #[test]
+fn a_handle_reaches_its_runtimes_driver() {
+    let driver = CountingDriver::new();
+    let rt = Runtime::builder().driver(driver.clone()).build();
+    let reached = rt.handle().driver().expect("built with a driver");
+    let expected: Arc<dyn Driver> = driver;
+    assert!(
+        Arc::ptr_eq(reached, &expected),
+        "the handle reaches the same driver"
+    );
+    assert!(
+        Runtime::new().handle().driver().is_none(),
+        "a runtime without a driver"
+    );
+}
+
+#[test]
 fn a_lane_parked_in_the_driver_sleeps_until_its_timer() {
     let driver = CountingDriver::new();
     let rt = Runtime::builder().driver(driver.clone()).build();
