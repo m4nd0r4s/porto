@@ -9,14 +9,19 @@
 //! waker with its innermost scope ([`ScopeNode::register_waiter`]), and a cancel wakes the ones
 //! in the subtree it reaches (C10). A task spawned into a scope holds a
 //! [`TaskScope`], through which the scope hears how the task ended ([`TaskEnd`]), exactly once.
+//! A scope with a deadline links the wheel entry it embeds, which cancels it with
+//! [`CancelReason::Deadline`] once the deadline passed ([`ScopeNode::set_deadline`], C9).
 //!
 //! The loom models run with `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release scope`.
 
 mod check;
 mod child;
+mod deadline;
 mod node;
 mod sync;
 
+#[cfg(all(test, not(loom)))]
+mod deadline_tests;
 #[cfg(all(test, not(loom)))]
 mod tests;
 

@@ -11,6 +11,9 @@ use std::task::Waker;
 
 use super::child::{ChildVTableRef, child_vtable};
 use super::sync::{Arc, AtomicU8, AtomicU64, CANCEL_GENERATION, Mutex, MutexGuard, UnsafeCell};
+use crate::sched::Handle;
+use crate::time::Deadline;
+use crate::time::wheel::TimerEntry;
 
 /// Why a scope was cancelled. The first reason wins: cancelling a cancelled scope does nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -83,6 +86,11 @@ pub struct ScopeNode<E> {
     /// This scope's links in the parent's `child_scopes`, guarded by the parent's `state` lock.
     siblings: UnsafeCell<Links<E>>,
     state: Mutex<ScopeState<E>>,
+    /// The wheel entry that cancels the scope at its deadline (`super::deadline`): linked in
+    /// the wheel of [`ScopeState::deadline_on`]'s runtime or in none, and only armed or
+    /// disarmed under `state`'s lock. While linked, its waker holds a reference to this node,
+    /// so the node outlives the link.
+    pub(super) deadline_timer: TimerEntry,
     /// Neighbours write `siblings` through shared references while this node's `Drop` holds
     /// `&mut self` (it waits for the parent's lock before unlinking). `!Unpin` keeps that
     /// `&mut` from asserting unique access, as for tokio's intrusive waiters.
@@ -107,6 +115,11 @@ pub struct ScopeState<E> {
     /// The scope's block exited ([`ScopeNode::close`]): no task can be spawned into it any more
     /// (C7, [`super::TaskScope::try_attach`]).
     pub closed: bool,
+    /// When the scope cancels itself with [`CancelReason::Deadline`] (C9);
+    /// [`Deadline::NEVER`] for none. See [`ScopeNode::set_deadline`].
+    pub(super) deadline: Deadline,
+    /// The runtime whose wheel links `deadline_timer`, `None` while it is linked nowhere.
+    pub(super) deadline_on: Option<Handle>,
     /// Nested scopes, for propagating a cancel down the tree.
     child_scopes: ChildList<E>,
     /// The tasks whose innermost scope this is and that wait in a cancellable wait, by task
@@ -229,6 +242,7 @@ impl<E: Send + 'static> ScopeNode<E> {
             status: AtomicU8::new(if shield { SHIELD } else { 0 }),
             cancel_epoch: AtomicU64::new(0),
             walk_cache: AtomicU64::new(NO_WALK),
+            deadline_timer: TimerEntry::new(),
             siblings: UnsafeCell::new(Links {
                 prev: ptr::null(),
                 next: ptr::null(),
@@ -239,6 +253,8 @@ impl<E: Send + 'static> ScopeNode<E> {
                 cancel_absorbed: false,
                 exit_waiter: None,
                 closed: false,
+                deadline: Deadline::NEVER,
+                deadline_on: None,
                 child_scopes: ChildList { head: ptr::null() },
                 waiters: None,
             }),
@@ -288,13 +304,18 @@ impl<E> ScopeNode<E> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Closes the scope (C7): from now on no task can be spawned into it. Returns the failures
-    /// it recorded, which the caller drops (or raises) after the lock is released. Closing again
-    /// returns nothing more.
+    /// Closes the scope (C7): from now on no task can be spawned into it, and its deadline no
+    /// longer cancels it (its timer is disarmed). Returns the failures it recorded, which the
+    /// caller drops (or raises) after the lock is released. Closing again returns nothing more.
     pub fn close(&self) -> Vec<E> {
         let mut state = self.lock_state();
         state.closed = true;
-        std::mem::take(&mut state.errors)
+        let timer = self.disarm_deadline(&mut state);
+        let errors = std::mem::take(&mut state.errors);
+        drop(state);
+        // The timer's waker holds a reference to this node: dropped after the lock.
+        drop(timer);
+        errors
     }
 
     /// Cancels the scope. Returns `false`, and changes nothing, if it was already cancelled.

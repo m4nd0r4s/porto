@@ -34,8 +34,10 @@ pub(crate) enum Armed {
 pub(crate) struct Timers {
     shard: Mutex<Shard>,
     /// Linked entries, read without the lock to skip it when there are none. Written under
-    /// the lock. Only the lane links new entries (`Sleep::poll`), so the lane never reads it
-    /// as zero while one is linked.
+    /// the lock. The lane links new entries (`Sleep::poll`), so it never reads it as zero
+    /// while one it linked is; another thread that links one (a scope deadline set there,
+    /// `ScopeNode::set_deadline`) notifies the lanes after, and the notify orders the write
+    /// before the lane's next look.
     armed: AtomicUsize,
 }
 
