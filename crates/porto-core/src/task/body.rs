@@ -399,16 +399,20 @@ unsafe fn dealloc<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
     // the unwind (a second panic there would abort).
     // SAFETY: we hold the last reference.
     let scope = unsafe { cell.header.take_scope() };
-    let dropped = panic::catch_unwind(AssertUnwindSafe(|| {
+    // Two guards: a panic in `release` must not leave the body undropped (it would leak what it
+    // owns), so the drop runs whatever `release` did. The first panic goes on.
+    let released = panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the last reference is ours, so nothing else reaches the body, and the body
         // never moves.
-        let mut body = unsafe { Pin::new_unchecked(&mut **cell.body.get()) };
-        body.as_mut().release(cell.scheduler.handle());
+        let body = unsafe { Pin::new_unchecked(&mut **cell.body.get()) };
+        body.release(cell.scheduler.handle());
+    }));
+    let dropped = panic::catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: dropped once, here: the field is `ManuallyDrop`, so the cell does not.
         unsafe { ManuallyDrop::drop(&mut *cell.body.get()) };
     }));
     drop(cell);
-    let Err(payload) = dropped else {
+    let Some(payload) = released.err().or(dropped.err()) else {
         drop(scope);
         return;
     };

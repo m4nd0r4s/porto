@@ -631,6 +631,9 @@ impl TaskBody for PyTask {
                 slot: this.slot.take().map(PyObj::into_unchecked),
                 handle,
                 pending,
+                // The scope the task is in (the innermost it entered): a scope node holds the
+                // exceptions its children raised, and the last reference to it frees them.
+                scope: this.cancel_scope.take(),
             },
         );
     }
@@ -644,6 +647,7 @@ struct LaneOwned {
     slot: Option<Py<PyAny>>,
     handle: Option<Py<Task>>,
     pending: Pending,
+    scope: Option<PyScopeRef>,
 }
 
 impl Drop for PyTask {
