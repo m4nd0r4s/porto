@@ -8,6 +8,7 @@ readiness and attempts the operation again. Registering raw sockets needs the AF
 Windows, which is not written yet, so these tests run on Unix.
 """
 
+import errno
 import os
 import socket
 import sys
@@ -465,7 +466,10 @@ def test_wait_readable_and_wait_writable() -> None:
     run(main())
 
 
-def test_closing_a_handle_fails_its_pending_read_with_ebadf() -> None:
+def test_closing_a_handle_fails_its_pending_read_with_closed_resource_error() -> None:
+    """A task waiting to read while another closes the handle gets ``ClosedResourceError``: a
+    ``PortoError`` and an ``OSError`` with errno ``EBADF`` and the Rust message (13 §4)."""
+
     async def main() -> None:
         left, right = socketpair()
         with left, right:
@@ -477,12 +481,22 @@ def test_closing_a_handle_fails_its_pending_read_with_ebadf() -> None:
 
             async with porto.scope() as s:
                 s.spawn(close_later())
-                with pytest.raises(OSError, match="was closed") as caught:
+                with pytest.raises(porto.ClosedResourceError, match="was closed") as caught:
                     await handle.read(8)
-            assert caught.value.errno == 9
+            assert isinstance(caught.value, porto.PortoError)
+            assert isinstance(caught.value, OSError)
+            assert caught.value.errno == errno.EBADF
+            assert "stop using a resource once it is closed" in str(caught.value)
             assert handle.closed
-            with pytest.raises(OSError, match="was closed"):
-                handle.read(8)
+            # Every later operation fails the same way, at the call.
+            for call in (
+                lambda: handle.read(8),
+                lambda: handle.write(b"x"),
+                lambda: handle.wait_readable(),
+            ):
+                with pytest.raises(porto.ClosedResourceError) as later:
+                    await call()
+                assert later.value.errno == errno.EBADF
             handle.close()
 
     run(main())
@@ -572,5 +586,5 @@ def test_a_handle_used_outside_any_run_is_refused() -> None:
             return _core._IoHandle(right.fileno())
 
         handle = run(open_handle())
-        with pytest.raises(RuntimeError, match="inside porto.run"):
+        with pytest.raises(RuntimeError, match=r"inside porto\.run"):
             handle.read(8)

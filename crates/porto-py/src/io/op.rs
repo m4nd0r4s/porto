@@ -30,6 +30,7 @@ use crate::driver::pytask::Resume;
 use crate::driver::ready::ready;
 use crate::driver::trap::{self, Trap, TrapKind};
 use crate::driver::{lane, step};
+use crate::errors::ClosedResourceError;
 
 /// A registered socket that operations run on.
 pub(crate) type IoRegistration = Registration<Socket>;
@@ -208,12 +209,13 @@ impl Completed {
     }
 }
 
-/// `error` as a Python exception: an `OSError` with its errno (so Python picks the subclass,
-/// `ConnectionResetError` and so on), a `MemoryError` for a receive buffer that could not be
-/// allocated.
+/// `error` as a Python exception: `porto.ClosedResourceError` (an `OSError` with errno `EBADF`)
+/// for a closed or released registration, an `OSError` with its errno otherwise (so Python
+/// picks the subclass, `ConnectionResetError` and so on), a `MemoryError` for a receive buffer
+/// that could not be allocated.
 pub(crate) fn os_error(error: &io::Error) -> PyErr {
     if let Some(closed) = ClosedResource::of(error) {
-        return PyOSError::new_err((ClosedResource::ERRNO, format!("porto: {closed}")));
+        return ClosedResourceError::new_err((ClosedResource::ERRNO, format!("porto: {closed}")));
     }
     if error.kind() == io::ErrorKind::OutOfMemory {
         return PyMemoryError::new_err(
