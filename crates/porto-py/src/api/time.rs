@@ -212,7 +212,7 @@ fn sleep_trap(delay: f64) -> PyResult<Trap> {
 /// The deadline for `seconds` on the runtime clock (not NaN), at `now` if that has passed.
 /// Rounded up to the nanosecond, so `current_time()` at or after it never reads below
 /// `seconds`: never early on the clock the caller measured with.
-fn deadline_at(now: Deadline, seconds: f64) -> Deadline {
+pub(crate) fn deadline_at(now: Deadline, seconds: f64) -> Deadline {
     if seconds <= now.as_secs_f64() {
         return now;
     }

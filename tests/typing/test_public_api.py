@@ -38,6 +38,19 @@ async def main(hosts: list[str]) -> list[bytes]:
     return [task.result() for task in from_function]
 
 
+async def with_deadlines() -> bool:
+    async with porto.timeout(1.5) as limited:
+        assert_type(limited, porto.Scope)
+        limited.deadline = porto.current_time() + 2
+        assert_type(limited.deadline, float)
+    async with porto.move_on_after(1) as quiet:
+        await porto.sleep_forever()
+    async with porto.scope(timeout=1, deadline=5.0, raise_on_timeout=False) as both:
+        pass
+    porto.timeout("1")  # pyright: ignore[reportArgumentType]
+    return limited.timed_out or quiet.timed_out or both.timed_out
+
+
 def check_run_infers_the_result_type() -> None:
     assert_type(porto.run(main, ["a"]), list[bytes])
     assert_type(porto.run(main(["a"])), list[bytes])

@@ -6,6 +6,7 @@ pub(crate) mod channel_op;
 pub(crate) mod config;
 pub(crate) mod run;
 pub(crate) mod scope;
+mod scope_deadline;
 mod scope_exit;
 pub(crate) mod sync;
 pub(crate) mod task;

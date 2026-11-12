@@ -17,12 +17,20 @@
 //! this scope's cancel counts as absorbed too (Trio's rule: a `Cancelled` counts for the scope
 //! whose cancel raised it), so `cancelled_caught` is true when only the children were reached.
 //!
-//! Not yet: deadlines and timeouts (C9), shields (C8), names, `start()` (§3), `Task.cancel()` and
-//! awaiting a task (§4), and spawning from other lanes or threads (C10).
+//! A scope can have a deadline (`porto.scope(timeout=, deadline=)`, `porto.timeout()`,
+//! `porto.move_on_after()`, the read/write `Scope.deadline`; `scope_deadline`): once it passed,
+//! the scope is cancelled as `scope.cancel()` would, with the reason `Deadline` (C9). The exit
+//! absorbs the `Cancelled` it caused like any other, but with `raise_on_timeout=True` (the
+//! default, and `porto.timeout()`) it raises the builtin `TimeoutError` instead (C3), and
+//! `timed_out` turns true either way.
+//!
+//! Not yet: shields (C8), names, `start()` (§3), `Task.cancel()` and awaiting a task (§4), and
+//! spawning from other lanes or threads (C10).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use porto_core::Handle;
 use porto_core::scope::{CancelReason, ScopeNode};
 use porto_core::sync::SetOnce;
 use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError, PyTypeError};
@@ -32,6 +40,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
 
 use super::run::{closing_on_error, coroutine_from};
+use super::scope_deadline::{self, ScopeDeadline, seconds};
 use super::scope_exit;
 use super::scope_exit::ScopeExit;
 use super::task::Task;
@@ -50,19 +59,44 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // Right after `add_class`, before anything can see the type (see `async_slots`).
     async_slots::install_iter_slots::<ScopeExit>(module.py(), scope_exit::scope_exit_iternext)?;
     freelist::install::<ScopeExit>(module.py(), &exit_freelist::SLOTS)?;
-    module.add_function(wrap_pyfunction!(scope, module)?)
+    module.add_function(wrap_pyfunction!(scope, module)?)?;
+    module.add_function(wrap_pyfunction!(timeout, module)?)?;
+    module.add_function(wrap_pyfunction!(move_on_after, module)?)
 }
 
 freelist::gil_freelist!(exit_freelist, 64);
 
-/// `porto.scope()`: a new scope, to enter with `async with`.
+/// `porto.scope(*, timeout=None, deadline=None, raise_on_timeout=True)`: a new scope, to
+/// enter with `async with`. `timeout` counts seconds from the entry, `deadline` is a time on
+/// the runtime clock; with both, the earlier wins.
 #[pyfunction]
-fn scope() -> Scope {
-    Scope {
-        node: SetOnce::new(),
-        flags: AtomicU8::new(0),
-        cancel_reason: OnceLock::new(),
-    }
+#[pyo3(signature = (*, timeout=None, deadline=None, raise_on_timeout=true))]
+fn scope(timeout: Option<f64>, deadline: Option<f64>, raise_on_timeout: bool) -> PyResult<Scope> {
+    let timeout = timeout
+        .map(|value| seconds("porto.scope()", "timeout", value))
+        .transpose()?;
+    let deadline = deadline
+        .map(|value| seconds("porto.scope()", "deadline", value))
+        .transpose()?;
+    Ok(Scope::new(timeout, deadline, raise_on_timeout))
+}
+
+/// `porto.timeout(seconds)`: a scope whose block raises `TimeoutError` if it is still running
+/// `seconds` after it was entered.
+#[pyfunction]
+#[pyo3(signature = (seconds, /))]
+fn timeout(seconds: f64) -> PyResult<Scope> {
+    let seconds = scope_deadline::seconds("porto.timeout()", "seconds", seconds)?;
+    Ok(Scope::new(Some(seconds), None, true))
+}
+
+/// `porto.move_on_after(seconds)`: a scope whose block is cancelled `seconds` after it was
+/// entered, and which then goes on quietly (`timed_out` tells).
+#[pyfunction]
+#[pyo3(signature = (seconds, /))]
+fn move_on_after(seconds: f64) -> PyResult<Scope> {
+    let seconds = scope_deadline::seconds("porto.move_on_after()", "seconds", seconds)?;
+    Ok(Scope::new(Some(seconds), None, false))
 }
 
 /// A nursery: every task spawned into it finishes before its `async with` block exits.
@@ -76,6 +110,10 @@ pub struct Scope {
     flags: AtomicU8,
     /// The reason the first `cancel()` gave, if any, for the repr.
     cancel_reason: OnceLock<String>,
+    /// The deadline given, armed on the node once the block is entered (C9).
+    deadline: ScopeDeadline,
+    /// Whether the exit raises `TimeoutError` when the deadline cut the block short (C3).
+    raise_on_timeout: bool,
 }
 
 /// The bits of `Scope::flags`.
@@ -90,6 +128,10 @@ impl ScopeFlags {
     const CANCEL_REQUESTED: u8 = 4;
     /// The exit absorbed a `Cancelled` this scope caused (C3).
     const CANCELLED_CAUGHT: u8 = 8;
+    /// ... and the scope's own deadline caused it.
+    const TIMED_OUT: u8 = 16;
+    /// The runtime's root scope, which has no deadline.
+    const ROOT: u8 = 32;
 }
 
 /// Where a scope is in its life.
@@ -169,6 +211,9 @@ impl Scope {
         if flags & ScopeFlags::CANCEL_REQUESTED != 0 {
             // Cancelled before it was entered.
             node.cancel(CancelReason::Explicit);
+        }
+        if let Some(handle) = Handle::try_current() {
+            this.deadline.enter(&node, &handle);
         }
         Ok(entered)
     }
@@ -269,6 +314,33 @@ impl Scope {
         self.has(ScopeFlags::CANCELLED_CAUGHT)
     }
 
+    /// Whether the scope's deadline cut its block short: the exit absorbed a `Cancelled` the
+    /// deadline caused (C3). It raised `TimeoutError` then, unless `raise_on_timeout=False`.
+    #[getter]
+    fn timed_out(&self) -> bool {
+        self.has(ScopeFlags::TIMED_OUT)
+    }
+
+    /// When the scope is cancelled by its deadline, in seconds on the runtime clock
+    /// (`porto.current_time()`); `inf` for none. A `timeout=` counts from the entry: until then
+    /// this reads the `deadline=` given, or `inf`.
+    #[getter(deadline)]
+    fn get_deadline(&self) -> f64 {
+        self.deadline.get(self.node.get())
+    }
+
+    /// Moves the deadline (C9): the timer re-arms, and a time already passed cancels the scope
+    /// now. A scope already cancelled stays cancelled, whatever its new deadline.
+    #[setter(deadline)]
+    fn set_deadline(&self, value: f64) -> PyResult<()> {
+        let value = seconds("Scope.deadline", "deadline", value)?;
+        if self.has(ScopeFlags::ROOT) {
+            return Err(scope_deadline::root_has_no_deadline());
+        }
+        self.deadline.set(self.node.get_arc().as_ref(), value);
+        Ok(())
+    }
+
     /// How many tasks are filed with the scope as waiting in a cancellable wait (C10): 0 before
     /// it is entered. For tests: every way a wait ends takes its task out (porto-szb.114).
     fn _waiter_count(&self) -> usize {
@@ -313,10 +385,22 @@ impl Scope {
     /// The `Scope` of a runtime's root scope, `node` (C12): open from the start, entered by no
     /// task. `porto.run` closes it once its children are done.
     pub(crate) fn root(node: PyScopeRef) -> Self {
-        let scope = scope();
+        let scope = Self::new(None, None, false);
         let _unset = scope.node.set(node);
-        scope.flags.store(ScopeFlags::ENTERED, Ordering::Release);
         scope
+            .flags
+            .store(ScopeFlags::ENTERED | ScopeFlags::ROOT, Ordering::Release);
+        scope
+    }
+
+    fn new(timeout: Option<f64>, deadline: Option<f64>, raise_on_timeout: bool) -> Self {
+        Self {
+            node: SetOnce::new(),
+            flags: AtomicU8::new(0),
+            cancel_reason: OnceLock::new(),
+            deadline: ScopeDeadline::new(timeout, deadline),
+            raise_on_timeout,
+        }
     }
 
     /// [`Scope::spawn`], without closing a rejected coroutine.
@@ -404,19 +488,29 @@ impl Scope {
     /// Closes the scope and raises the children's failures, after `exc` unless the scope
     /// absorbs it. Returns whether it absorbs `exc`: a `Cancelled` while this scope itself is
     /// cancelled (C3; one from an enclosing scope's cancellation goes on). `cancelled_caught`
-    /// turns true then, or when a child ended by this scope's cancel was dropped here.
+    /// turns true then, or when a child ended by this scope's cancel was dropped here; if the
+    /// scope's deadline was the cancel, `timed_out` does too, and with `raise_on_timeout` the
+    /// exit raises `TimeoutError` (unless children failed: their group goes on instead).
     pub(super) fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         let py = exc.py();
         let node = self.node.get();
-        let absorbed = !exc.is_none()
-            && exc.is_instance_of::<Cancelled>()
-            && node.is_some_and(|node| node.cancel_called().is_some());
-        if absorbed || node.is_some_and(|node| node.lock_state().cancel_absorbed) {
-            self.flags
-                .fetch_or(ScopeFlags::CANCELLED_CAUGHT, Ordering::AcqRel);
+        let reason = node.and_then(|node| node.cancel_called());
+        let absorbed = !exc.is_none() && exc.is_instance_of::<Cancelled>() && reason.is_some();
+        let caught = absorbed || node.is_some_and(|node| node.lock_state().cancel_absorbed);
+        let timed_out = caught && reason == Some(CancelReason::Deadline);
+        if caught {
+            let flags = if timed_out {
+                ScopeFlags::CANCELLED_CAUGHT | ScopeFlags::TIMED_OUT
+            } else {
+                ScopeFlags::CANCELLED_CAUGHT
+            };
+            self.flags.fetch_or(flags, Ordering::AcqRel);
         }
         let errors = self.close();
         if errors.is_empty() {
+            if timed_out && self.raise_on_timeout {
+                return Err(scope_deadline::timeout_error(py, exc)?);
+            }
             return Ok(absorbed);
         }
         let exceptions = PyList::empty(py);

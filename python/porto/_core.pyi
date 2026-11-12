@@ -105,8 +105,29 @@ def checkpoint() -> Awaitable[None]:
 
 # Structured concurrency
 
-def scope() -> Scope:
-    """A new scope; enter it with ``async with porto.scope() as s:``."""
+def scope(
+    *,
+    timeout: float | None = None,
+    deadline: float | None = None,
+    raise_on_timeout: bool = True,
+) -> Scope:
+    """A new scope; enter it with ``async with porto.scope() as s:``.
+
+    ``timeout`` (seconds, counted from the entry) and ``deadline`` (a time on the runtime clock,
+    ``porto.current_time()``) give it a deadline, the earlier of the two if both are given: once
+    it passed, the scope is cancelled. Its exit then raises the builtin ``TimeoutError`` if the
+    cancel cut the block short, or goes on quietly with ``raise_on_timeout=False``
+    (``timed_out`` tells). 0 or less expires at once; ``inf`` never does; NaN raises
+    ``ValueError``."""
+
+def timeout(seconds: float, /) -> Scope:
+    """``porto.scope(timeout=seconds)``: the block raises ``TimeoutError`` if it is still running
+    ``seconds`` after it was entered."""
+
+def move_on_after(seconds: float, /) -> Scope:
+    """``porto.scope(timeout=seconds, raise_on_timeout=False)``: the block is cancelled
+    ``seconds`` after it was entered and the program goes on after it; ``timed_out`` tells
+    whether it was cut short."""
 
 @final
 class Scope:
@@ -150,6 +171,24 @@ class Scope:
     @property
     def cancel_called(self) -> bool:
         """Whether the scope was cancelled: ``cancel()`` was called, or a child failed."""
+
+    @property
+    def deadline(self) -> float:
+        """When the scope is cancelled by its deadline, in seconds on the runtime clock
+        (``porto.current_time()``); ``inf`` for none. A ``timeout=`` counts from the entry: until
+        then this reads the ``deadline=`` given, or ``inf``.
+
+        Setting it moves the deadline and re-arms the timer (from any thread); a time already
+        passed cancels the scope now, ``inf`` removes the deadline. A scope already cancelled
+        stays cancelled. The root scope has no deadline: setting it raises ``RuntimeError``."""
+
+    @deadline.setter
+    def deadline(self, value: float) -> None: ...
+    @property
+    def timed_out(self) -> bool:
+        """Whether the scope's deadline cut its block short: the exit absorbed a
+        ``porto.Cancelled`` the deadline caused. The exit raised ``TimeoutError`` then, unless
+        the scope was made with ``raise_on_timeout=False`` (``porto.move_on_after``)."""
 
     @property
     def cancelled_caught(self) -> bool:
