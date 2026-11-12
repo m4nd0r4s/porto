@@ -55,7 +55,7 @@ The channel closes when all senders are closed or dropped (receivers see the end
 - Rust-side channels (`porto::sync::mpsc`) are generic over `T: Send`. The Python channel is `T = PyObj`.
 
 ### 2.5 Oneshot, watch and broadcast
-The three constructors that are not queues return pairs of their own classes (`OneshotSender[T]`/`OneshotReceiver[T]`, and below `WatchSender`/`WatchReceiver`, `BroadcastSender`/`BroadcastReceiver`), because their methods differ from the queue's. What they share with `channel`: the errors (§2.3: `EndOfChannel` when the other side ended, `BrokenResourceError` when every receiver is gone, `ClosedResourceError` for a handle the program closed), `try_recv`/`blocking_recv`, `async for`, `close()` and `async with tx:`, dropping a handle closes it, and a never-awaited `recv()` warns and takes nothing. **None of them has a sender that waits, so `send` is a plain call, not awaited** (a type checker flags `await tx.send(v)`); `recv_many`, `capacity` and `try_send` are only on `channel`.
+The three constructors that are not queues return pairs of their own classes (`OneshotSender[T]`/`OneshotReceiver[T]`, and below `WatchSender`/`WatchReceiver`, `BroadcastSender`/`BroadcastReceiver`), because their methods differ from the queue's. What they share with `channel`: the errors (§2.3: `EndOfChannel` when the other side ended, `BrokenResourceError` when every receiver is gone, `ClosedResourceError` for a handle the program closed), `try_recv`/`blocking_recv`, `async for`, `close()` and `async with tx:`, dropping a handle closes it, and a never-awaited `recv()` warns and takes nothing. **None of them has a sender that waits, so `send` is a plain call, not awaited** (a type checker flags `await tx.send(v)`); `recv_many` and `try_send` are only on `channel`, and `capacity` on `channel` and `broadcast` (the ring's size, ≥ 1).
 
 **`oneshot[T]()`** (`sync::oneshot`): one value. `tx.send(v)` uses the sender up (a second `send` raises `ClosedResourceError`); it raises `BrokenResourceError` if the receiver is closed or dropped, and the value is dropped with it. `await rx.recv()` raises `EndOfChannel` if the sender was closed or dropped without sending, and also after the value was received (`async for` yields the one value, then ends). No clone. The value sits in a slot until a receive takes it, and a wake only says "look again", so a waiter cancelled after a wake loses nothing: the next receive finds the value (loom-tested). Several tasks may await one receiver: the value goes to one, the others see the end.
 
@@ -67,3 +67,48 @@ The three constructors that are not queues return pairs of their own classes (`O
 
 ## 3. Select (choice over several events)
 `porto.select(*branches)` is deliberately **not** provided in v1. Users write a scope with competing tasks plus `scope.cancel()`, or use `rx.recv_many`. Rationale: select-style cancellation of partially completed ops is the main source of lost-message bugs in Tokio. Revisit after v1 (`55`).
+
+## 4. Rule IDs for the traceability matrix
+The tests of this chapter carry the rule they check in their name, `test_<ID>_<what>` (52 §3), and `scripts/rule_matrix.py` greps those names against the IDs below: every ID needs at least one test (`rule_matrix.py --check 16`, run by CI). The IDs start with `SY` because `S1`–`S7` belong to the goals of `01`. The chapter has no numbered rules, so the IDs are given here; a change to a paragraph above changes its row.
+
+| ID | Rule |
+|---|---|
+| SY1 | `Lock`: `acquire`/`release`/`locked`/`try_acquire`/`async with`; not reentrant; the holder is not recorded, and only a release of an unlocked lock raises `RuntimeError` (§1). |
+| SY2 | `Mutex[T]`: `async with m as v:` gives a guard with `value` and `set`, unusable once the block exits (§1). |
+| SY3 | `RwLock`: readers share, a writer excludes; a reader never takes the lock while a writer waits; the rest are served in arrival order, consecutive readers together; a release of what no one holds raises `RuntimeError` (§1). |
+| SY4 | `Semaphore(n)`: `acquire(k)`/`release(k)`/`available`/`try_acquire(k)`; fair, so a large request blocks the smaller ones behind it; bounded: `release` of more than was acquired, or a count outside `1..=n`, raises `ValueError`, and `n` ≥ 1 (§1). |
+| SY5 | `CapacityLimiter`: the AnyIO surface; `total_tokens` is settable (raising grants waiters, lowering takes tokens back as they are released); a borrower holds at most one token, and releasing one it does not hold raises `RuntimeError` (§1). |
+| SY6 | `Event`: `set` releases every waiter now and later ones return at once; it is not clearable (§1). |
+| SY7 | `Notify`: `notify_one` stores one permit when nobody waits and otherwise wakes the longest waiter; `notify_all` wakes only the tasks waiting now (§1). |
+| SY8 | `Condition`: `wait` queues before it releases the lock and takes the lock again before it returns, also when cancelled; `wait_for(pred)` re-checks `pred` after each notification; `wait`/`notify`/`notify_all` without the lock raise `RuntimeError`; `lock` must be a `porto.Lock` (§1). |
+| SY9 | `Condition` notifications are not stored, go to the longest waiter first, and one whose task was cancelled before it observed it goes to the next waiter (§1). |
+| SY10 | A `Condition` wait that is closed (`GeneratorExit`) takes the lock back only if it is free; otherwise the holder keeps it (§1). |
+| SY11 | `Barrier(n)`: `wait` returns True for exactly one task per round, the last arrival; the barrier is reusable; a task cancelled while it waits leaves its round; `n` ≥ 1 (§1). |
+| SY12 | Waiters are served in arrival order (FIFO, fair) unless stated otherwise (§1). |
+| SY13 | A cancelled waiter is removed from the queue and the waiters behind it are served (§1). |
+| SY14 | A waiter cancelled after it was granted the lock or permit passes the grant on to the next waiter (§1). |
+| SY15 | `wait()`, `notified()`, `acquire()` and the like are lazy: one created and never awaited takes nothing and warns when freed (§1). |
+| SY16 | A grant is taken only in the step that resumes the coroutine with it: a wait that completes at once but finds the budget spent yields first, and a task closed or cancelled at any suspension point never holds a grant it did not observe (§1). |
+| SY17 | `async with` on a primitive awaits a lazy entry whose first resume takes a free lock without suspending (raising `Cancelled` first if the task is cancelled); an exception between the call and the await leaves it free (§1). |
+| SY18 | Awaiting a primitive or a channel operation that must wait outside a porto runtime raises `NoRuntimeError` (§1, 15 X4). |
+| SY19 | `blocking_*` methods work from non-runtime threads and raise `RuntimeError` on a lane thread (§1, §2.4). |
+| SY20 | A `blocking_*` wait does not check for signals: a `KeyboardInterrupt` that arrives meanwhile is raised once the wait is over (§1). |
+| SY21 | The primitives and channel handles are thread-safe: threads and tasks share them, and mutual exclusion and permit counts hold (§1). |
+| SY22 | `channel[T](capacity)` needs an int capacity ≥ 1 (a `TypeError` that names `unbounded_channel()` without one); every constructor and handle class can be subscripted at run time (§2, §2.3). |
+| SY23 | Sender API: `await send` waits when full, `try_send` raises `WouldBlock`, `clone`, `close`, `async with tx:`, `capacity`, `is_closed()`, `blocking_send`; blocked senders get room in arrival order (§2.1). |
+| SY24 | Receiver API: `await recv()`, `try_recv()`, `async for`, `clone`, `close`, `blocking_recv`, `recv_many(max)` (everything buffered up to `max`, waiting only when empty) (§2.2). |
+| SY25 | A channel closes when all senders are closed or dropped (receivers drain, then get `EndOfChannel`) or when all receivers are dropped (sends raise `BrokenResourceError`); dropping a handle closes it (§2.3). |
+| SY26 | Using a handle the program closed raises `ClosedResourceError`, not `EndOfChannel` or `BrokenResourceError`; full and empty `try_send`/`try_recv` raise `WouldBlock` (§2.3). |
+| SY27 | Closing a handle wakes the tasks and threads waiting through it with `ClosedResourceError`; waiters on other handles keep waiting; a woken waiter closed before it retried passes the wake on (§2.4). |
+| SY28 | A channel op that completes without waiting is a checkpoint: under a cancelled scope its first resume raises `Cancelled` before it sends or takes anything, also over a closed-channel error; a shield suspends this; a cancelled waiter loses no value (§2.4). |
+| SY29 | `send`, `recv`, `recv_many` and the like are lazy: one never awaited sends and takes nothing, and warns (§2.4, §2.5). |
+| SY30 | `oneshot`: one value; `send` uses the sender up (a second raises `ClosedResourceError`) and raises `BrokenResourceError` if the receiver is gone; `recv` raises `EndOfChannel` if the sender ended without sending and after the value was taken; no clone (§2.5). |
+| SY31 | `oneshot` several tasks may await one receiver: the value goes to one, the others see the end; a receive cancelled after a wake loses no value (§2.5). |
+| SY32 | `watch`: every send makes the next version; `changed()` completes once there is a newer one and marks it seen, sends coalesce, and the initial value is seen from the start; `borrow()` marks nothing and `borrow_and_update()` does; `has_changed`, `try_changed`, `async for` (§2.5). |
+| SY33 | `watch`: `clone` has seen what the original had and `subscribe()` the current version; the channel ends for receivers when every sender is closed (after an unseen change) while `borrow()` keeps the last value; a send with no receiver raises `BrokenResourceError` until `subscribe()`; `watch[bool]` is the clearable event (§2.5). |
+| SY34 | `broadcast`: every receiver gets every message in order; `clone` starts where the original is and `subscribe()` at the next message; `send` never waits and overwrites the oldest message when full (§2.5). |
+| SY35 | `broadcast`: a receiver more than `capacity` behind gets `Lagged(skipped=n)` with `n` exactly the number overwritten before it read them, then the oldest kept; messages received plus `skipped` add up to everything sent (§2.5). |
+| SY36 | `broadcast`: when every sender is closed a receiver drains the messages kept, then gets `EndOfChannel`; a send with no receiver raises `BrokenResourceError` until `subscribe()`; every receiver gets the same object (§2.5). |
+| SY37 | `oneshot`, `watch` and `broadcast`: `send` is a plain call, `recv_many` and `try_send` exist only on `channel` (`capacity` also on `broadcast`), and the handles share the errors, `try_recv`, `async for`, `close()` and `async with tx:` of `channel` (§2.5). |
+| SY38 | `watch` and `broadcast`: a cancelled waiter loses nothing: the version stays unseen and the receiver's position unmoved, and other receivers are undisturbed (§2.5). |
+| SY39 | `porto.select` is not provided in v1 (§3). |

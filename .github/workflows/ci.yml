@@ -50,6 +50,8 @@ jobs:
       - run: uv run python scripts/third_party_licenses.py --check
       # Every rule of the structured-concurrency spec (15) has a test named after it (52 §3).
       - run: uv run python scripts/rule_matrix.py --check 15
+      # Likewise for the sync primitives and channels (16, rules SY1-SY39).
+      - run: uv run python scripts/rule_matrix.py --check 16
 
   rust-test:
     name: rust-test (${{ matrix.os }})
