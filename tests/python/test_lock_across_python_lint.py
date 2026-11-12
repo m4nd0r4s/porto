@@ -72,6 +72,42 @@ def test_every_kind_of_guard_is_caught(tmp_path: Path, acquire: str) -> None:
     assert lint(source).returncode == 1
 
 
+def test_a_guard_bound_across_several_lines_is_caught(tmp_path: Path) -> None:
+    # rustfmt's shape for a long chain: the receiver, then `.lock()` on a line of its own.
+    source = planted(
+        tmp_path,
+        "fn f(registry: &Registry) {",
+        "    let mut guard = registry",
+        "        .entries",
+        "        .lock()",
+        "        .unwrap_or_else(PoisonError::into_inner);",
+        "    callback.call0(py)?;",
+        "}",
+    )
+    result = lint(source)
+    assert result.returncode == 1
+    assert "planted.rs:6:" in result.stderr
+    assert "guard `guard` (line 2)" in result.stderr
+
+
+def test_a_multi_line_binding_that_is_not_a_guard_or_is_marked_passes(tmp_path: Path) -> None:
+    source = planted(
+        tmp_path,
+        "fn f(registry: &Registry) {",
+        "    let copy = registry",
+        "        .entries",
+        "        .clone();",
+        "    callback.call0(py)?;",
+        "    let guard = registry",
+        "        .entries",
+        "        .lock(); // lock-across-python: the callee never re-enters porto",
+        "    callback.call0(py)?;",
+        "}",
+    )
+    result = lint(source)
+    assert result.returncode == 0, result.stderr
+
+
 def test_a_guard_dropped_or_out_of_scope_before_the_call_passes(tmp_path: Path) -> None:
     source = planted(
         tmp_path,

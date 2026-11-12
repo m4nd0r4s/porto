@@ -32,11 +32,15 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATHS = (REPOSITORY_ROOT / "crates" / "porto-py",)
 ALLOW_MARKER = "// lock-across-python:"
 
-#: `let guard = <expr>.lock()...;`: a guard bound for the rest of its block.
+#: `let guard = <expr>.lock()...;`: a guard bound for the rest of its block. Matched against the
+#: whole statement, joined onto one line: rustfmt breaks a long chain (`let guard = state` then
+#: `.lock()` on the next line).
 GUARD_BINDING = re.compile(
     r"^\s*let\s+(?:mut\s+)?(?P<name>[A-Za-z_]\w*)\s*(?::[^=]+)?=\s*[^;]*"
-    r"\.(?:lock|lock_state|read|write|try_lock|lock_arc)\(\)"
+    r"\.\s*(?:lock|lock_state|read|write|try_lock|lock_arc)\s*\(\)"
 )
+#: How many lines a `let` statement may span before the lint gives up on it.
+MAX_STATEMENT_LINES = 12
 #: Calls that can run Python code.
 PYTHON_CALL = re.compile(
     r"\.(?:call|call0|call1|call_method|call_method0|call_method1|call_method_bound|getattr"
@@ -70,20 +74,36 @@ def brace_delta(code: str) -> int:
     return code.count("{") - code.count("}")
 
 
+def statement_at(lines: list[str], start: int) -> tuple[str, int]:
+    """The code of the statement that begins at line `start`, on one line, and the index of its
+    last line: the lines up to the first one that ends in `;` (or `{`, for a block expression)."""
+    parts: list[str] = []
+    end = start
+    for end in range(start, min(start + MAX_STATEMENT_LINES, len(lines))):
+        code = code_of(lines[end])
+        parts.append(code)
+        if code.rstrip().endswith((";", "{", "}")):
+            break
+    return " ".join(part.strip() for part in parts), end
+
+
 def violations(file: Path) -> list[str]:
     """`file:line: message` for each lock guard alive at a call that can run Python code."""
     lines = file.read_text(encoding="utf-8").splitlines()
     found: list[str] = []
     for start, line in enumerate(lines):
-        binding = GUARD_BINDING.match(code_of(line))
-        if binding is None or ALLOW_MARKER in line:
+        if not line.lstrip().startswith("let "):
+            continue
+        statement, last = statement_at(lines, start)
+        binding = GUARD_BINDING.match(statement)
+        if binding is None or any(ALLOW_MARKER in lines[n] for n in range(start, last + 1)):
             continue
         name = binding.group("name")
         released = re.compile(rf"\bdrop\(\s*{re.escape(name)}\s*\)")
-        # The binding's own line may open a block (`let g = x.lock(); if ... {`): depth is
+        # The statement's last line may open a block (`let g = x.lock(); if ... {`): depth is
         # measured from the line after it.
         depth = 0
-        for number in range(start + 1, len(lines)):
+        for number in range(last + 1, len(lines)):
             code = code_of(lines[number])
             if released.search(code):
                 break

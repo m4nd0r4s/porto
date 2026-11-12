@@ -145,8 +145,10 @@ const DOMAINS: [ffi::PyMemAllocatorDomain; 2] = [
 #[pyfunction(name = "_count_allocations")]
 #[pyo3(signature = (function, /))]
 fn count_allocations(function: &Bound<'_, PyAny>) -> PyResult<usize> {
+    // The lock is the point: one set of wrappers at a time while `function` runs. Only this
+    // test hook takes it, and `function` calling it again is the test's own deadlock.
     let _serialised = COUNTING
-        .lock()
+        .lock() // lock-across-python: serialises the allocator wrappers; no other path takes it
         .map_err(|_| PyRuntimeError::new_err("porto._core: _count_allocations was poisoned"))?;
     let guard = CountingAllocators::install();
     let before = ALLOCATIONS.load(Ordering::Relaxed);
