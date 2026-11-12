@@ -1,0 +1,61 @@
+name: loom-nightly
+
+# Every loom model at its full bound (no LOOM_MAX_PREEMPTIONS: the exhaustive ones are
+# exhaustive; the capped ones run at the bound they declare), under a long timeout. Each model has
+# its own LOOM_CHECKPOINT_FILE, kept in the Actions cache: a search the time budget cut short
+# resumes from its checkpoint the next night, as long as the code under test is unchanged.
+# Results are in the run's summary; a failure uploads the loom trace (51-build-ci-release.md §2).
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: loom-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Searches that did not finish within this many seconds stop and resume the next night. Kept
+  # well under the job's timeout, which leaves room for the build and the trace of a failure.
+  LOOM_BUDGET_SECONDS: "18000"
+
+jobs:
+  loom:
+    name: loom (full bound)
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: loom
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: loom-checkpoints
+          key: loom-checkpoints-${{ hashFiles('crates/porto-core/**', 'crates/porto-io/**', 'Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: loom-checkpoints-${{ hashFiles('crates/porto-core/**', 'crates/porto-io/**', 'Cargo.lock', 'rust-toolchain.toml') }}-
+      - run: >-
+          python3 scripts/run_loom.py --checkpoint-dir loom-checkpoints
+          --budget "$LOOM_BUDGET_SECONDS" --trace-dir loom-trace
+      - if: ${{ !cancelled() }}
+        run: >-
+          python3 scripts/run_loom.py --package porto-io --filter loom_tests
+          --checkpoint-dir loom-checkpoints --trace-dir loom-trace
+      # Saved whatever happened, so a timeout or a failure does not lose the searches' progress.
+      - if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: loom-checkpoints
+          key: loom-checkpoints-${{ hashFiles('crates/porto-core/**', 'crates/porto-io/**', 'Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loom-trace
+          path: loom-trace/
+          if-no-files-found: ignore

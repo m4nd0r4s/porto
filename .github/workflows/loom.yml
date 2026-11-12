@@ -1,0 +1,66 @@
+name: loom
+
+# The loom models of porto-core and the close gate of porto-io (51-build-ci-release.md §2,
+# 52-testing-strategy.md item 2), on the pull requests that can break them. LOOM_MAX_PREEMPTIONS=2
+# bounds every model, which keeps the run to a couple of minutes; the nightly workflow
+# (loom-nightly.yml) runs each model at its full bound. Not a required check: a pull request that
+# does not touch these paths does not start it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/porto-core/**
+      - crates/porto-io/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - scripts/run_loom.py
+      - .github/workflows/loom.yml
+  pull_request:
+    paths:
+      - crates/porto-core/**
+      - crates/porto-io/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - scripts/run_loom.py
+      - .github/workflows/loom.yml
+  workflow_dispatch:
+
+concurrency:
+  group: loom-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  loom:
+    name: loom (LOOM_MAX_PREEMPTIONS=2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The models build with --cfg loom, apart from the regular artifacts.
+          key: loom
+      # One process per model (scripts/run_loom.py); a failing one is run again with loom's
+      # trace on, and the logs land in loom-trace/.
+      - run: python3 scripts/run_loom.py --max-preemptions 2 --trace-dir loom-trace
+      # porto-io's other tests are not loom-aware: only the model of the close gate runs.
+      - if: ${{ !cancelled() }}
+        run: >-
+          python3 scripts/run_loom.py --package porto-io --filter loom_tests
+          --max-preemptions 2 --trace-dir loom-trace
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loom-trace
+          path: loom-trace/
+          if-no-files-found: ignore
