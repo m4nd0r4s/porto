@@ -23,6 +23,7 @@ use std::future::{Future, poll_fn};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -41,6 +42,9 @@ use crate::py_compat::take_exception;
 /// How often the lane checks for signals (Ctrl-C) while it waits for `main`: the longest a
 /// `KeyboardInterrupt` waits when every task is parked.
 const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How many runs in the process are in debug mode.
+static DEBUG_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// Whether this thread is running a Python lane (inside [`run`]).
@@ -166,6 +170,13 @@ fn open_driver(py: Python<'_>, config: &RuntimeConfig) -> PyResult<Arc<MioDriver
 /// Whether the run on this thread is in debug mode.
 pub(crate) fn debug() -> bool {
     DEBUG.get()
+}
+
+/// Whether any run in the process is in debug mode: one relaxed load, for the checks that sit
+/// on a path every task takes (the swallowed-`Cancelled` report as a task ends).
+#[inline]
+pub(crate) fn any_debug() -> bool {
+    DEBUG_RUNS.load(Ordering::Relaxed) != 0
 }
 
 /// Whether this thread is running a Python lane.
@@ -314,13 +325,18 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
 }
 
 /// Marks this thread as a Python lane until dropped.
-struct OnPythonLane;
+struct OnPythonLane {
+    debug: bool,
+}
 
 impl OnPythonLane {
     fn enter(debug: bool) -> Self {
         ON_PYTHON_LANE.set(true);
         DEBUG.set(debug);
-        Self
+        if debug {
+            DEBUG_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { debug }
     }
 }
 
@@ -328,6 +344,9 @@ impl Drop for OnPythonLane {
     fn drop(&mut self) {
         ON_PYTHON_LANE.set(false);
         DEBUG.set(false);
+        if self.debug {
+            DEBUG_RUNS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 

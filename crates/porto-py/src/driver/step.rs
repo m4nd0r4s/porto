@@ -417,7 +417,8 @@ pub(crate) fn exit_cancel_scope(scope: &PyScopeNode) -> bool {
 /// The `Cancelled` delivered to a task whose effective scope, walked from `scope`, is
 /// cancelled: its message says which cancellation it is.
 fn cancelled_exception(py: Python<'_>, scope: &PyScopeNode) -> Py<PyBaseException> {
-    let why = match scope.effective_cancellation().map(|found| found.reason) {
+    let found = scope.effective_cancellation();
+    let why = match found.as_ref().map(|found| found.reason) {
         Some(CancelReason::Deadline) => "the deadline of its scope, or of one it is in, passed",
         Some(CancelReason::ChildFailed) => {
             "a task of its scope, or of one it is nested in, failed, which cancels the scope (C4)"
@@ -426,26 +427,21 @@ fn cancelled_exception(py: Python<'_>, scope: &PyScopeNode) -> Py<PyBaseExceptio
         Some(CancelReason::TaskCancelled) => TASK_CANCELLED,
         _ => "Scope.cancel() was called on its scope or on one it is nested in",
     };
-    cancelled_with(py, why)
+    let cause = found.map(|found| found.scope.id());
+    cancelled_with(py, why, cause)
 }
 
-/// Debug mode (15 C11): remembers that the running task is being delivered a `Cancelled`, so
-/// that one that goes on to return normally can be reported as having swallowed it
-/// ([`warn_if_swallowed`]). Costs a thread-local read on this cold path, and nothing when no
-/// `Cancelled` is raised.
-fn note_cancel_delivered(py: Python<'_>) {
-    if !lane::debug() {
-        return;
-    }
-    // A task with no handle gets one (the handle holds the flag).
-    if let Ok(Some(handle)) = current_task(py) {
-        handle.get().set_cancel_delivered(true);
-    }
-}
+/// The cause recorded for a `Cancelled` that `Task.cancel()` delivered with no scope of its own
+/// to carry it: never equal to a scope's id, so no scope exit absorbs it.
+const TASK_CAUSE: u64 = 1 << 63;
 
-/// Debug mode (15 C11): a scope exit absorbed a `Cancelled` in the running task, which is how a
-/// delivered cancellation is meant to end: not swallowed.
-pub(crate) fn note_cancel_absorbed() {
+/// Debug mode (15 C11): remembers that the running task is being delivered the `Cancelled` of
+/// the scope with id `cause` (`None`: of `Task.cancel()` alone), so that a task that goes on to
+/// return normally can be reported as having swallowed it ([`warn_if_swallowed`]). A thread-local
+/// read on this cold path and nothing when no `Cancelled` is raised. A task with no handle (an
+/// internal spawn) is not tracked: giving it one would change what it later does (an implicit
+/// scope is made for a task whose handle was cancelled), which a run without debug must not see.
+fn note_cancel_delivered(cause: Option<u64>) {
     if !lane::debug() {
         return;
     }
@@ -456,18 +452,39 @@ pub(crate) fn note_cancel_absorbed() {
     // SAFETY: non-null points at the `Task` behind the running task's handle, which the body
     // (or `made_handle`) holds for the whole poll.
     if let Some(task) = unsafe { task.as_ref() } {
-        task.set_cancel_delivered(false);
+        task.note_cancel_delivered(cause.unwrap_or(TASK_CAUSE | running.task_id));
+    }
+}
+
+/// Debug mode (15 C11): the exit of the scope with id `scope` absorbed a `Cancelled` in the
+/// running task, which is how that scope's delivered cancellation is meant to end. Clears the
+/// note only when that scope is the one whose cancellation was delivered.
+pub(crate) fn note_cancel_absorbed(scope: u64) {
+    if !lane::debug() {
+        return;
+    }
+    let Some(running) = running() else {
+        return;
+    };
+    let task = running.task_state.get();
+    // SAFETY: as in `note_cancel_delivered`.
+    if let Some(task) = unsafe { task.as_ref() } {
+        task.note_cancel_absorbed(scope);
     }
 }
 
 /// Debug mode (15 C11): the task returned normally, and its handle says a `Cancelled` was
-/// delivered to it and no scope absorbed one since: it caught the cancellation and carried on,
-/// which asks for it to be raised again. Warns once, as the task ends.
+/// delivered to it and its scope's exit absorbed none since: it caught the cancellation and
+/// carried on, which asks for it to be raised again. Warns once, as the task ends. One relaxed
+/// load of a process-wide count gates it, so a run without debug pays nothing else.
 fn warn_if_swallowed(py: Python<'_>, task: &PyTask) {
+    if !lane::any_debug() {
+        return;
+    }
     let Some(handle) = task.py_handle.as_ref() else {
         return;
     };
-    if !handle.get().cancel_delivered() {
+    if !handle.get().swallow_pending() {
         return;
     }
     let name = handle
@@ -491,11 +508,11 @@ const TASK_CANCELLED: &str = "Task.cancel() was called on it";
 /// The `Cancelled` delivered to a task that `Task.cancel()` reached while it has no implicit
 /// scope to carry it.
 fn task_cancelled_exception(py: Python<'_>) -> Py<PyBaseException> {
-    cancelled_with(py, TASK_CANCELLED)
+    cancelled_with(py, TASK_CANCELLED, None)
 }
 
-fn cancelled_with(py: Python<'_>, why: &str) -> Py<PyBaseException> {
-    note_cancel_delivered(py);
+fn cancelled_with(py: Python<'_>, why: &str, cause: Option<u64>) -> Py<PyBaseException> {
+    note_cancel_delivered(cause);
     Cancelled::new_err(format!(
         "porto: the task was cancelled: {why}; let the Cancelled propagate (the cancelled scope \
          absorbs it at its `async with` exit): a task that catches it gets it again at its next \

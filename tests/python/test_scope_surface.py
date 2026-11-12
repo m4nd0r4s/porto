@@ -306,6 +306,26 @@ def test_C4_a_named_scope_names_itself_in_the_failure_group() -> None:
     assert "'" not in unnamed.split(" (")[0]
 
 
+def test_a_name_with_a_lone_surrogate_is_refused_where_it_is_given() -> None:
+    """It could not be put in the failure group's message, which would lose the failures."""
+    with pytest.raises(ValueError, match=r"lone surrogate.*leave it out"):
+        porto.scope(name="bad\udc80name")
+
+
+def test_C4_a_non_ascii_name_names_the_failure_group_and_keeps_the_failure() -> None:
+    async def main() -> BaseExceptionGroup[Any]:
+        try:
+            async with porto.scope(name="jöbs \U0001f680") as s:
+                s.spawn(_fail())
+        except BaseExceptionGroup as group:
+            return group
+        raise AssertionError("no group")
+
+    group = porto.run(main)
+    assert str(group).startswith("porto scope 'jöbs \U0001f680' failed")
+    assert [type(error) for error in group.exceptions] == [ValueError]
+
+
 # --- Scope.tasks --------------------------------------------------------------------------------
 
 

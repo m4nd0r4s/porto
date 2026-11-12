@@ -1,14 +1,15 @@
 //! The tasks a scope lists for `Scope.tasks` (20-python-api-reference.md "Structured
 //! concurrency").
 //!
-//! A [`ChildList`] belongs to a `Scope`. It holds *non-owning* links to the `Task` handles of the
-//! tasks spawned into it, and a task takes itself out when it ends ([`unlink`], called by
-//! `Task::finish`), so a finished task leaves nothing behind: no handle is kept alive, and a
-//! spawn costs one lock and a push, an end one lock and a swap-remove (porto-szb.43 measured a
-//! list of owning handles that was compacted lazily: it kept the ended handles until the exit
-//! and made 10k-task fan-outs 20% slower).
+//! A [`ChildList`] belongs to a `Scope`. It is an intrusive doubly linked list through the
+//! `Task` handles of the tasks spawned into it: a spawn links the handle in (one lock, a few
+//! stores, no allocation), and a task takes itself out when it ends ([`unlink`], called by
+//! `Task::finish`), touching only its two neighbours. It holds no reference, so a finished task
+//! leaves nothing behind (porto-szb.43 measured a list of owning handles that was compacted
+//! lazily: it kept ended handles until the exit and made 10k-task fan-outs 20% slower).
 //!
-//! The links are sound because of the order of things, not because anything is counted:
+//! **Single lane only.** The links are sound because of the order of things on the one lane
+//! that runs the tasks of a runtime (M1), not because anything is counted:
 //!
 //! - a task's body holds its handle strongly until it ends, and `Task::finish` unlinks the task
 //!   before the body lets go (`PyTask::complete`, `cancel` and `Drop` all finish the handle
@@ -18,72 +19,62 @@
 //!   pointer never outlives the list. An ordinary scope cannot even be freed with listed tasks:
 //!   its exit waits for them (C5), and a task unlinks before it counts out of the scope.
 //!
-//! All of it runs on the lane that runs the tasks, except a snapshot (`Scope.tasks`), which
-//! takes the list's lock like the rest.
+//! What does not hold once tasks run on several lanes (M2), and what `porto-szb.24` (the
+//! per-lane registry) and `porto-szb.142` (derive `Scope.tasks` from it) must resolve before
+//! `lanes > 1`: `unlink` reads `home` and then locks the list it points at, so a scope freed in
+//! that window is a use after free (the list needs a counted owner, or the registry replaces
+//! it); and `PyTask::drop`, which finishes the handle, can run on a thread that is not the
+//! task's lane (a waker dropped after shutdown). The orderings below are `SeqCst` so that the
+//! one store-load pattern (`register` publishes `home` then reads `ended`, `finish` publishes
+//! `ended` then reads `home`) cannot miss on both sides.
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
+use pyo3::Borrowed;
 use pyo3::prelude::*;
-use pyo3::{Borrowed, ffi};
 
 use super::task::Task;
 
-/// One listed task: its `Task` struct (for the id and the slot) and the Python object around it
-/// (to hand out in a snapshot).
-struct Entry {
-    task: *const Task,
-    object: *mut ffi::PyObject,
-}
+/// The first task of the list: the others hang off it through `Task::next`.
+struct Head(*const Task);
 
-/// The entries. Slot 0 is the first task of a scope, inline, so a scope that spawns one task
-/// (the common case of a scope per request) allocates nothing; slot `n + 1` is `rest[n]`.
-#[derive(Default)]
-struct Children {
-    first: Option<Entry>,
-    rest: Vec<Entry>,
-}
+// SAFETY: the pointer is only dereferenced under the list's lock, while the invariants in the
+// module docs make it point at a live task.
+unsafe impl Send for Head {}
 
-// SAFETY: the pointers are only dereferenced under the list's lock, while the invariants in the
-// module docs make them point at live tasks.
-unsafe impl Send for Children {}
-
-impl Children {
-    /// Lists `entry` and returns its slot.
-    fn insert(&mut self, entry: Entry) -> u32 {
-        if self.first.is_none() {
-            self.first = Some(entry);
-            return 0;
+impl Head {
+    /// Links `task` in at the head.
+    fn insert(&mut self, task: &Task) {
+        task.set_links(ptr::null(), self.0);
+        if !self.0.is_null() {
+            // SAFETY: a listed task is alive (module docs).
+            unsafe { &*self.0 }.set_prev(ptr::from_ref(task));
         }
-        self.rest.push(entry);
-        u32::try_from(self.rest.len()).expect("a scope lists fewer than 4 billion tasks")
+        self.0 = ptr::from_ref(task);
     }
 
-    /// Takes `task` off, if it is listed where it says: the last entry moves into its place.
+    /// Unlinks `task`, which is listed here: its neighbours point at each other.
     fn remove(&mut self, task: &Task) {
-        let slot = task.slot() as usize;
-        let this = ptr::from_ref(task);
-        if slot == 0 {
-            if self.first.as_ref().is_some_and(|entry| entry.task == this) {
-                self.first = None;
-            }
-            return;
+        let (prev, next) = (task.prev(), task.next());
+        if prev.is_null() {
+            self.0 = next;
+        } else {
+            // SAFETY: a listed task is alive (module docs).
+            unsafe { &*prev }.set_next(next);
         }
-        let index = slot - 1;
-        if self.rest.get(index).is_some_and(|entry| entry.task == this) {
-            self.rest.swap_remove(index);
-            if let Some(moved) = self.rest.get(index) {
-                // SAFETY: a listed task is alive (module docs).
-                unsafe { &*moved.task }.set_slot(u32::try_from(index + 1).unwrap_or(u32::MAX));
-            }
+        if !next.is_null() {
+            // SAFETY: as above.
+            unsafe { &*next }.set_prev(prev);
         }
+        task.set_links(ptr::null(), ptr::null());
     }
 }
 
 /// A scope's list of its tasks.
 pub(super) struct ChildList {
-    children: Mutex<Children>,
+    head: Mutex<Head>,
     /// Whether anything was ever listed: a scope that spawned nothing skips the lock at its exit.
     used: AtomicBool,
 }
@@ -91,10 +82,7 @@ pub(super) struct ChildList {
 impl ChildList {
     pub(super) const fn new() -> Self {
         Self {
-            children: Mutex::new(Children {
-                first: None,
-                rest: Vec::new(),
-            }),
+            head: Mutex::new(Head(ptr::null())),
             used: AtomicBool::new(false),
         }
     }
@@ -102,20 +90,21 @@ impl ChildList {
     /// Lists `task` here, taking it off the list it was in (a task `Scope.start` moves).
     pub(super) fn register(&self, task: &Bound<'_, Task>) {
         let state = task.get();
-        unlink(state);
-        let entry = Entry {
-            task: ptr::from_ref(state),
-            object: task.as_ptr(),
-        };
-        let mut children = self.children.lock();
-        let slot = children.insert(entry);
-        state.set_slot(slot);
+        // A task is listed nowhere when it is spawned: skip the swap-and-lock of `unlink`.
+        if state.is_listed() {
+            unlink(state);
+        }
+        state.set_object(task.as_ptr());
+        let mut head = self.head.lock();
+        head.insert(state);
         state.set_home(ptr::from_ref(self).cast_mut());
         // A task that ended meanwhile (another lane ran it to the end before this): it already
         // looked for its list and found none.
         let ended = state.has_ended();
-        drop(children);
-        self.used.store(true, Ordering::Relaxed);
+        drop(head);
+        if !self.used.load(Ordering::Relaxed) {
+            self.used.store(true, Ordering::Relaxed);
+        }
         if ended {
             unlink(state);
         }
@@ -126,24 +115,20 @@ impl ChildList {
         if !self.used.load(Ordering::Relaxed) {
             return Vec::new();
         }
-        let mut listed: Vec<(u64, Bound<'py, PyAny>)> = {
-            let children = self.children.lock();
-            children
-                .first
-                .iter()
-                .chain(children.rest.iter())
-                .map(|entry| {
-                    // SAFETY: a listed task is alive, and the lock keeps it listed (module
-                    // docs); the new reference outlives the entry.
-                    unsafe {
-                        (
-                            (*entry.task).task_id(),
-                            Borrowed::from_ptr(py, entry.object).to_owned(),
-                        )
-                    }
-                })
-                .collect()
-        };
+        let mut listed: Vec<(u64, Bound<'py, PyAny>)> = Vec::new();
+        {
+            let head = self.head.lock();
+            let mut at = head.0;
+            while !at.is_null() {
+                // SAFETY: a listed task is alive, and the lock keeps it listed (module docs).
+                let task = unsafe { &*at };
+                // SAFETY: `object` is the task's Python object, set when it was listed; the new
+                // reference outlives the link.
+                let object = unsafe { Borrowed::from_ptr(py, task.object()) }.to_owned();
+                listed.push((task.task_id(), object));
+                at = task.next();
+            }
+        }
         listed.sort_unstable_by_key(|(id, _)| *id);
         listed.into_iter().map(|(_, object)| object).collect()
     }
@@ -154,11 +139,14 @@ impl ChildList {
         if !self.used.load(Ordering::Relaxed) {
             return;
         }
-        let mut children = self.children.lock();
-        let first = children.first.take();
-        for entry in first.into_iter().chain(children.rest.drain(..)) {
+        let mut head = self.head.lock();
+        let mut at = std::mem::replace(&mut head.0, ptr::null());
+        while !at.is_null() {
             // SAFETY: a listed task is alive (module docs).
-            unsafe { &*entry.task }.set_home(ptr::null_mut());
+            let task = unsafe { &*at };
+            at = task.next();
+            task.set_links(ptr::null(), ptr::null());
+            task.set_home(ptr::null_mut());
         }
     }
 }
@@ -170,11 +158,22 @@ impl Drop for ChildList {
 }
 
 /// Takes `task` off the list it is in, if any: it ended, or `Scope.start` moves it.
+///
+/// Locks the list first and checks under the lock that the task is still listed there, so a
+/// `detach_all` or a second unlink in between is seen.
 pub(super) fn unlink(task: &Task) {
-    let home = task.take_home();
-    if home.is_null() {
-        return;
+    loop {
+        let home = task.home();
+        if home.is_null() {
+            return;
+        }
+        // SAFETY: a task's `home` is cleared before its list dies (module docs, single lane).
+        let list = unsafe { &*home };
+        let mut head = list.head.lock();
+        if task.home() == home {
+            head.remove(task);
+            task.set_home(ptr::null_mut());
+            return;
+        }
     }
-    // SAFETY: a task's `home` is cleared before its list dies (module docs).
-    unsafe { &*home }.children.lock().remove(task);
 }

@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 import porto
+from porto import _core
 
 SWALLOWED = "cancellation was swallowed"
 
@@ -171,6 +172,66 @@ def test_C11_debug_is_per_run() -> None:
     assert len(swallowed(run_debug(main, debug=True))) == 1
     assert swallowed(run_debug(main, debug=False)) == []
     assert len(swallowed(run_debug(main, debug=True))) == 1
+
+
+def test_C11_an_inner_deadline_that_times_out_does_not_excuse_a_swallowed_outer_cancel() -> None:
+    """Only the exit of the scope whose cancel was delivered clears the note: the task swallowed
+    the outer cancel, then ran a ``move_on_after`` that timed out on its own."""
+
+    async def worker() -> None:
+        with contextlib.suppress(porto.Cancelled):
+            await porto.sleep(30)  # the outer cancel, swallowed
+        with porto.shield():  # out of the outer cancel's reach from here on
+            async with porto.move_on_after(0.01):
+                await porto.sleep(30)  # the inner scope's own cancel, absorbed by its exit
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.spawn(worker)
+            await porto.checkpoint()
+            s.cancel()
+
+    assert len(swallowed(run_debug(main, debug=True))) == 1
+
+
+def test_C11_the_exit_of_the_scope_whose_cancel_was_delivered_clears_the_note() -> None:
+    async def worker() -> None:
+        async with porto.move_on_after(0.01):
+            await porto.sleep(30)
+        await porto.sleep(0.001)
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.spawn(worker)
+
+    assert swallowed(run_debug(main, debug=True)) == []
+
+
+def test_C11_debug_does_not_give_a_handle_less_task_a_handle() -> None:
+    """A task spawned internally has no ``porto.Task``; debug mode must not make one (a handle
+    changes what a later ``cancel()`` does), so such a task is not tracked."""
+
+    async def internal() -> None:
+        with contextlib.suppress(porto.Cancelled):
+            await porto.sleep(30)
+
+    async def main() -> int:
+        _core._spawn(internal())  # pyright: ignore[reportPrivateUsage]
+        await porto.checkpoint()
+        return _core._task_handles_created()  # pyright: ignore[reportPrivateUsage]
+
+    def handles_made(debug: bool) -> tuple[int, list[str]]:
+        before = _core._task_handles_created()  # pyright: ignore[reportPrivateUsage]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            during = porto.run(main, debug=debug)
+        texts = [str(w.message) for w in caught]
+        return during - before, swallowed(texts)
+
+    plain, _ = handles_made(False)
+    debugged, reports = handles_made(True)
+    assert debugged == plain
+    assert reports == []
 
 
 def test_C11_a_task_that_lets_the_cancellation_out_is_not_reported() -> None:

@@ -48,7 +48,9 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use porto_core::Handle;
 use porto_core::scope::{CancelReason, ScopeNode};
 use porto_core::sync::SetOnce;
-use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError, PyTypeError};
+use pyo3::exceptions::{
+    PyBaseException, PyGeneratorExit, PyRuntimeError, PyTypeError, PyValueError,
+};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -118,7 +120,18 @@ fn scope_name(name: Option<Bound<'_, PyAny>>) -> PyResult<Option<Py<PyString>>> 
         None => Ok(None),
         Some(name) if name.is_none() => Ok(None),
         Some(name) => match name.cast_into::<PyString>() {
-            Ok(name) => Ok(Some(name.unbind())),
+            Ok(name) => {
+                // A name the exit cannot put in the failure group's message (a lone surrogate)
+                // is refused here, where the mistake is made.
+                if name.to_str().is_err() {
+                    return Err(PyValueError::new_err(
+                        "porto: porto.scope() name= must be text that can be encoded (it has a \
+                         lone surrogate); pass a str without \\ud800-\\udfff escapes, or leave it \
+                         out for an unnamed scope",
+                    ));
+                }
+                Ok(Some(name.unbind()))
+            }
             Err(error) => Err(PyTypeError::new_err(format!(
                 "porto: porto.scope() name= must be a str, got {}; pass name=str(...), or leave \
                  it out for an unnamed scope",
@@ -840,7 +853,9 @@ impl Scope {
         let caught = absorbed || child_absorbed;
         if absorbed {
             // The cancellation this task was delivered ends here, as it should (15 C11).
-            step::note_cancel_absorbed();
+            if let Some(node) = node {
+                step::note_cancel_absorbed(node.id());
+            }
         }
         // The deadline timed the block out only if it cut it short: nothing came out of it, or
         // the `Cancelled` it caused did. Any other exception leaving the block (a cleanup bug
@@ -874,9 +889,11 @@ impl Scope {
         for error in errors {
             exceptions.append(error)?;
         }
+        // Never `?` here: the children's failures were drained by `close` above, and an error
+        // from the name would replace them.
         let message = match &self.name {
-            Some(name) if !name.bind(py).is_empty()? => {
-                format!("porto scope '{}' failed", name.bind(py).to_str()?)
+            Some(name) if !name.bind(py).to_string_lossy().is_empty() => {
+                format!("porto scope '{}' failed", name.bind(py).to_string_lossy())
             }
             _ => "porto scope failed".to_owned(),
         };
