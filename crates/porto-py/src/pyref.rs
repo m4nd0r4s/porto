@@ -47,7 +47,18 @@ pub(crate) fn thread_is_attached() -> bool {
 /// would run code for) from here on.
 pub(crate) fn interpreter_is_finalizing() -> bool {
     // SAFETY: a plain query, callable from any thread, also after the interpreter ended.
-    unsafe { ffi::Py_IsFinalizing() != 0 }
+    unsafe { py_is_finalizing() != 0 }
+}
+
+/// `Py_IsFinalizing` is public from 3.13; 3.11 and 3.12 export the same query as
+/// `_Py_IsFinalizing` (`cpython/pylifecycle.h`).
+#[cfg(Py_3_13)]
+use ffi::Py_IsFinalizing as py_is_finalizing;
+
+#[cfg(not(Py_3_13))]
+unsafe extern "C" {
+    #[link_name = "_Py_IsFinalizing"]
+    fn py_is_finalizing() -> std::ffi::c_int;
 }
 
 /// A Python reference owned by code that always runs attached (P1 a, b). Same size as `Py<T>`.
