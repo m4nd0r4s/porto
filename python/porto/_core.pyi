@@ -944,6 +944,93 @@ class OneshotReceiver(Generic[_T_co]):
 
 def _oneshot() -> tuple[OneshotSender[Any], OneshotReceiver[Any]]: ...
 
+# Watch channel (porto.watch): the latest value, with change notification. Sending never waits,
+# so ``send`` is a plain call.
+
+@final
+class WatchSender(Generic[_T_contra]):
+    """The sending end of a watch channel. Clone it for more producers.
+
+    Closing it (``close()``, ``async with``, or dropping the last reference) is per handle:
+    once every sender is closed, receivers see the last value and then the end.
+    """
+
+    def send(self, value: _T_contra, /) -> None:
+        """Makes ``value`` the latest value (a new version) and wakes the waiting receivers;
+        never waits, so it is not awaited. Raises ``porto.BrokenResourceError`` if no receiver
+        is open (``subscribe()`` makes one), ``porto.ClosedResourceError`` if this sender was
+        closed."""
+
+    def subscribe(self) -> WatchReceiver[_T_contra]:
+        """A new receiver that has seen the current version: it waits for the next send.
+        Works while no other receiver is open. Raises ``porto.ClosedResourceError`` if this
+        sender was closed."""
+
+    def clone(self) -> WatchSender[_T_contra]:
+        """Another sender on the same channel. A clone of a closed sender is closed."""
+
+    def close(self) -> None:
+        """Closes this sender; other clones are unaffected. Closing twice does nothing."""
+
+    def is_closed(self) -> bool:
+        """Whether sends through this sender fail: it was closed, or no receiver is open."""
+
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> None: ...
+
+@final
+class WatchReceiver(Generic[_T_co]):
+    """The receiving end of a watch channel. Clone it for more watchers.
+
+    It remembers the newest version it has *seen*: ``changed()`` waits for a newer one and
+    marks it seen, so several sends before the call coalesce into one completion, and the
+    initial value counts as seen. ``borrow()`` only reads.
+    """
+
+    def borrow(self) -> _T_co:
+        """The latest value, without marking its version seen. After the channel closed it is
+        the last value. Raises ``porto.ClosedResourceError`` if this receiver was closed."""
+
+    def borrow_and_update(self) -> _T_co:
+        """The latest value, marking its version seen."""
+
+    def has_changed(self) -> bool:
+        """Whether a version this receiver has not seen exists."""
+
+    def changed(self) -> Awaitable[None]:
+        """Waits for a version newer than the last this receiver saw, and marks it seen.
+        Raises ``porto.EndOfChannel`` once every sender is closed and no unseen version is
+        left, ``porto.ClosedResourceError`` if this receiver was closed. Nothing happens until
+        it is awaited; one freed unawaited emits ``RuntimeWarning``."""
+
+    def try_changed(self) -> None:
+        """``changed()`` without waiting: raises ``porto.WouldBlock`` if there is no unseen
+        version, and the errors of ``changed``."""
+
+    def blocking_changed(self) -> None:
+        """``changed()`` from a thread that does not run porto, blocking that thread until a
+        newer version exists. Raises ``RuntimeError`` on a porto lane thread."""
+
+    def clone(self) -> WatchReceiver[_T_co]:
+        """Another receiver on the same channel, which has seen what this one has."""
+
+    def close(self) -> None:
+        """Closes this receiver; other receivers are unaffected. Waits through it raise
+        ``porto.ClosedResourceError``. Closing twice does nothing."""
+
+    def __aiter__(self) -> Self: ...
+    def __anext__(self) -> Awaitable[_T_co]:
+        """``async for value in rx``: waits for each new version and yields the latest value;
+        the end of the channel ends the loop. The initial value is not yielded."""
+
+def _watch(initial: Any, /) -> tuple[WatchSender[Any], WatchReceiver[Any]]: ...
+
 @final
 class _Trap:
     """A request to the driver. Awaiting it yields the trap, then returns what the driver sends.

@@ -57,6 +57,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     py_compat::names(py);
     api::channel::register(module)?;
     api::oneshot::register(module)?;
+    api::watch::register(module)?;
     api::config::register(module)?;
     api::run::register(module)?;
     api::scope::register(module)?;

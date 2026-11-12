@@ -20,7 +20,7 @@ print(porto.run(main))
 """
 
 from porto import lowlevel
-from porto._channel import channel, oneshot, unbounded_channel
+from porto._channel import channel, oneshot, unbounded_channel, watch
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Barrier,
@@ -41,6 +41,8 @@ from porto._core import (
     Sender,
     Started,
     Task,
+    WatchReceiver,
+    WatchSender,
     __version__,
     checkpoint,
     current_task,
@@ -104,6 +106,8 @@ __all__ = [
     "Started",
     "Task",
     "Terminated",
+    "WatchReceiver",
+    "WatchSender",
     "WouldBlock",
     "__version__",
     "channel",
@@ -120,6 +124,7 @@ __all__ = [
     "sleep",
     "timeout",
     "unbounded_channel",
+    "watch",
 ]
 
 # Time: sleep_until and sleep_forever (porto-szb.33)

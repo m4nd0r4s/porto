@@ -32,6 +32,7 @@ use super::channel::{
     PyObj, RecvSide, SendSide, collect_many, recv_closed_error, send_closed_error,
 };
 use super::oneshot::{self, OneshotRecvSide};
+use super::watch::{self, WatchRecvSide};
 use crate::async_slots::{guard_send, stop_iteration};
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
@@ -63,6 +64,11 @@ pub(super) enum Op {
     OneshotNext {
         side: Arc<Waitable<OneshotRecvSide>>,
     },
+    /// A watch receiver's `changed()`.
+    WatchChanged { side: Arc<Waitable<WatchRecvSide>> },
+    /// A watch receiver's `__anext__()`: the latest value after a change; the end is
+    /// `StopAsyncIteration`.
+    WatchNext { side: Arc<Waitable<WatchRecvSide>> },
 }
 
 impl Op {
@@ -75,6 +81,8 @@ impl Op {
             Self::RecvMany { .. } => "Receiver.recv_many(...)",
             Self::OneshotRecv { .. } => "OneshotReceiver.recv()",
             Self::OneshotNext { .. } => "anext(oneshot receiver)",
+            Self::WatchChanged { .. } => "WatchReceiver.changed()",
+            Self::WatchNext { .. } => "anext(watch receiver)",
         }
     }
 
@@ -127,6 +135,20 @@ impl Op {
                 }
                 Err(TryRecvError::Closed) => Err(PyStopAsyncIteration::new_err(())),
             },
+            Self::WatchChanged { side } => match side.0.try_changed() {
+                Ok(()) => Ok(Some(py.None())),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Closed) => Err(watch::recv_closed_error(&side.0)),
+            },
+            Self::WatchNext { side } => match side.0.try_changed_ref() {
+                // A new reference, taken under the channel's lock; nothing else runs there.
+                Ok(latest) => Ok(Some(latest.clone_ref(py))),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Closed) if side.0.is_handle_closed() => {
+                    Err(watch::recv_closed_error(&side.0))
+                }
+                Err(TryRecvError::Closed) => Err(PyStopAsyncIteration::new_err(())),
+            },
         }
     }
 
@@ -138,6 +160,7 @@ impl Op {
                 side.target()
             }
             Self::OneshotRecv { side } | Self::OneshotNext { side } => side.target(),
+            Self::WatchChanged { side } | Self::WatchNext { side } => side.target(),
         }
     }
 }

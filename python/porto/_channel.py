@@ -10,11 +10,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from porto import _core
-from porto._core import OneshotReceiver, OneshotSender, Receiver, Sender
+from porto._core import (
+    OneshotReceiver,
+    OneshotSender,
+    Receiver,
+    Sender,
+    WatchReceiver,
+    WatchSender,
+)
 
 _T = TypeVar("_T")
 
-_NO_CAPACITY: Any = object()
+_MISSING: Any = object()
 
 
 class channel(Generic[_T]):
@@ -31,8 +38,8 @@ class channel(Generic[_T]):
 
     else:
 
-        def __new__(cls, capacity=_NO_CAPACITY):
-            if capacity is _NO_CAPACITY:
+        def __new__(cls, capacity=_MISSING):
+            if capacity is _MISSING:
                 raise TypeError(
                     "porto: porto.channel() needs a capacity, as in porto.channel[T](64): pass "
                     "how many values the channel may buffer before senders wait, or use "
@@ -63,3 +70,27 @@ class oneshot(Generic[_T]):
 
     def __new__(cls) -> tuple[OneshotSender[_T], OneshotReceiver[_T]]:
         return _core._oneshot()  # pyright: ignore[reportPrivateUsage]
+
+
+class watch(Generic[_T]):
+    """A channel for the latest value: ``tx, rx = porto.watch[bool](False)``.
+
+    ``tx.send(value)`` never waits (every send is a new version); ``rx.borrow()`` reads the
+    latest value; ``await rx.changed()`` waits for a version it has not seen, once per call
+    however many sends came before. ``watch[bool](False)`` is the clearable event: ``send(True)``
+    sets it, ``send(False)`` clears it.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, initial: _T) -> tuple[WatchSender[_T], WatchReceiver[_T]]: ...
+
+    else:
+
+        def __new__(cls, initial=_MISSING):
+            if initial is _MISSING:
+                raise TypeError(
+                    "porto: porto.watch() needs an initial value, as in porto.watch[bool](False): "
+                    "pass the value receivers read before the first send"
+                )
+            return _core._watch(initial)

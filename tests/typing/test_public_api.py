@@ -250,6 +250,49 @@ def test_the_oneshot_sample_runs() -> None:
     assert porto.run(oneshot_roundtrip) == 5
 
 
+async def check_watch_is_typed() -> None:
+    tx, rx = porto.watch[bool](False)
+    assert_type(tx, porto.WatchSender[bool])
+    assert_type(rx, porto.WatchReceiver[bool])
+    tx.send(True)  # never waits: not awaited
+    assert_type(rx.borrow(), bool)
+    assert_type(rx.borrow_and_update(), bool)
+    assert_type(rx.has_changed(), bool)
+    await rx.changed()
+    rx.try_changed()
+    rx.blocking_changed()
+    assert_type(rx.clone(), porto.WatchReceiver[bool])
+    assert_type(tx.clone(), porto.WatchSender[bool])
+    assert_type(tx.subscribe(), porto.WatchReceiver[bool])
+    async for flag in rx:
+        assert_type(flag, bool)
+    async with tx:
+        pass
+
+
+def check_watch_misuse_is_a_type_error() -> None:
+    porto.watch[int]()  # pyright: ignore[reportCallIssue]
+    porto.watch[int]("zero")  # pyright: ignore[reportArgumentType]
+    tx, rx = porto.watch[int](0)
+    tx.send("one")  # pyright: ignore[reportArgumentType]
+    rx.recv()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+    objects: porto.WatchReceiver[object] = porto.watch[int](0)[1]
+    ints: porto.WatchSender[int] = porto.watch[object](0)[0]
+    del objects, ints
+
+
+async def watch_roundtrip() -> int:
+    tx, rx = porto.watch[int](0)
+    tx.send(1)
+    tx.send(2)
+    await rx.changed()
+    return rx.borrow()
+
+
+def test_the_watch_sample_runs() -> None:
+    assert porto.run(watch_roundtrip) == 2
+
+
 def test_the_channel_sample_runs() -> None:
     assert porto.run(pipeline, ["a", "b", "c"]) == ["a", "b", "c"]
 

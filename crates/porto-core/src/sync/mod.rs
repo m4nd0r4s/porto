@@ -30,6 +30,7 @@
 //!   the lane.
 //! - [`mpsc`]: bounded and unbounded multi-producer multi-consumer channels.
 //! - [`oneshot`]: a channel for one value.
+//! - [`watch`]: a channel for the latest value, with change notification.
 //! - [`SetOnce`]: an `Arc` set at most once and read with one atomic load.
 //!
 //! The grant-versus-cancel race is model-checked with [loom](https://docs.rs/loom):
@@ -50,8 +51,10 @@ pub mod oneshot;
 pub(crate) mod primitives;
 mod rwlock;
 mod semaphore;
+mod send_error;
 mod set_once;
 mod wait_queue;
+pub mod watch;
 
 #[cfg(all(test, not(loom)))]
 mod tests;
@@ -64,6 +67,9 @@ mod mutex_tests;
 
 #[cfg(all(test, not(loom)))]
 mod oneshot_tests;
+
+#[cfg(all(test, not(loom)))]
+mod watch_tests;
 
 #[cfg(test)]
 mod join_waiters_tests;
@@ -79,6 +85,9 @@ mod loom_mutex_tests;
 
 #[cfg(all(test, loom))]
 mod loom_oneshot_tests;
+
+#[cfg(all(test, loom))]
+mod loom_watch_tests;
 
 #[cfg(all(test, not(loom)))]
 mod semaphore_tests;
