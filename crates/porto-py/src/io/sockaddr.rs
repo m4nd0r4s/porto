@@ -6,7 +6,9 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 use pyo3::exceptions::{PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString, PyTuple};
+use pyo3::types::PyTuple;
+#[cfg(unix)]
+use pyo3::types::{PyBytes, PyString};
 use socket2::SockAddr;
 
 /// `address` as the `socket` module shows it.
