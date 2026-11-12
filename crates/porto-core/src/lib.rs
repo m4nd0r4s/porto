@@ -16,6 +16,8 @@
 
 pub mod config;
 pub mod coop;
+#[cfg(all(test, loom))]
+mod loom_support;
 pub mod sched;
 pub mod scope;
 pub mod sync;

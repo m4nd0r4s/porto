@@ -4,9 +4,9 @@
 //! Waiting goes through `loom::future::block_on`, so a lost wake-up shows up as a deadlock
 //! that loom reports.
 //!
-//! The models run under a preemption bound of 3 (one of them 2; `LOOM_MAX_PREEMPTIONS`
-//! overrides both): the array queue spins while a peer is half-way through a push or pop, so
-//! the unbounded search does not finish. Bounded search is loom's documented practice; most
+//! The models run under a preemption bound of 3 (two of them 2 and 1; a lower
+//! `LOOM_MAX_PREEMPTIONS` lowers them further): the array queue spins while a peer is half-way
+//! through a push or pop, so the unbounded search does not finish. Bounded search is loom's documented practice; most
 //! concurrency bugs need two or three preemptions.
 
 use std::future::poll_fn;
@@ -18,6 +18,8 @@ use loom::future::block_on;
 use loom::model::Builder;
 use loom::thread;
 
+use crate::loom_support::cap_preemptions;
+
 use super::super::WaitNode;
 use super::{
     Receiver, RecvError, SendError, Sender, TryRecvError, TrySendError, channel, unbounded_channel,
@@ -28,11 +30,11 @@ fn model(f: impl Fn() + Sync + Send + 'static) {
     model_bounded(3, f);
 }
 
-/// Explores `f` with at most `preemptions` preemptions (unless `LOOM_MAX_PREEMPTIONS` says
-/// otherwise).
+/// Explores `f` with at most `preemptions` preemptions, fewer if `LOOM_MAX_PREEMPTIONS` is
+/// lower (`crate::loom_support`).
 fn model_bounded(preemptions: usize, f: impl Fn() + Sync + Send + 'static) {
     let mut builder = Builder::new();
-    builder.preemption_bound.get_or_insert(preemptions);
+    cap_preemptions(&mut builder, preemptions);
     // Each spin of the queue on a preempted peer is a branch of the path.
     builder.max_branches = 10_000;
     builder.check(f);

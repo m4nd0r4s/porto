@@ -14,6 +14,8 @@ use loom::model::Builder;
 use loom::sync::Arc;
 use loom::thread;
 
+use crate::loom_support::cap_preemptions;
+
 use super::oneshot::{self, RecvError, SendError, TryRecvError};
 
 /// Counts its wakes. Plain std atomics: it is only read after every thread joined.
@@ -107,12 +109,12 @@ fn a_cancelled_receive_loses_nothing() {
 }
 
 /// Two receives on one receiver race for the value: exactly one gets it, the other ends. Three
-/// threads, so the search runs under a preemption bound of 2 (`LOOM_MAX_PREEMPTIONS`
-/// overrides it): unbounded, it takes minutes.
+/// threads, so the search runs under a preemption bound of 2 (a lower `LOOM_MAX_PREEMPTIONS`
+/// lowers it): unbounded, it takes minutes.
 #[test]
 fn two_receives_take_the_value_once() {
     let mut builder = Builder::new();
-    builder.preemption_bound.get_or_insert(2);
+    cap_preemptions(&mut builder, 2);
     builder.check(|| {
         let (tx, rx) = oneshot::channel();
         let rx = Arc::new(rx);

@@ -2,8 +2,8 @@
 //! or a root wake from another thread never leaves the lane parked with work queued.
 //!
 //! A lost wakeup shows up as the lane parked forever, which loom reports as a deadlock. The
-//! models with three threads run under a preemption bound of 3 (`LOOM_MAX_PREEMPTIONS`
-//! overrides it), as the channel's do: unbounded, they do not finish.
+//! models with three threads run under a preemption bound of 3 (a lower `LOOM_MAX_PREEMPTIONS`
+//! lowers it), as the channel's do: unbounded, they do not finish.
 //!
 //! `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release sched`
 
@@ -16,6 +16,7 @@ use loom::thread;
 
 use super::inject::Inject;
 use super::park::Parking;
+use crate::loom_support::cap_preemptions;
 use crate::sync::primitives::{current_thread, park};
 
 /// The lane and the queue it drains.
@@ -75,10 +76,10 @@ impl Lane {
     }
 }
 
-/// Explores `f` with at most 3 preemptions, unless `LOOM_MAX_PREEMPTIONS` says otherwise.
+/// Explores `f` with at most 3 preemptions, fewer if `LOOM_MAX_PREEMPTIONS` is lower.
 fn model_bounded(f: impl Fn() + Sync + Send + 'static) {
     let mut builder = Builder::new();
-    builder.preemption_bound.get_or_insert(3);
+    cap_preemptions(&mut builder, 3);
     builder.check(f);
 }
 

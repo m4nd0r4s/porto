@@ -38,7 +38,9 @@ proptest = "1.12"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
-# The loom models: `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release scope` (or `sync`).
+# The loom models of porto-core: `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release` runs
+# all of them (add a filter such as `scope` or `sync` for some); `LOOM_MAX_PREEMPTIONS=2` bounds
+# them for a quick run. No cargo feature: the cfg swaps in loom's primitives (52 item 2).
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 [workspace.lints.clippy]

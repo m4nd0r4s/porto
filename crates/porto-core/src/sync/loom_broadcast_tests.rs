@@ -14,6 +14,8 @@ use loom::model::Builder;
 use loom::sync::Arc;
 use loom::thread;
 
+use crate::loom_support::cap_preemptions;
+
 use super::broadcast::{self, RecvError, SendError, TryRecvError};
 
 /// Counts its wakes. Plain std atomics: it is only read after every thread joined.
@@ -43,11 +45,11 @@ fn receive_all(rx: &broadcast::Receiver<u32>) -> Vec<Result<u32, u64>> {
 
 /// A send races with a waiting receive on each of two receivers: both get the message, once,
 /// and neither hangs. Three threads, so the search runs under a preemption bound of 2
-/// (`LOOM_MAX_PREEMPTIONS` overrides it): unbounded, it takes minutes.
+/// (a lower `LOOM_MAX_PREEMPTIONS` lowers it): unbounded, it takes minutes.
 #[test]
 fn send_vs_two_waiting_receives_delivers_to_both() {
     let mut builder = Builder::new();
-    builder.preemption_bound.get_or_insert(2);
+    cap_preemptions(&mut builder, 2);
     builder.check(|| {
         let (tx, rx) = broadcast::channel(2);
         let second = tx.subscribe().unwrap();

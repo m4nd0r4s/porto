@@ -12,7 +12,7 @@
 |---|---|
 | lint | `cargo fmt --check`, `clippy -D warnings`, `ruff`, `pyright --strict` on python/ and tests/typing |
 | rust-test | `cargo nextest` (Linux/macOS/Windows), `--exclude porto-py douro-py` + with them via `pyo3` test harness |
-| loom | `RUSTFLAGS="--cfg loom" cargo test -p porto-core --features loom` (nightly-scheduled heavy run) |
+| loom | `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release` (no cargo feature; `52` item 2 lists the models), through `scripts/run_loom.py`, one process per model. Pull requests that touch `crates/porto-core` or `crates/porto-io` run it with `LOOM_MAX_PREEMPTIONS=2`; a nightly workflow runs every model at its full bound with `LOOM_CHECKPOINT_FILE`, resuming searches the run's time budget cut short. A failure uploads the model's log and a rerun with loom's trace (`LOOM_LOG=trace`) |
 | sanitizers | TSAN/ASAN builds of porto-core + Python free-threaded TSAN build of CPython for the porto-py tests (nightly) |
 | py-test | pytest matrix: 3.11–3.14, 3.14t; Linux epoll, Linux io_uring (privileged runner), macOS, Windows |
 | py-test-debug | pytest (Linux, 3.14) against a debug build of porto on a debug CPython (Py_DEBUG), so the `debug_assert`s of porto-core and porto-py and CPython's own object checks (the collector validates every object it starts tracking) run under the Python tests; the examples test fails on any stderr output, where a panic in a drop shows |
