@@ -3,9 +3,13 @@
 //!
 //! A view is taken with `PyObject_GetBuffer(PyBUF_SIMPLE)` (plus `PyBUF_WRITABLE` for a
 //! receive), so the bytes are one contiguous run, and the exporter keeps them where they are
-//! while the view lives (a `bytearray` refuses to resize, a `porto.Buffer` too). The view is
-//! released on drop, which MUST happen on a Python lane, attached (25 P1): debug builds assert
-//! it. A release build that drops one detached anyway attaches to release it.
+//! while the view lives (a `bytearray` refuses to resize, a `porto.Buffer` too).
+//!
+//! The `Py_buffer` lives in a small Python object, `_BufferView`, whose deallocation releases
+//! it: an operation holds a `Py<_BufferView>`, so dropping the operation is a decref like any
+//! other `Py` it could hold (25 P1). On a Python lane that releases the view at once; where no
+//! thread state is attached (a task cancelled or freed off its lane, a wake after shutdown)
+//! pyo3 defers the decref to the next attached thread, and the release happens there.
 
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
@@ -14,12 +18,43 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-/// A Python buffer viewed as one contiguous run of bytes, released on drop.
-struct View(NonNull<ffi::Py_buffer>);
+/// Owns one filled `Py_buffer` and releases it when the object is deallocated (attached).
+#[pyclass(frozen, module = "porto._core", name = "_BufferView")]
+pub(crate) struct ExportedView(NonNull<ffi::Py_buffer>);
 
-// SAFETY: the view is only read by the operation that owns it, polled on its lane; the exporter
-// keeps the memory alive and in place until `PyBuffer_Release`, which `Drop` calls attached
-// (P1). Moving the owning future between threads moves the view, nothing else touches it.
+// SAFETY: the `Py_buffer` is read through `&self` only (its `buf` and `len`, never written after
+// `PyObject_GetBuffer` filled it), and released once, by `Drop`, which CPython runs attached
+// when the object is deallocated, on whichever thread drops the last reference.
+unsafe impl Send for ExportedView {}
+// SAFETY: as above.
+unsafe impl Sync for ExportedView {}
+
+impl Drop for ExportedView {
+    fn drop(&mut self) {
+        debug_assert!(
+            thread_is_attached(),
+            "porto: a buffer view was released without an attached thread state (25 P1)"
+        );
+        // SAFETY: the object is being deallocated, attached; the view was filled by
+        // `PyObject_GetBuffer` and is released once, here.
+        unsafe { ffi::PyBuffer_Release(self.0.as_ptr()) };
+        // SAFETY: from `Box::into_raw` in `View::new` (as a `MaybeUninit`, same layout), freed
+        // once, after the release.
+        drop(unsafe { Box::from_raw(self.0.as_ptr().cast::<MaybeUninit<ffi::Py_buffer>>()) });
+    }
+}
+
+/// A Python buffer viewed as one contiguous run of bytes, released when dropped (deferred to an
+/// attached thread if need be).
+struct View {
+    /// Held only for its drop, which releases the view (deferred if detached).
+    _owner: Py<ExportedView>,
+    data: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `_owner` is a `Py` (Send); `data` points into the exporter's memory, kept alive and in
+// place by `_owner`, and only the operation that owns the view reads or writes it.
 unsafe impl Send for View {}
 
 impl View {
@@ -53,41 +88,17 @@ impl View {
             error.set_cause(py, Some(cause));
             return Err(error);
         }
-        Ok(Self(
-            NonNull::new(view).expect("Box::into_raw is never null"),
-        ))
-    }
-
-    fn raw(&self) -> &ffi::Py_buffer {
-        // SAFETY: filled by `PyObject_GetBuffer`, live until `Drop`.
-        unsafe { self.0.as_ref() }
-    }
-
-    fn len(&self) -> usize {
-        usize::try_from(self.raw().len).expect("a buffer's length is never negative")
-    }
-}
-
-impl Drop for View {
-    fn drop(&mut self) {
-        let attached = thread_is_attached();
-        debug_assert!(
-            attached,
-            "porto: a buffer view was released off a Python lane (25 P1)"
-        );
-        let release = || {
-            // SAFETY: attached (checked, or attached just now); the view was filled by
-            // `PyObject_GetBuffer` and is released once.
-            unsafe { ffi::PyBuffer_Release(self.0.as_ptr()) };
-        };
-        if attached {
-            release();
-        } else {
-            Python::attach(|_| release());
-        }
-        // SAFETY: from `Box::into_raw` in `new` (as a `MaybeUninit`, same layout), freed once,
-        // after the release.
-        drop(unsafe { Box::from_raw(self.0.as_ptr().cast::<MaybeUninit<ffi::Py_buffer>>()) });
+        let view = NonNull::new(view).expect("Box::into_raw is never null");
+        // SAFETY: filled by `PyObject_GetBuffer` just now.
+        let (data, len) = unsafe { (view.as_ref().buf.cast::<u8>(), view.as_ref().len) };
+        let len = usize::try_from(len).expect("a buffer's length is never negative");
+        // From here on the object owns the view; if it cannot be made, its drop releases it.
+        let owner = Py::new(py, ExportedView(view))?;
+        Ok(Self {
+            _owner: owner,
+            data,
+            len,
+        })
     }
 }
 
@@ -108,7 +119,7 @@ impl PyBufferRef {
 
     /// The bytes.
     pub(crate) fn bytes(&self) -> &[u8] {
-        let len = self.0.len();
+        let len = self.0.len;
         if len == 0 {
             return &[];
         }
@@ -117,7 +128,7 @@ impl PyBufferRef {
         // attempt (it runs on the lane, attached); a free-threaded build's other threads can
         // write the bytes meanwhile, as they can during `socket.send`, and the kernel then
         // sends whichever bytes it copied.
-        unsafe { std::slice::from_raw_parts(self.0.raw().buf.cast::<u8>(), len) }
+        unsafe { std::slice::from_raw_parts(self.0.data, len) }
     }
 }
 
@@ -132,13 +143,13 @@ impl PyBufferMut {
 
     /// The bytes, to receive into.
     pub(crate) fn spare(&mut self) -> &mut [MaybeUninit<u8>] {
-        let len = self.0.len();
+        let len = self.0.len;
         if len == 0 {
             return &mut [];
         }
         // SAFETY: a writable `PyBUF_SIMPLE` view is `len` contiguous writable bytes at `buf`,
         // kept in place while the view lives; `&mut self` makes this the only Rust access.
-        unsafe { std::slice::from_raw_parts_mut(self.0.raw().buf.cast(), len) }
+        unsafe { std::slice::from_raw_parts_mut(self.0.data.cast(), len) }
     }
 }
 
@@ -177,23 +188,23 @@ mod tests {
         });
     }
 
-    /// P1: a view held across a lane hop (dropped on a thread with no Python thread state)
-    /// trips the debug assertion instead of releasing it detached.
-    #[cfg(debug_assertions)]
+    /// P1: a view held across a lane hop (dropped on a thread with no Python thread state, as a
+    /// task cancelled off its lane does) is released at the next attach, not detached.
     #[test]
-    fn releasing_a_view_off_a_python_lane_is_caught_in_debug_builds() {
+    fn a_view_dropped_off_a_python_lane_is_released_at_the_next_attach() {
         Python::initialize();
-        Python::attach(|py| {
+        let array = Python::attach(|py| {
             let array = PyByteArray::new(py, b"hop");
             let view = PyBufferRef::new(array.as_any(), "data").unwrap();
-            let hopped = py.detach(|| std::thread::spawn(move || drop(view)).join());
-            let panic = hopped.expect_err("the release off the lane must be caught");
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or_default();
-            assert!(message.contains("off a Python lane"), "{message}");
+            py.detach(|| std::thread::spawn(move || drop(view)).join())
+                .expect("dropping a view off the lane must not panic");
+            array.unbind()
+        });
+        Python::attach(|py| {
+            let array = array.bind(py);
+            array
+                .resize(1)
+                .expect("the deferred release ran when this thread attached");
         });
     }
 }
