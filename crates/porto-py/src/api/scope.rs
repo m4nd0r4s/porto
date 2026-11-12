@@ -918,6 +918,10 @@ impl Scope {
         let absorbed = !exc.is_none() && exc.is_instance_of::<Cancelled>() && reason.is_some();
         let child_absorbed = node.is_some_and(|node| node.lock_state().cancel_absorbed);
         let caught = absorbed || child_absorbed;
+        if absorbed {
+            // The cancellation this task was delivered ends here, as it should (15 C11).
+            step::note_cancel_absorbed();
+        }
         // The deadline timed the block out only if it cut it short: nothing came out of it, or
         // the `Cancelled` it caused did. Any other exception leaving the block (a cleanup bug
         // after the `Cancelled`, `KeyboardInterrupt`) is the body's own and goes on, as C4 says,

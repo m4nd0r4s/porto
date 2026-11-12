@@ -45,6 +45,9 @@ const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 thread_local! {
     /// Whether this thread is running a Python lane (inside [`run`]).
     static ON_PYTHON_LANE: Cell<bool> = const { Cell::new(false) };
+    /// Whether the run on this thread is in debug mode (`RuntimeConfig.debug`): read only by
+    /// the cold paths that report mistakes (a swallowed `Cancelled`, 15 C11).
+    static DEBUG: Cell<bool> = const { Cell::new(false) };
     /// What the run on this thread keeps (see the module docs).
     static LANE: RefCell<LaneState> = RefCell::new(LaneState::default());
 }
@@ -118,7 +121,7 @@ pub(crate) fn run<T>(
         .driver(open_driver(py, config)?)
         .build();
     let output = {
-        let _lane = OnPythonLane::enter();
+        let _lane = OnPythonLane::enter(config.debug());
         body(&runtime)
     };
     drop(runtime);
@@ -158,6 +161,11 @@ fn open_driver(py: Python<'_>, config: &RuntimeConfig) -> PyResult<Arc<MioDriver
         PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &message, 1)?;
     }
     Ok(Arc::new(driver))
+}
+
+/// Whether the run on this thread is in debug mode.
+pub(crate) fn debug() -> bool {
+    DEBUG.get()
 }
 
 /// Whether this thread is running a Python lane.
@@ -309,8 +317,9 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
 struct OnPythonLane;
 
 impl OnPythonLane {
-    fn enter() -> Self {
+    fn enter(debug: bool) -> Self {
         ON_PYTHON_LANE.set(true);
+        DEBUG.set(debug);
         Self
     }
 }
@@ -318,6 +327,7 @@ impl OnPythonLane {
 impl Drop for OnPythonLane {
     fn drop(&mut self) {
         ON_PYTHON_LANE.set(false);
+        DEBUG.set(false);
     }
 }
 

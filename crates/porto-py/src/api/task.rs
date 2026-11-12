@@ -107,6 +107,10 @@ pub struct Task {
     /// implicit scope yet (a task that entered no scope): then it is the task's own cancel
     /// scope, and one the task makes once it first enters a scope is cancelled at once.
     cancel_requested: AtomicBool,
+    /// Debug mode only: a `porto.Cancelled` was thrown into the task and no scope exit absorbed
+    /// one since (15 C11). Still set when the task returns normally, the cancellation was
+    /// swallowed. Written by the task's own lane at its cold paths, read when it ends.
+    cancel_delivered: AtomicBool,
 }
 
 impl Task {
@@ -124,7 +128,21 @@ impl Task {
             label,
             pinned,
             cancel_requested: AtomicBool::new(false),
+            cancel_delivered: AtomicBool::new(false),
         }
+    }
+
+    /// Records (debug mode) that a `Cancelled` was delivered to the task, or that a scope exit
+    /// absorbed one (`delivered = false`).
+    #[inline]
+    pub(crate) fn set_cancel_delivered(&self, delivered: bool) {
+        self.cancel_delivered.store(delivered, Ordering::Relaxed);
+    }
+
+    /// Whether a delivered `Cancelled` is still unabsorbed (always false outside debug mode).
+    #[inline]
+    pub(crate) fn cancel_delivered(&self) -> bool {
+        self.cancel_delivered.load(Ordering::Relaxed)
     }
 
     /// Whether the task ended (its outcome is stored, or the task was freed unfinished), for

@@ -25,8 +25,8 @@ static RESOLVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 /// for an invalid value.
 ///
 /// The M1 single-lane runtime uses `io_backend`, `io_backend_strict`, `timer_resolution`,
-/// `coop_budget` and `cancel_timeout` (how long `porto.run` waits for the root scope's tasks,
-/// C12) only; the other fields are checked (in Python) and not carried yet.
+/// `coop_budget`, `cancel_timeout` (how long `porto.run` waits for the root scope's tasks,
+/// C12) and `debug` (the swallowed-`Cancelled` warning, C11) only; the other fields are checked (in Python) and not carried yet.
 pub(crate) fn resolve(
     py: Python<'_>,
     config: Option<&Bound<'_, PyAny>>,
@@ -70,7 +70,9 @@ pub(crate) fn resolve(
     let io_backend_strict: bool = resolved
         .getattr(pyo3::intern!(py, "io_backend_strict"))?
         .extract()?;
+    let debug: bool = resolved.getattr(pyo3::intern!(py, "debug"))?.extract()?;
     RuntimeConfig::builder()
+        .debug(debug)
         .io_backend(io_backend)
         .io_backend_strict(io_backend_strict)
         .timer_resolution(Duration::from_secs_f64(timer_resolution))

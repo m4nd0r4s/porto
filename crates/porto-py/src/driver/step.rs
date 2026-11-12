@@ -53,7 +53,9 @@ use std::task::{Context, Poll, Waker};
 use porto_core::coop;
 use porto_core::scope::{CancelReason, TaskEnd, TaskScope};
 use porto_core::task::{Header, TaskFlags};
-use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyStopIteration, PyTypeError};
+use pyo3::exceptions::{
+    PyBaseException, PyRuntimeError, PyRuntimeWarning, PyStopIteration, PyTypeError,
+};
 use pyo3::prelude::*;
 use pyo3::{ffi, intern};
 
@@ -427,6 +429,63 @@ fn cancelled_exception(py: Python<'_>, scope: &PyScopeNode) -> Py<PyBaseExceptio
     cancelled_with(py, why)
 }
 
+/// Debug mode (15 C11): remembers that the running task is being delivered a `Cancelled`, so
+/// that one that goes on to return normally can be reported as having swallowed it
+/// ([`warn_if_swallowed`]). Costs a thread-local read on this cold path, and nothing when no
+/// `Cancelled` is raised.
+fn note_cancel_delivered(py: Python<'_>) {
+    if !lane::debug() {
+        return;
+    }
+    // A task with no handle gets one (the handle holds the flag).
+    if let Ok(Some(handle)) = current_task(py) {
+        handle.get().set_cancel_delivered(true);
+    }
+}
+
+/// Debug mode (15 C11): a scope exit absorbed a `Cancelled` in the running task, which is how a
+/// delivered cancellation is meant to end: not swallowed.
+pub(crate) fn note_cancel_absorbed() {
+    if !lane::debug() {
+        return;
+    }
+    let Some(running) = running() else {
+        return;
+    };
+    let task = running.task_state.get();
+    // SAFETY: non-null points at the `Task` behind the running task's handle, which the body
+    // (or `made_handle`) holds for the whole poll.
+    if let Some(task) = unsafe { task.as_ref() } {
+        task.set_cancel_delivered(false);
+    }
+}
+
+/// Debug mode (15 C11): the task returned normally, and its handle says a `Cancelled` was
+/// delivered to it and no scope absorbed one since: it caught the cancellation and carried on,
+/// which asks for it to be raised again. Warns once, as the task ends.
+fn warn_if_swallowed(py: Python<'_>, task: &PyTask) {
+    let Some(handle) = task.py_handle.as_ref() else {
+        return;
+    };
+    if !handle.get().cancel_delivered() {
+        return;
+    }
+    let name = handle
+        .bind(py)
+        .repr()
+        .map_or_else(|_| "a task".to_owned(), |name| name.to_string());
+    let message = std::ffi::CString::new(format!(
+        "porto: cancellation was swallowed: {name} caught porto.Cancelled and finished normally \
+         while its scope was cancelled (15 C11); let the Cancelled propagate, or raise it again \
+         after the cleanup: the cancelled scope absorbs it at its `async with` exit"
+    ))
+    .expect("the warning has no NUL byte");
+    if let Err(error) = PyErr::warn(py, &py.get_type::<PyRuntimeWarning>(), &message, 1) {
+        // Warnings turned into errors: nobody to raise it to from here.
+        error.write_unraisable(py, None);
+    }
+}
+
 const TASK_CANCELLED: &str = "Task.cancel() was called on it";
 
 /// The `Cancelled` delivered to a task that `Task.cancel()` reached while it has no implicit
@@ -436,6 +495,7 @@ fn task_cancelled_exception(py: Python<'_>) -> Py<PyBaseException> {
 }
 
 fn cancelled_with(py: Python<'_>, why: &str) -> Py<PyBaseException> {
+    note_cancel_delivered(py);
     Cancelled::new_err(format!(
         "porto: the task was cancelled: {why}; let the Cancelled propagate (the cancelled scope \
          absorbs it at its `async with` exit): a task that catches it gets it again at its next \
@@ -508,6 +568,9 @@ pub(super) fn poll(
     match outcome {
         Some(outcome) => {
             let outcome = cancelled_by_its_scope(py, task, &running, outcome);
+            if matches!(outcome, TaskOutcome::Ok(_)) {
+                warn_if_swallowed(py, task);
+            }
             task.complete(py, header, outcome);
             Poll::Ready(())
         }
