@@ -582,3 +582,37 @@ def test_senders_on_several_threads_reach_every_receiver() -> None:
     assert sorted(first) == sorted(
         n * 10_000 + i for n in range(senders) for i in range(per_sender)
     )
+
+
+def test_receiver_threads_share_messages_without_leaking_references() -> None:
+    # Every receiver thread gets the same objects the sender made; once they are all gone, so
+    # are the objects (the shared messages are counted exactly, also on free-threaded builds).
+    class Payload:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+    tx, first = porto.broadcast[Payload](1024)
+    receivers = [first] + [first.clone() for _ in range(3)]
+    count = 300
+    alive: list[weakref.ref[Payload]] = []
+    results: list[list[int]] = [[] for _ in receivers]
+
+    def listen(receiver: porto.BroadcastReceiver[Payload], index: int) -> None:
+        for _ in range(count):
+            results[index].append(receiver.blocking_recv().index)
+
+    threads = [
+        threading.Thread(target=listen, args=(receiver, i)) for i, receiver in enumerate(receivers)
+    ]
+    for thread in threads:
+        thread.start()
+    for index in range(count):
+        payload = Payload(index)
+        alive.append(weakref.ref(payload))
+        tx.send(payload)
+        del payload
+    for thread in threads:
+        thread.join(30)
+    assert results == [list(range(count))] * len(receivers)
+    del tx, first, receivers, threads
+    assert all(ref() is None for ref in alive)

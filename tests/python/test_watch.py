@@ -509,3 +509,38 @@ def test_send_and_borrow_work_from_plain_threads() -> None:
         thread.join(30)
     assert rx.borrow() in range(1, 501)
     assert rx.has_changed()
+
+
+def test_threads_borrowing_while_another_sends_never_see_a_freed_value() -> None:
+    class Payload:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+    tx, rx = porto.watch[Payload](Payload(0))
+    stop = threading.Event()
+    errors: list[BaseException] = []
+    alive: list[weakref.ref[Payload]] = []
+
+    def read(receiver: porto.WatchReceiver[Payload]) -> None:
+        reader = receiver.clone()
+        try:
+            while not stop.is_set():
+                assert reader.borrow().index >= 0
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=read, args=(rx,)) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for index in range(1, 2000):
+        payload = Payload(index)
+        alive.append(weakref.ref(payload))
+        tx.send(payload)
+        del payload
+    stop.set()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    assert rx.borrow().index == 1999
+    del tx, rx, threads
+    assert all(ref() is None for ref in alive)
