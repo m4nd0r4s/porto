@@ -1517,6 +1517,12 @@ class _JoinTarget(Generic[_T_co]):
     def steps(self) -> int:
         """How many times the driver resumed the coroutine; read it from another task."""
 
+    @property
+    def timing(self) -> tuple[int, int, int] | None:
+        """``(first_poll_ns, total_poll_ns, last_step_start_ns)`` of the task's steps if the run has
+        introspection on (``debug=True``) and the task ran a step, else ``None``; read it from
+        another task."""
+
 @final
 class _TaskToken:
     """Test hook: the task that called ``_current_task_token``."""

@@ -161,6 +161,12 @@ impl RuntimeConfig {
         self.slow_step_threshold
     }
 
+    /// Whether the runtime's tasks record their timing (`23-observability.md` §1): on in debug
+    /// mode and with a console, the two consumers of it until `porto.inspect` (M5).
+    pub fn introspection(&self) -> bool {
+        self.debug || self.console.is_some()
+    }
+
     /// The `host:port` the console listens on, if any (`23-observability.md`).
     pub fn console(&self) -> Option<&str> {
         self.console.as_deref()

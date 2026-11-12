@@ -9,7 +9,7 @@ Every task (Rust and Python) is linked into a per-lane intrusive list on spawn a
 
 A snapshot is a request posted to every lane's deferred-work inbox (the same inbox `Handle::defer` uses): the lane copies its list at its next maintenance tick (≤ `event_interval` tasks), or immediately if it is idle (the request wakes it), and the requester waits for each lane's copy. On a lane's own thread the lane's copy is taken at once. Deterministic and cheap; a snapshot is exactly the set of tasks that were live (linked, not complete) when the lane copied, plus the injector's. The raw record is `TaskRecord { id, kind, state, type_name, flags, owner_lane, scope_id, cancel_requested }`; `porto.inspect` (M5) shapes it into `TaskInfo`.
 
-The **introspection switch** (`Builder::introspection`, off by default) turns on the per-task timing fields of 11 §2 (`first_poll`, `total_poll_ns`, `last_step_start`): they need a clock read per step, so with the switch off the hot path reads no clock. The registry and its snapshots work either way.
+The **introspection switch** (`Builder::introspection`, off by default; the Python runtime turns it on in debug mode and with a `console`) turns on the per-task timing fields of 11 §2 (`first_poll`, `total_poll_ns`, `last_step_start`): they need a clock read per step, so with the switch off the hot path reads no clock. The registry and its snapshots work either way.
 
 The lane's own code can also walk its list (`Handle::with_live_tasks`): `Scope.tasks` is derived that way (15, 20), so a scope keeps no list of its own tasks.
 

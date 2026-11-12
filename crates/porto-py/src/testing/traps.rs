@@ -160,6 +160,22 @@ impl JoinTarget {
         // keeps the body alive.
         Ok(unsafe { PyTask::steps(self.task.body()) })
     }
+
+    /// What the task recorded of its steps, as `(first_poll_ns, total_poll_ns,
+    /// last_step_start_ns)`, if the run has introspection on (`debug=True`) and the task ran a
+    /// step; `None` otherwise. Read it from another task of the same run.
+    #[getter]
+    fn timing(&self) -> PyResult<Option<(u64, u64, u64)>> {
+        if !lane::is_active() || step::is_running(self.task.header()) {
+            return Err(PyRuntimeError::new_err(
+                "porto: _JoinTarget.timing must be read from another task of the run the target \
+                 belongs to",
+            ));
+        }
+        // SAFETY: as for `steps`.
+        let timing = unsafe { PyTask::timing(self.task.body()) };
+        Ok(timing.map(|t| (t.first_poll_ns, t.total_poll_ns, t.last_step_start_ns)))
+    }
 }
 
 /// Starts `coro` as a task on the running runtime and returns a handle to join it. Nothing

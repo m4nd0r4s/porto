@@ -648,6 +648,8 @@ fn step_until_wait(
 ) -> Option<TaskOutcome> {
     let py = coro.py();
     let budget = &running.budget;
+    // Introspection records each step's timing; off, the loop reads no clock (spec 23 §1).
+    let timed = lane::any_introspection();
     loop {
         if task.is_waiting() {
             if budget.get() == 0 {
@@ -680,12 +682,16 @@ fn step_until_wait(
             return None;
         }
         budget.set(budget.get() - 1);
-        task.stats.steps = task.stats.steps.wrapping_add(1);
+        task.steps = task.steps.wrapping_add(1);
         let resume_with = task.take_resume(py);
         // The coroutine's Python code reaches the cancel stack through `RUNNING` (scopes it
         // enters and exits), not through the task, which this loop holds.
         running.stack.replace(task.take_cancel_stack());
+        let started = timed.then(|| task.step_started());
         let stepped = resume(coro, resume_with);
+        if let Some(started) = started {
+            task.step_ended(started);
+        }
         task.put_cancel_stack(running.stack.take());
         let yielded = match stepped {
             Stepped::Finished(outcome) => return Some(outcome),

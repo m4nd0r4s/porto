@@ -8,8 +8,8 @@
 //!
 //! # Layout (25-cpython-integration-and-memory.md §5)
 //!
-//! The body is 64 bytes plus the two nodes it embeds for its one wait at a time: a
-//! [`TaskTimer`] (56 B) and a [`WaitNode`] (48 B), 168 bytes in all (192 allowed). To fit, the
+//! The body is 72 bytes plus the two nodes it embeds for its one wait at a time: a
+//! [`TaskTimer`] (56 B) and a [`WaitNode`] (48 B), 176 bytes in all (192 allowed). To fit, the
 //! small enums are stored as a one-byte kind next to a one-word payload, and read back through
 //! [`PyTask::take_resume`], [`PyTask::poll_pending`] (`wait.rs`) and [`PyTask::outcome`]:
 //!
@@ -150,6 +150,9 @@ pub(crate) struct PyTask {
     cancel_scope: Option<PyScopeRef>,
     /// Who waits for the task to finish. Closed once the outcome is in `slot`.
     join: JoinWaiters,
+    /// What the task recorded of its steps while introspection was on (`TaskStats`), null until
+    /// its first timed step. The one pointer a task pays for it when the switch is off.
+    timing: Option<Box<TaskTiming>>,
     /// The `porto.Task` of this task, if it has one: `Scope.spawn` makes it with the task, and
     /// `current_task()` makes one for a task that has none (an internal spawn creates none:
     /// spec 11 §7). It holds the handle strongly while the task lives and gives it its
@@ -157,7 +160,9 @@ pub(crate) struct PyTask {
     /// the two are no cycle: a task parked forever that nothing can wake is freed with its
     /// runtime, and the handle learns it (see `Drop`).
     pub(super) py_handle: Option<Py<Task>>,
-    pub(super) stats: TaskStats,
+    /// Coroutine resumes (`send` or `throw`) so far: `TaskStats::steps`, which sits here and not in
+    /// a struct of its own so it fills the padding the one-byte fields leave.
+    pub(super) steps: u32,
     slot_kind: SlotKind,
     pub(super) pending_kind: Kind,
     /// Who else keeps the task's waker for its current wait: the lane, its innermost scope
@@ -173,13 +178,28 @@ pub(crate) struct PyTask {
     _pinned: PhantomPinned,
 }
 
-/// Per-task counters for introspection (spec 11 §2, `TaskStats`). Timing (first poll, total
-/// poll time, step start) needs a clock read per step, which the hot path cannot afford: it
-/// arrives with the task registry, behind its switch (porto-szb.24).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TaskStats {
-    /// Coroutine resumes (`send` or `throw`) so far.
-    pub(crate) steps: u32,
+/// Per-task counters for introspection (spec 11 §2, `TaskStats`). The step count (`PyTask::steps`)
+/// is free; the timing (first poll, total poll time, step start) needs a clock read per step, which
+/// the hot path cannot afford, so it is kept only while the registry's introspection switch is on
+/// (`Builder::introspection`, spec 23 §1): in a record allocated at the task's first timed step. A
+/// task of a run with the switch off carries one null pointer and reads no clock.
+/// What a task records of its steps while introspection is on, in nanoseconds on a monotonic
+/// clock (`clock_ns`); 0 means "never".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TaskTiming {
+    /// When its first step started.
+    pub(crate) first_poll_ns: u64,
+    /// Time spent inside steps, summed.
+    pub(crate) total_poll_ns: u64,
+    /// When its latest step started.
+    pub(crate) last_step_start_ns: u64,
+}
+
+/// Nanoseconds since the process's first timed step, plus one so a reading is never 0.
+pub(crate) fn clock_ns() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = ORIGIN.get_or_init(std::time::Instant::now).elapsed();
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX - 1) + 1
 }
 
 /// The body's size without the nodes it embeds.
@@ -187,10 +207,10 @@ const BODY_WITHOUT_NODES: usize =
     size_of::<PyTask>() - size_of::<TaskTimer>() - size_of::<WaitNode>();
 
 // ADR-034, 25 §5: the body is at most 192 bytes including its embedded timer entry and wait
-// node; the rest is held to 64 bytes.
+// node; the rest is held to 72 bytes: 64 and the pointer to the timing record (`TaskStats`).
 const _: () = assert!(
-    BODY_WITHOUT_NODES <= 64,
-    "PyTask body over 64 bytes without its nodes"
+    BODY_WITHOUT_NODES <= 72,
+    "PyTask body over 72 bytes without its nodes"
 );
 const _: () = assert!(
     size_of::<PyTask>() <= 192,
@@ -354,7 +374,8 @@ pub(crate) fn spawn_in_context(
         cancel_scope: None,
         join: JoinWaiters::new(),
         py_handle,
-        stats: TaskStats::default(),
+        steps: 0,
+        timing: None,
         slot_kind: SlotKind::ResumeNone,
         pending_kind: Kind::None,
         wait_links: 0,
@@ -485,14 +506,47 @@ impl PyTask {
         }
     }
 
-    /// The steps the task ran so far (`TaskStats::steps`).
+    /// A step is about to start, with introspection on: records it, and returns the clock reading
+    /// the matching [`PyTask::step_ended`] needs.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn step_started(&mut self) -> u64 {
+        let now = clock_ns();
+        let timing = self.timing.get_or_insert_with(Box::default);
+        if timing.first_poll_ns == 0 {
+            timing.first_poll_ns = now;
+        }
+        timing.last_step_start_ns = now;
+        now
+    }
+
+    /// The step that [`PyTask::step_started`] returned `started` for ended.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn step_ended(&mut self, started: u64) {
+        let elapsed = clock_ns().saturating_sub(started);
+        if let Some(timing) = self.timing.as_mut() {
+            timing.total_poll_ns = timing.total_poll_ns.saturating_add(elapsed);
+        }
+    }
+
+    /// What the task recorded of its steps, if it did (introspection was on).
+    ///
+    /// # Safety
+    /// As for [`PyTask::steps`].
+    pub(crate) unsafe fn timing(task: NonNull<Self>) -> Option<TaskTiming> {
+        // SAFETY: the caller's contract; the field is read alone, not through a `&PyTask`.
+        unsafe { (*task.as_ptr()).timing.as_deref().copied() }
+    }
+
+    /// The steps the task ran so far.
     ///
     /// # Safety
     /// `task` points at a live body that is not being polled (read from its lane, between its
     /// polls).
     pub(crate) unsafe fn steps(task: NonNull<Self>) -> u32 {
         // SAFETY: the caller's contract; the field is read alone, not through a `&PyTask`.
-        unsafe { (*task.as_ptr()).stats.steps }
+        unsafe { (*task.as_ptr()).steps }
     }
 
     /// The task's joiners.

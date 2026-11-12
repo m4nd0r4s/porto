@@ -48,6 +48,9 @@ const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 /// How many runs in the process are in debug mode.
 static DEBUG_RUNS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many runs in the process have the introspection switch on (tasks record their timing).
+static INTROSPECTION_RUNS: AtomicUsize = AtomicUsize::new(0);
+
 thread_local! {
     /// Whether this thread is running a Python lane (inside [`run`]).
     static ON_PYTHON_LANE: Cell<bool> = const { Cell::new(false) };
@@ -128,9 +131,10 @@ pub(crate) fn run<T>(
         .blocking_keepalive(config.blocking_keepalive())
         .blocking_hooks(PythonWorkers::of_current_interpreter(py))
         .driver(open_driver(py, config)?)
+        .introspection(config.introspection())
         .build();
     let output = {
-        let _lane = OnPythonLane::enter(config.debug());
+        let _lane = OnPythonLane::enter(config.debug(), config.introspection());
         body(&runtime)
     };
     drop(runtime);
@@ -181,6 +185,14 @@ pub(crate) fn debug() -> bool {
 #[inline]
 pub(crate) fn any_debug() -> bool {
     DEBUG_RUNS.load(Ordering::Relaxed) != 0
+}
+
+/// Whether any run in the process has introspection on: one relaxed load per poll, which is all
+/// the hot path pays for the timing a step records only then (spec 23 §1). A run with it off
+/// whose tasks a run with it on shares a process with times its steps too: harmless.
+#[inline]
+pub(crate) fn any_introspection() -> bool {
+    INTROSPECTION_RUNS.load(Ordering::Relaxed) != 0
 }
 
 /// Whether this thread is running a Python lane.
@@ -294,16 +306,23 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
 /// Marks this thread as a Python lane until dropped.
 struct OnPythonLane {
     debug: bool,
+    introspection: bool,
 }
 
 impl OnPythonLane {
-    fn enter(debug: bool) -> Self {
+    fn enter(debug: bool, introspection: bool) -> Self {
         ON_PYTHON_LANE.set(true);
         DEBUG.set(debug);
         if debug {
             DEBUG_RUNS.fetch_add(1, Ordering::Relaxed);
         }
-        Self { debug }
+        if introspection {
+            INTROSPECTION_RUNS.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            debug,
+            introspection,
+        }
     }
 }
 
@@ -313,6 +332,9 @@ impl Drop for OnPythonLane {
         DEBUG.set(false);
         if self.debug {
             DEBUG_RUNS.fetch_sub(1, Ordering::Relaxed);
+        }
+        if self.introspection {
+            INTROSPECTION_RUNS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
