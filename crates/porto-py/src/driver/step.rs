@@ -47,7 +47,7 @@
 //! [`exit_cancel_scope`]) while the loop holds the task.
 
 use std::cell::Cell;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker};
 
 use porto_core::coop;
@@ -159,7 +159,16 @@ pub(crate) fn current_task(py: Python<'_>) -> PyResult<Option<Py<Task>>> {
     // for that whole time (the run reference).
     let header = unsafe { &*running.header };
     let handle = Py::new(py, Task::new(None, header.flags().contains(TaskFlags::PIN)))?;
-    handle.get().bind_header(header);
+    // The task's pointer with the provenance of its allocation is the data of its waker (the
+    // `&Header` `poll` got is only a borrow of the header).
+    // SAFETY: `poll` borrows the waker for as long as it publishes `Running`; its data is the
+    // header pointer of the task being polled, which is alive for the whole poll.
+    let ptr = unsafe { &*running.waker }
+        .data()
+        .cast::<Header>()
+        .cast_mut();
+    // SAFETY: a task waker's data is never null, and it has the provenance of the allocation.
+    unsafe { handle.get().bind_ptr(NonNull::new_unchecked(ptr)) };
     running.handle.set(handle.as_ptr());
     running.task_state.set(ptr::from_ref(handle.get()));
     running.made_handle.set(Some(handle.clone_ref(py)));
@@ -208,7 +217,10 @@ pub(crate) fn move_running_task(hidden: &PyScopeRef, target: &PyScopeRef) -> PyR
              until start() returns",
         )
     })?;
-    hidden.adopt(target);
+    // Once only: `Started.set` is called once. A hidden scope with no parent (the caller was in
+    // no scope) gets its first one, so `target`'s cancel, deadline and shield reach the task.
+    let adopted = hidden.adopt(target);
+    debug_assert!(adopted, "a hidden scope is adopted once");
     // SAFETY: as above.
     let hidden_count = unsafe { header.replace_scope(counted) };
     if let Some(hidden_count) = hidden_count {
@@ -505,8 +517,13 @@ pub(super) fn poll(
 
 /// `outcome`, or `Cancelled` if it is a `porto.Cancelled` raised while the task's scope is
 /// cancelling: the cancellation ended the task, which did not fail (spec 11 §4). The scope
-/// whose cancel that was learns it absorbed one (C3, `cancelled_caught`): the one the walk
-/// reaches first, so an enclosing scope's cancel counts for the enclosing scope, as in Trio.
+/// whose cancel that was learns it absorbed one (C3, `cancelled_caught`): an enclosing scope's
+/// cancel counts for the enclosing scope, never for the nested one the task ran in, and the
+/// task's own scope (`Task.cancel()`, spec 15 §4) is such a nested one: while the scope the task
+/// was spawned into, or one around it, is cancelled too (a deadline, `Scope.cancel()`), that
+/// scope absorbs the `Cancelled`, so its `cancelled_caught` and its `TimeoutError` are not lost
+/// to a `Task.cancel()` that came in the meantime. Only a `Task.cancel()` alone leaves every
+/// scope's flags alone.
 fn cancelled_by_its_scope(
     py: Python<'_>,
     task: &PyTask,
@@ -514,24 +531,27 @@ fn cancelled_by_its_scope(
     outcome: TaskOutcome,
 ) -> TaskOutcome {
     match outcome {
-        // `Task.cancel()` with no implicit scope: the task's own scope is the first the walk
-        // reaches, so no scope absorbed anything.
-        TaskOutcome::Err(exception)
-            if exception.bind(py).is_instance_of::<Cancelled>()
-                && task_cancel_requested(running)
-                && !task.has_shield() =>
-        {
-            TaskOutcome::Cancelled(Some(exception))
-        }
         TaskOutcome::Err(exception) if exception.bind(py).is_instance_of::<Cancelled>() => {
-            let cause = task
+            let own = task_cancel_requested(running) && !task.has_shield();
+            let found = task
                 .innermost_scope()
                 .and_then(|scope| scope.effective_cancellation());
+            let task_scope_cancelled = found.is_some();
+            // The implicit scope, once made, is where the walk starts: look past it.
+            let cause = match found {
+                Some(found) if found.reason == CancelReason::TaskCancelled => found
+                    .scope
+                    .parent()
+                    .and_then(|parent| parent.effective_cancellation()),
+                other => other,
+            };
             match cause {
                 Some(cause) => {
                     cause.scope.lock_state().cancel_absorbed = true;
                     TaskOutcome::Cancelled(Some(exception))
                 }
+                // `Task.cancel()` alone (with no implicit scope, the flag; with one, its cancel).
+                None if own || task_scope_cancelled => TaskOutcome::Cancelled(Some(exception)),
                 None => TaskOutcome::Err(exception),
             }
         }

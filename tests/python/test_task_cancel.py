@@ -347,3 +347,60 @@ def test_a_task_cancelled_inside_a_nested_scope_does_not_cancel_the_scope_it_was
             return outer.cancel_called, victim.cancelled() and other.result() == 2
 
     assert porto.run(main) == (False, True)
+
+
+def test_a_task_cancel_during_a_deadline_does_not_lose_the_scopes_timeout() -> None:
+    # The deadline cancelled the scope and raised Cancelled in the child; the child's cleanup
+    # calls Task.cancel() before the Cancelled ends it. The scope's cancel caused the
+    # Cancelled (C3), so the scope still absorbs it and raises TimeoutError.
+    async def child() -> None:
+        try:
+            await porto.sleep_forever()
+        except porto.Cancelled:
+            porto.current_task().cancel()
+            raise
+
+    async def main() -> None:
+        async with porto.timeout(0.02) as limited:
+            limited.spawn(child)
+        raise AssertionError("unreachable")
+
+    with pytest.raises(TimeoutError):
+        porto.run(main)
+
+
+def test_a_task_cancel_during_a_deadline_does_not_lose_it_when_the_task_entered_a_scope() -> None:
+    # The same with the task's implicit scope made (it entered a scope first).
+    async def child() -> None:
+        async with porto.scope():
+            try:
+                await porto.sleep_forever()
+            except porto.Cancelled:
+                porto.current_task().cancel()
+                raise
+
+    async def main() -> None:
+        async with porto.timeout(0.02) as limited:
+            limited.spawn(child)
+        raise AssertionError("unreachable")
+
+    with pytest.raises(TimeoutError):
+        porto.run(main)
+
+
+def test_a_task_cancel_during_scope_cancel_keeps_cancelled_caught() -> None:
+    async def child() -> None:
+        try:
+            await porto.sleep_forever()
+        except porto.Cancelled:
+            porto.current_task().cancel()
+            raise
+
+    async def main() -> bool:
+        async with porto.scope() as s:
+            s.spawn(child)
+            await settle()
+            s.cancel()
+        return s.cancelled_caught
+
+    assert porto.run(main) is True

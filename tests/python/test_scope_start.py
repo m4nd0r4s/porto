@@ -11,6 +11,7 @@ import contextvars
 import pytest
 
 import porto
+from porto._core import _spawn as _core_spawn  # pyright: ignore[reportPrivateUsage]
 
 
 async def server(port: int, *, started: porto.Started[int]) -> None:
@@ -283,6 +284,35 @@ def test_the_started_task_runs_in_a_copy_of_the_callers_context() -> None:
             return await s.start(reads)
 
     assert porto.run(main) == "callers"
+
+
+def test_a_task_in_no_scope_can_start_into_a_scope_and_that_scope_then_reaches_it() -> None:
+    # The caller is an internal task that entered no scope: the hidden scope has no parent
+    # until `set` gives it the scope `start` was called on.
+    cancelled: list[str] = []
+    started_value: list[int] = []
+
+    async def parked(*, started: porto.Started[int]) -> None:
+        started.set(5)
+        try:
+            await porto.sleep_forever()
+        except porto.Cancelled:
+            cancelled.append("by its scope")
+            raise
+
+    async def internal(s: porto.Scope) -> None:
+        started_value.append(await s.start(parked))
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            _core_spawn(internal(s))
+            for _ in range(5):
+                await porto.checkpoint()
+            assert started_value == [5]
+            s.cancel()
+
+    porto.run(main)
+    assert cancelled == ["by its scope"]
 
 
 # What a user can get wrong ---------------------------------------------------------------------

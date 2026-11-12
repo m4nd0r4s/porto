@@ -580,7 +580,7 @@ mod adoption {
     }
 
     #[test]
-    fn a_scope_is_adopted_once_and_a_root_never() {
+    fn a_scope_is_adopted_once_and_a_root_gets_its_first_parent() {
         let root = Scope::new_root(0);
         let first = child(&root);
         let second = child(&root);
@@ -588,7 +588,26 @@ mod adoption {
         assert!(hidden.adopt(&first));
         assert!(!hidden.adopt(&second), "adopted already");
         assert_eq!(hidden.parent().unwrap().id(), first.id());
-        assert!(!root.adopt(&first), "a root has no parent to replace");
+        let lone = Scope::new_root(0);
+        let (woken, waker) = counting_waker();
+        assert!(!lone.register_waiter(1, &waker));
+        assert!(
+            lone.adopt(&first),
+            "a root has no old parent to leave, and gets a new one"
+        );
+        assert_eq!(lone.parent().unwrap().id(), first.id());
+        assert!(!cancelled(&lone));
+        assert!(first.cancel(CancelReason::Explicit));
+        assert!(cancelled(&lone));
+        assert_eq!(woken.0.load(Ordering::Relaxed), 1);
+        lone.unregister_waiter(1);
+        drop(lone);
+        assert!(
+            !first.lock_state().child_scopes_is_empty(),
+            "hidden is still adopted"
+        );
+        drop(hidden);
+        assert!(first.lock_state().child_scopes_is_empty());
     }
 
     #[test]

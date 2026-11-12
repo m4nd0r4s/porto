@@ -553,3 +553,131 @@ fn adopt_vs_the_scopes_drop() {
         assert!(new.lock_state().child_scopes_is_empty());
     });
 }
+
+/// What `Task::install_implicit` and `Task::cancel` (porto-py) do about a task's implicit
+/// scope, with the same primitives: the task makes its scope and publishes it under the lock,
+/// then reads the cancel flag; `cancel` stores the flag under the lock, then reads the scope.
+/// Whichever is second sees the other, so the scope is cancelled either way and the cancel is
+/// never lost.
+#[test]
+fn install_implicit_scope_vs_task_cancel() {
+    use loom::sync::Mutex;
+    use loom::sync::atomic::{AtomicBool, Ordering};
+
+    loom::model(|| {
+        let base = Scope::new_root(0);
+        let shared = Arc::new((Mutex::new(None::<Arc<Scope>>), AtomicBool::new(false)));
+        let canceller = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let implicit = {
+                    let published = shared.0.lock().unwrap();
+                    shared.1.store(true, Ordering::SeqCst);
+                    published.clone()
+                };
+                if let Some(scope) = implicit {
+                    scope.cancel(CancelReason::TaskCancelled);
+                }
+            })
+        };
+
+        let scope = ScopeNode::new_child(&base, 1, false);
+        let requested = {
+            let mut published = shared.0.lock().unwrap();
+            *published = Some(Arc::clone(&scope));
+            shared.1.load(Ordering::SeqCst)
+        };
+        if requested {
+            scope.cancel(CancelReason::TaskCancelled);
+        }
+
+        canceller.join().unwrap();
+        assert_eq!(scope.cancel_called(), Some(CancelReason::TaskCancelled));
+        assert!(!base.is_cancelled(), "only the task's own scope");
+    });
+}
+
+/// A scope is adopted while a shield on its old parent (or its new one) is removed: whatever
+/// the interleaving, it ends up cancelled through the new parent (the root is cancelled), and
+/// its waiter was woken, by the unshield or by the adoption: never neither.
+fn adopt_vs_unshield(shield_old: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    loom::model(move || {
+        let root = Scope::new_root(0);
+        assert!(root.cancel(CancelReason::Explicit));
+        let old = ScopeNode::new_child(&root, 1, shield_old);
+        let new = ScopeNode::new_child(&root, 1, !shield_old);
+        let hidden = ScopeNode::new_child(&old, 1, false);
+        let wakes = std::sync::Arc::new(CountWakes(AtomicUsize::new(0)));
+        let waker = Waker::from(std::sync::Arc::clone(&wakes));
+        // The old parent shields it: not cancelled yet.
+        let before = hidden.register_waiter(1, &waker);
+        assert_eq!(before, !shield_old);
+        let unshielder = {
+            let (old, new) = (Arc::clone(&old), Arc::clone(&new));
+            thread::spawn(move || {
+                if shield_old {
+                    old.set_shield(false);
+                } else {
+                    new.set_shield(false);
+                }
+            })
+        };
+
+        assert!(hidden.adopt(&new));
+
+        unshielder.join().unwrap();
+        assert!(hidden.effective_cancellation().is_some());
+        assert!(
+            before || wakes.0.load(Ordering::SeqCst) >= 1,
+            "the waiter was never woken"
+        );
+        hidden.unregister_waiter(1);
+    });
+}
+
+#[test]
+fn adopt_vs_the_old_parents_unshield() {
+    adopt_vs_unshield(true);
+}
+
+#[test]
+fn adopt_vs_the_new_parents_unshield() {
+    adopt_vs_unshield(false);
+}
+
+/// A task's check fills the scope's cached walk result while the scope is adopted by a parent
+/// that is cancelled: the cache, filled from the old parent's walk, is never believed once the
+/// adoption bumped the generation.
+#[test]
+fn adopt_vs_the_walk_cache_refill() {
+    loom::model(|| {
+        let root = Scope::new_root(0);
+        let old = ScopeNode::new_child(&root, 1, false);
+        let new = ScopeNode::new_child(&root, 1, false);
+        assert!(new.cancel(CancelReason::Explicit));
+        let hidden = ScopeNode::new_child(&old, 1, false);
+        let checker = {
+            let hidden = Arc::clone(&hidden);
+            thread::spawn(move || hidden.is_cancelled())
+        };
+
+        assert!(hidden.adopt(&new));
+
+        checker.join().unwrap();
+        assert!(
+            hidden.is_cancelled(),
+            "a stale cached walk survived the adoption"
+        );
+    });
+}

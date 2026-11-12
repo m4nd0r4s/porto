@@ -8,6 +8,7 @@ one that runs yields a ``join`` trap.
 """
 
 import gc
+import sys
 import weakref
 from typing import Any
 
@@ -402,6 +403,45 @@ def test_scope_spawn_creates_exactly_one_handle_per_task() -> None:
         return handles() - before
 
     assert porto.run(main) == 10
+
+
+def test_a_detached_task_that_took_a_handle_still_reports_its_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reported: list[Any] = []
+    monkeypatch.setattr(sys, "unraisablehook", reported.append)
+    kept: list[porto.Task[None]] = []
+
+    async def internal() -> None:
+        kept.append(porto.current_task())
+        await porto.checkpoint()
+        raise ValueError("nobody reads the handle")
+
+    async def main() -> None:
+        _core._spawn(internal())
+        for _ in range(5):
+            await porto.checkpoint()
+
+    porto.run(main)
+    assert len(reported) == 1
+    assert isinstance(reported[0].exc_value, ValueError)
+    assert isinstance(kept[0].exception(), ValueError), "the handle has the outcome too"
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, SystemExit])
+def test_a_detached_task_that_took_a_handle_still_stops_the_run_on_an_interrupt(
+    stop: type[BaseException],
+) -> None:
+    async def internal() -> None:
+        porto.current_task()
+        raise stop()
+
+    async def main() -> None:
+        _core._spawn(internal())
+        await porto.sleep_forever()
+
+    with pytest.raises(stop):
+        porto.run(main)
 
 
 # Lifetime -----------------------------------------------------------------------------------

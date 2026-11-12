@@ -404,7 +404,7 @@ fn completion_and_idle_free_vs_scope_exit_wait() {
     });
 }
 
-/// The upgrade of a non-owning pointer to a task (`try_ref_inc`, what `TaskBodyRef::try_from_header`
+/// The upgrade of a non-owning pointer to a task (`try_ref_inc`, what `TaskBodyRef::try_from_ptr`
 /// does first) races with the drop of the last reference: either the upgrade fails because the
 /// task is being freed, or it succeeds and holds a reference of its own, so the task is freed
 /// exactly once, by whoever drops the last one.

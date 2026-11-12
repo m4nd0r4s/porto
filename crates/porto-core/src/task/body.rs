@@ -81,22 +81,30 @@ unsafe impl<B: Send> Send for TaskBodyRef<B> {}
 unsafe impl<B: Send> Sync for TaskBodyRef<B> {}
 
 impl<B: TaskBody> TaskBodyRef<B> {
-    /// A new reference to the task `header` belongs to, or `None` if it is being freed (its
-    /// last reference was dropped): the upgrade of a non-owning pointer to a task.
+    /// The task's pointer, with the provenance of the whole allocation: what a non-owning
+    /// holder keeps to [`TaskBodyRef::try_from_ptr`] it later. The count is not touched.
+    pub fn as_ptr(&self) -> NonNull<Header> {
+        self.task.raw().as_ptr()
+    }
+
+    /// A new reference to the task at `ptr`, or `None` if it is being freed (its last
+    /// reference was dropped): the upgrade of a non-owning pointer to a task.
     ///
     /// # Safety
-    /// `header` MUST be the header of a task made by [`new_body_task`]/[`new_body_task_in`]
-    /// with body type `B`, whose allocation is not freed yet: the caller keeps it from being
-    /// freed while this runs, by whatever it holds that the task's body waits for before the
-    /// allocation goes (the body's `Drop` runs before the memory is released, so a lock the
-    /// body's `Drop` takes is enough).
-    pub unsafe fn try_from_header(header: &Header) -> Option<Self> {
+    /// `ptr` MUST come from [`TaskBodyRef::as_ptr`] (or a task waker's data) of a task made by
+    /// [`new_body_task`]/[`new_body_task_in`] with body type `B`, whose allocation is not freed
+    /// yet: the caller keeps it from being freed while this runs, by whatever it holds that the
+    /// task's body waits for before the allocation goes (the body's `Drop` runs before the
+    /// memory is released, so a lock the body's `Drop` takes is enough).
+    pub unsafe fn try_from_ptr(ptr: NonNull<Header>) -> Option<Self> {
+        // SAFETY: the allocation is live (the caller's contract).
+        let header = unsafe { ptr.as_ref() };
         if !header.state.try_ref_inc() {
             return None;
         }
-        // SAFETY: the increment above made the reference the `TaskRef` takes over; the header
-        // is the first field of a task allocation that is live (the caller's contract).
-        let task = unsafe { TaskRef::from_owned(RawTask::from_raw(NonNull::from(header))) };
+        // SAFETY: the increment above made the reference the `TaskRef` takes over; `ptr` is the
+        // header pointer of a live task allocation, with its provenance.
+        let task = unsafe { TaskRef::from_owned(RawTask::from_raw(ptr)) };
         Some(Self {
             task,
             _body: PhantomData,

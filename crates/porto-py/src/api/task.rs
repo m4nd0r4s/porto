@@ -5,7 +5,7 @@
 //! holds its handle strongly (`PyTask::py_handle`) until it ends, when it hands the handle its
 //! outcome ([`Task::finish`]), while the handle holds the task *weakly*, as a pointer to its
 //! header that is upgraded to a counted reference when a method needs the task
-//! (`TaskBodyRef::try_from_header`). So no reference cycle keeps a task alive that nothing can
+//! (`TaskBodyRef::try_from_ptr`). So no reference cycle keeps a task alive that nothing can
 //! wake any more, and the handle owns the outcome (and so shows it to the cycle collector) once
 //! the task ended, however it ended.
 //!
@@ -13,7 +13,8 @@
 //! one for a task that has none, and an internal spawn (`_spawn`, the Douro request tasks) makes
 //! none. [`handles_created`] counts them, for the test that proves it.
 
-use std::ptr;
+use std::cell::Cell;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
@@ -30,8 +31,12 @@ use crate::driver::step;
 use crate::driver::trap::{Trap, TrapKind};
 use crate::errors::{InvalidStateError, NoRuntimeError};
 
-/// How many `porto.Task` objects were made in this process.
-static HANDLES_CREATED: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// How many `porto.Task` objects this thread made. Per thread, not one counter for the
+    /// process: a handle is made at every spawn, and a shared atomic would be contended once
+    /// lanes spawn in parallel (M2). Tests read it on the lane thread they run on.
+    static HANDLES_CREATED: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Adds the class and the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -53,16 +58,16 @@ fn current_task(py: Python<'_>) -> PyResult<Py<Task>> {
     })
 }
 
-/// Test hook: how many `porto.Task` objects were made so far in this process. An internal spawn
+/// Test hook: how many `porto.Task` objects the calling thread made so far. An internal spawn
 /// makes none; `Scope.spawn` makes one per task, and `current_task()` one for a task with none.
 #[pyfunction(name = "_task_handles_created")]
 fn task_handles_created() -> u64 {
     handles_created()
 }
 
-/// How many `porto.Task` objects were made so far in this process.
+/// How many `porto.Task` objects the calling thread made so far.
 pub(crate) fn handles_created() -> u64 {
-    HANDLES_CREATED.load(Ordering::Relaxed)
+    HANDLES_CREATED.get()
 }
 
 /// `Task::body` once the task ended: no pointer to follow any more, and none to set.
@@ -108,7 +113,7 @@ impl Task {
     /// A handle for a task about to be spawned, to [`bind`](Task::bind) to it. `label` is its
     /// name (a `str`), or the object it is spawned from, whose `__qualname__` names it.
     pub(crate) fn new(label: Option<Py<PyAny>>, pinned: bool) -> Self {
-        HANDLES_CREATED.fetch_add(1, Ordering::Relaxed);
+        HANDLES_CREATED.set(HANDLES_CREATED.get() + 1);
         Self {
             inner: Mutex::new(Inner {
                 outcome: None,
@@ -159,18 +164,25 @@ impl Task {
 
     /// Points the handle at its task, which was just spawned.
     pub(crate) fn bind(&self, task: &TaskBodyRef<PyTask>) {
-        self.bind_header(task.header());
+        // SAFETY: the reference keeps the task alive, and `as_ptr` is the allocation's pointer.
+        unsafe { self.bind_ptr(task.as_ptr()) };
     }
 
-    /// [`Task::bind`], from the header of a task that is alive, with its handle already known
-    /// by it (or the one polling it).
-    pub(crate) fn bind_header(&self, header: &Header) {
-        self.id.store(header.id(), Ordering::Relaxed);
+    /// [`Task::bind`], from the pointer of a task that is alive, with its handle already
+    /// known by it (or the one polling it).
+    ///
+    /// # Safety
+    /// `ptr` is a task's pointer with the provenance of its allocation (`TaskBodyRef::as_ptr`,
+    /// or the data of its waker), and the task is alive now.
+    pub(crate) unsafe fn bind_ptr(&self, ptr: NonNull<Header>) {
+        // SAFETY: the caller's contract.
+        self.id
+            .store(unsafe { ptr.as_ref() }.id(), Ordering::Relaxed);
         // A task that ended already (another lane ran it to the end before this) has told
         // the handle (`ENDED`): nothing to follow.
         let _ended = self.body.compare_exchange(
             ptr::null_mut(),
-            ptr::from_ref(header).cast_mut(),
+            ptr.as_ptr(),
             Ordering::Release,
             Ordering::Relaxed,
         );
@@ -221,7 +233,7 @@ impl Task {
         // the lock (`_locked`): the task's body ends the pointer under that lock before it is
         // freed (`Task::finish`, from `PyTask::drop`), so the allocation is still there. The
         // task is a PyTask: only `Scope.spawn` and the step driver bind a handle.
-        unsafe { TaskBodyRef::try_from_header(&*body) }
+        unsafe { TaskBodyRef::try_from_ptr(NonNull::new_unchecked(body)) }
     }
 
     /// The outcome, cloned, if the task finished.
@@ -370,8 +382,12 @@ impl Task {
     /// themselves, M2: lane 0 is the only one).
     #[getter]
     fn lane(&self) -> Option<u16> {
-        let inner = self.lock();
-        let task = self.upgrade(&inner)?;
+        let task = {
+            let inner = self.lock();
+            self.upgrade(&inner)
+        }?;
+        // The reference may be the last one (the task finished and was freed meanwhile): its
+        // drop runs `PyTask::drop`, which takes the lock, so it must not be held here.
         Some(task.header().owner_lane())
     }
 

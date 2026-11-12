@@ -167,9 +167,9 @@ fn a_non_owning_pointer_to_a_body_task_upgrades_while_a_reference_lives_and_not_
     let task = rt
         .handle()
         .spawn_body(TestBody::new(Script::Park), TaskFlags::PYTHON);
-    let header = std::ptr::NonNull::from(task.header());
+    let ptr = task.as_ptr();
     // SAFETY: `task` holds a reference, so the allocation is live.
-    let upgraded = unsafe { super::TaskBodyRef::<TestBody>::try_from_header(header.as_ref()) }
+    let upgraded = unsafe { super::TaskBodyRef::<TestBody>::try_from_ptr(ptr) }
         .expect("a task with a reference upgrades");
     assert_eq!(upgraded.id(), task.id());
     assert_eq!(

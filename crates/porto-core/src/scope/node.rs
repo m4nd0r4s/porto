@@ -494,11 +494,9 @@ impl<E> ScopeNode<E> {
     /// started task runs in until it reports is adopted by the scope it is started in.
     ///
     /// Safe from any thread. At most once: returns `false`, changing nothing, if this scope
-    /// was adopted already, or has no parent (a root).
+    /// was adopted already. A root (a scope entered by a task in no scope) can be adopted
+    /// too: it then has a parent for the first time.
     pub fn adopt(&self, new_parent: &Arc<Self>) -> bool {
-        let Some(old_parent) = &self.parent else {
-            return false;
-        };
         let published = Box::into_raw(Box::new(Arc::clone(new_parent)));
         if self
             .adopted
@@ -517,7 +515,9 @@ impl<E> ScopeNode<E> {
         // Out of the old parent's child list, then into the new one's: never in both, so
         // each list is only touched under its own lock. In between, a cancel of either parent
         // misses this scope's subtree, which the wake-up below makes up for.
-        old_parent.unlink_child(self);
+        if let Some(old_parent) = &self.parent {
+            old_parent.unlink_child(self);
+        }
         new_parent.link_child(self);
         // Everything the walk from here (or below) saw is stale: the parent changed.
         let mut wake = Vec::new();

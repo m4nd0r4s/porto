@@ -489,9 +489,12 @@ impl PyTask {
     /// thing the lane does to the body: joiners read the outcome once `join` is closed.
     pub(super) fn complete(&mut self, py: Python<'_>, header: &Header, outcome: TaskOutcome) {
         let coro = self.coro.take();
+        // A detached task has no one to raise to even if `current_task()` made it a handle:
+        // nobody reads that handle, so the failure is still reported below.
         if let Some(task) = self.py_handle.take() {
             task.get().finish(outcome.clone_ref(py));
-        } else if header.flags().contains(TaskFlags::DETACHED_DROP)
+        }
+        if header.flags().contains(TaskFlags::DETACHED_DROP)
             && let TaskOutcome::Err(exception) = &outcome
         {
             let exception = exception.clone_ref(py);
