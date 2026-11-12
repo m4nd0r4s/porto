@@ -105,9 +105,19 @@ def _module_marks(tree: ast.Module) -> list[ast.expr]:
 
 
 def _claims(nodes: list[ast.stmt], excluded: bool) -> Iterable[tuple[str, bool]]:
-    """``(function name, counts)`` for the tests in ``nodes``, classes included."""
+    """``(function name, counts)`` for the tests in ``nodes``, classes included, and those inside
+    module-level ``if``/``try``/``with`` blocks (pytest collects them too)."""
     for node in nodes:
-        if isinstance(node, ast.ClassDef):
+        if isinstance(node, ast.If):
+            yield from _claims(node.body + node.orelse, excluded)
+        elif isinstance(node, ast.Try | ast.TryStar):
+            blocks = node.body + node.orelse + node.finalbody
+            for handler in node.handlers:
+                blocks += handler.body
+            yield from _claims(blocks, excluded)
+        elif isinstance(node, ast.With | ast.AsyncWith):
+            yield from _claims(node.body, excluded)
+        elif isinstance(node, ast.ClassDef):
             yield from _claims(node.body, excluded or never_runs(node.decorator_list))
         elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             yield node.name, not (excluded or never_runs(node.decorator_list))

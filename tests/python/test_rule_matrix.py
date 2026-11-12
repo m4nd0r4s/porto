@@ -154,3 +154,20 @@ def test_a_test_that_can_run_still_counts_next_to_marked_ones(tmp_path: Path) ->
         "def test_T1_also_xfailed(): ...\n",
     )
     assert run(specs, suite, "--check", "99").returncode == 0
+
+
+def test_tests_inside_module_level_if_try_and_with_blocks_count(tmp_path: Path) -> None:
+    # pytest collects them, so a rule whose only test sits in such a block is checked.
+    specs, suite = make_tree(
+        tmp_path,
+        "import sys\n"
+        "if sys.platform != 'never':\n"
+        "    def test_R1_in_if(): ...\n"
+        "try:\n"
+        "    def test_R2_in_try(): ...\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "with open(__file__):\n"
+        "    def test_T1_in_with(): ...\n",
+    )
+    assert run(specs, suite, "--check", "99").returncode == 0

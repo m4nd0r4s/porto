@@ -24,7 +24,9 @@
 //! `lanes > 1`: `unlink` reads `home` and then locks the list it points at, so a scope freed in
 //! that window is a use after free (the list needs a counted owner, or the registry replaces
 //! it); and `PyTask::drop`, which finishes the handle, can run on a thread that is not the
-//! task's lane (a waker dropped after shutdown). The orderings below are `SeqCst` so that the
+//! task's lane (a waker dropped after shutdown) — already possible at one lane, where it is
+//! safe only because a scope is always closed (its tasks detached) before it can be freed: the
+//! real precondition of the window above is a scope freed unclosed. The orderings below are `SeqCst` so that the
 //! one store-load pattern (`register` publishes `home` then reads `ended`, `finish` publishes
 //! `ended` then reads `home`) cannot miss on both sides.
 
