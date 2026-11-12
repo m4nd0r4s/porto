@@ -3,7 +3,7 @@
 The ``check_*`` functions are only type-checked: they would need a network.
 """
 
-from typing import assert_type
+from typing import Any, assert_type
 
 import porto
 from porto import abc, net
@@ -73,3 +73,26 @@ def check_wrong_calls_are_errors(stream: net.TcpStream) -> None:
     stream.read_until(b"\n", 10)  # pyright: ignore[reportCallIssue]
     stream.read_to_end()  # pyright: ignore[reportCallIssue]
     net.listen_tcp(port="80")  # pyright: ignore[reportArgumentType, reportUnusedCoroutine]
+
+
+async def check_serve_tcp(scope: porto.Scope) -> None:
+    async def handler(stream: net.TcpStream) -> None:
+        await stream.write(await stream.readline())
+
+    async def returns_a_value(stream: net.TcpStream) -> int:
+        return len(await stream.read())
+
+    port = await scope.start(net.serve_tcp, handler, "127.0.0.1")
+    assert_type(port, Any)  # Scope.start returns what `started.set` was given
+    await net.serve_tcp(returns_a_value, max_connections=100)
+    await net.serve_tcp(handler, None, 8080, tls=None, max_connections=None, started=None)
+
+
+async def check_serve_tcp_started(started: porto.Started[int]) -> None:
+    await net.serve_tcp(lambda stream: stream.aclose(), "127.0.0.1", 0, started=started)
+
+
+async def check_serve_tcp_wrong_calls(started: porto.Started[str]) -> None:
+    await net.serve_tcp("not a handler")  # pyright: ignore[reportArgumentType]
+    await net.serve_tcp(lambda stream: stream.aclose(), max_connections="2")  # pyright: ignore[reportArgumentType]
+    await net.serve_tcp(lambda stream: stream.aclose(), started=started)  # pyright: ignore[reportArgumentType]
