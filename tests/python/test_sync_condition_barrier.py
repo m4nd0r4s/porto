@@ -229,6 +229,91 @@ def test_a_notification_whose_waiter_never_ran_leaks_nothing() -> None:
     assert not condition.locked(), "the lock leaked"
 
 
+async def wait_in_a_helper(condition: porto.Condition) -> None:
+    await condition.wait()
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["direct", "through-a-helper"])
+def test_a_waiter_freed_while_another_task_holds_the_lock_leaves_it_held(nested: bool) -> None:
+    # The run ends with a waiter parked (lock released) and main holding the lock: the freed
+    # waiter cannot take the lock back, so its `async with` exit must not release main's lock.
+    condition = porto.Condition()
+    exits: list[str] = []
+
+    async def waiter() -> None:
+        try:
+            async with condition:
+                if nested:
+                    await wait_in_a_helper(condition)
+                else:
+                    await condition.wait()
+        except BaseException as error:
+            exits.append(type(error).__name__)
+            raise
+
+    async def main() -> None:
+        _core._spawn_joinable(waiter())
+        await settle()
+        await condition.acquire()
+
+    _core._run(main())
+    assert exits == ["GeneratorExit"]
+    assert condition.locked(), "the freed waiter released a lock another task held"
+    condition.release()  # the holder's own release still works
+    assert not condition.locked()
+
+
+def test_a_waiter_freed_while_relocking_leaves_the_holders_lock_held() -> None:
+    # Notified, the waiter queues for the lock main holds; the run ends before it gets it.
+    condition = porto.Condition()
+
+    async def waiter() -> None:
+        async with condition:
+            await condition.wait()
+
+    async def main() -> None:
+        _core._spawn_joinable(waiter())
+        await settle()
+        await condition.acquire()
+        condition.notify()
+        await settle()
+
+    _core._run(main())
+    assert condition.locked(), "the freed waiter released a lock another task held"
+    condition.release()
+    assert not condition.locked()
+
+
+def test_a_waiter_freed_with_an_unobserved_relock_grant_passes_it_on_cleanly() -> None:
+    # main hands the lock to the relocking waiter, with a second task queued behind it, and the
+    # run ends before either runs: the grant goes down the queue and the lock ends free, with no
+    # release of a lock the freed waiter no longer holds.
+    condition = porto.Condition()
+
+    async def waiter() -> None:
+        async with condition:
+            await condition.wait()
+
+    async def queued() -> None:
+        async with condition:
+            pass
+
+    async def main() -> None:
+        _core._spawn_joinable(waiter())
+        await settle()
+        await condition.acquire()
+        condition.notify()
+        await settle()
+        _core._spawn_joinable(queued())
+        await settle()
+        condition.release()
+
+    _core._run(main())
+    assert not condition.locked(), "the lock leaked"
+    with pytest.raises(RuntimeError, match=r"not held"):
+        condition.release()
+
+
 def test_waiting_or_notifying_without_the_lock_raises() -> None:
     async def main() -> None:
         condition = porto.Condition()

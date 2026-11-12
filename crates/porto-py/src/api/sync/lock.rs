@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use porto_core::sync::{Mutex, MutexGuard, WaitNode};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyBaseException, PyGeneratorExit, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
@@ -367,11 +367,20 @@ pub(super) fn release(lock: &LockSource) -> PyResult<()> {
 /// The `__aexit__` of `async with lock:` (and of a `porto.Mutex`): releases the lock, then the
 /// exit's checkpoint (T2), which never holds the lock. `exc` is the exception leaving the
 /// block, if any.
+///
+/// A [`LockLost`] for `lock` leaving the block means the task does not hold the lock: the exit
+/// releases nothing and goes on as the `GeneratorExit` the close started with.
 pub(super) fn release_then_checkpoint(
     py: Python<'_>,
     lock: &LockSource,
     exc: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
+    if !exc.is_none()
+        && let Ok(lost) = exc.cast::<LockLost>()
+        && lost.get().is_for(lock)
+    {
+        return Err(PyGeneratorExit::new_err(()));
+    }
     release(lock)?;
     // An exception is in flight: no checkpoint, which could raise `Cancelled` in its place (and
     // a cancelled scope would then absorb it, losing the original error).
@@ -379,4 +388,41 @@ pub(super) fn release_then_checkpoint(
         return ready_none(py);
     }
     checkpoint_if_needed_none(py)
+}
+
+/// Raised by a `Condition.wait()` closed (its task freed) after it released the lock, when
+/// another task holds the lock and the wait cannot take it back. The lock records no holder, so
+/// the exception carries the fact to the exit that would release it: it travels up the closing
+/// coroutines (it is not a `GeneratorExit`, which a coroutine's `close()` swallows) until the
+/// `async with` exit of that lock, which releases nothing and turns it back into the
+/// `GeneratorExit` of the close. A task that releases the lock by hand instead sees it reach its
+/// `finally:` blocks; if nothing turns it back, the close reports it as unraisable.
+#[pyclass(frozen, extends = PyBaseException, module = "porto._core", name = "_LockLost")]
+pub(super) struct LockLost {
+    lock: Arc<Waitable<LockSource>>,
+}
+
+impl LockLost {
+    /// The exception for `lock`, which this task released and another task now holds.
+    pub(super) fn new_err(py: Python<'_>, lock: Arc<Waitable<LockSource>>) -> PyErr {
+        match Bound::new(py, Self { lock }) {
+            Ok(lost) => PyErr::from_value(lost.into_any()),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether it is about `lock`. The `Arc` keeps the lock alive, so its address is not reused.
+    fn is_for(&self, lock: &LockSource) -> bool {
+        std::ptr::eq(&raw const **self.lock, lock)
+    }
+}
+
+#[pymethods]
+impl LockLost {
+    fn __str__(&self) -> &'static str {
+        "porto: this task was freed (closed) while it waited in Condition.wait(), after it had \
+         released the lock, and another task holds the lock now, so the task ends without it. \
+         The `async with condition:` exit releases nothing for it; a task that releases the \
+         lock by hand MUST NOT release it in this case (use `async with condition:`)"
+    }
 }

@@ -414,6 +414,14 @@ impl Semaphore {
     }
 }
 
+#[cfg(all(test, loom))]
+impl Semaphore {
+    /// Whether [`SLOW`] is set, for the models that check it is clear once nobody waits.
+    pub(super) fn slow_flag(&self) -> bool {
+        self.queue.word().load(Ordering::Relaxed) & SLOW != 0
+    }
+}
+
 impl fmt::Debug for Semaphore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let locked = self.queue.lock();

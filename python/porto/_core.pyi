@@ -765,6 +765,12 @@ class _ConditionWait(Generic[_T_co]):
     def close(self) -> None: ...
 
 @final
+class _LockLost(BaseException):
+    """Raised in place of ``GeneratorExit`` by a ``Condition.wait()`` closed while another task
+    holds the lock; the lock's ``async with`` exit releases nothing for it and turns it back into
+    ``GeneratorExit``."""
+
+@final
 class _Ready(Generic[_T_co]):
     """An awaitable that already holds its value: awaiting it never suspends."""
 

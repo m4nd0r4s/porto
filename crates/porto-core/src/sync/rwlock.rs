@@ -380,6 +380,14 @@ impl<T: ?Sized> RwLock<T> {
     }
 }
 
+#[cfg(all(test, loom))]
+impl<T: ?Sized> RwLock<T> {
+    /// Whether [`QUEUED`] is set, for the models that check it is clear once nobody waits.
+    pub(super) fn queued_flag(&self) -> bool {
+        self.queue.word().load(Ordering::Relaxed) & QUEUED != 0
+    }
+}
+
 impl<T: Default> Default for RwLock<T> {
     fn default() -> Self {
         Self::new(T::default())

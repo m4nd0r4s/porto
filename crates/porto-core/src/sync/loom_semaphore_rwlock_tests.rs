@@ -92,6 +92,61 @@ fn semaphore_cancel_of_a_granted_waiter_passes_the_permits_on() {
     });
 }
 
+/// The front waiter `a` wants more permits than are free and leaves while a release runs; `b`
+/// and `c` wait behind it. Whichever goes first, `a` leaving lets them in (when the release
+/// went first, only `waiter_left` grants them): each is woken once, and no permit is lost.
+#[test]
+fn semaphore_front_waiter_leaving_during_a_release_lets_the_ones_behind_in() {
+    loom::model(|| {
+        let semaphore = Arc::new(Semaphore::new(3));
+        semaphore.try_acquire(2).expect("free").forget();
+        let mut noop = Context::from_waker(Waker::noop());
+        let a = Box::pin(WaitNode::new(0));
+        // SAFETY: `a` is pinned, used with this semaphore only, and cancelled below.
+        assert!(unsafe { semaphore.poll_acquire_node(a.as_ref(), 3, &mut noop) }.is_pending());
+        let behind = [Box::pin(WaitNode::new(0)), Box::pin(WaitNode::new(0))];
+        let wakers = [counting_waker(), counting_waker()];
+        for (node, (_, waker)) in behind.iter().zip(&wakers) {
+            let mut cx = Context::from_waker(waker);
+            // SAFETY: as above, resolved below.
+            let first = unsafe { semaphore.poll_acquire_node(node.as_ref(), 1, &mut cx) };
+            assert!(first.is_pending(), "a waiter barged ahead of the queue");
+        }
+
+        let releaser = {
+            let semaphore = semaphore.clone();
+            thread::spawn(move || assert!(semaphore.release(1)))
+        };
+        // SAFETY: nothing else uses `a` concurrently.
+        unsafe { semaphore.cancel_acquire_node(a.as_ref()) };
+        releaser.join().unwrap();
+
+        for (wakes, _) in &wakers {
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                1,
+                "a waiter behind was stranded"
+            );
+        }
+        assert!(!semaphore.slow_flag(), "SLOW is set with nobody waiting");
+        for (node, (wakes, waker)) in behind.iter().zip(&wakers) {
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                1,
+                "a waiter behind was stranded"
+            );
+            let mut cx = Context::from_waker(waker);
+            // SAFETY: as above.
+            assert!(unsafe { semaphore.poll_acquire_node(node.as_ref(), 1, &mut cx) }.is_ready());
+        }
+        assert_eq!(semaphore.acquired_permits(), 3);
+        assert_eq!(semaphore.available_permits(), 0);
+        assert!(semaphore.release(3));
+        assert_eq!(semaphore.available_permits(), 3);
+        assert!(!a.is_pending());
+    });
+}
+
 /// Two threads acquire and release through the fast paths while a third adds a permit: the
 /// counts stay consistent and the permits never go above the total.
 #[test]
@@ -223,4 +278,82 @@ fn rwlock_cancel_of_a_granted_writer_lets_the_reader_in() {
         assert!(unsafe { lock.force_read_unlock() });
         assert!(!writer.is_pending());
     });
+}
+
+/// Readers hold the lock (`holders` of them), a writer `w` waits at the front and two readers
+/// wait behind it; `w` leaves while one holder releases. After both, each reader behind `w`
+/// is granted exactly once, and the lock's QUEUED flag is clear with nobody waiting.
+///
+/// With one holder the release is the last reader's, which grants the queue itself whichever
+/// goes first. With two, a release that goes first leaves `w` waiting, and only `waiter_left`
+/// can let the readers behind it in.
+fn rwlock_writer_leaving_during_a_read_release(holders: usize) {
+    loom::model(move || {
+        let lock = Arc::new(RwLock::new(()));
+        for _ in 0..holders {
+            RwLockReadGuard::leak(lock.try_read().expect("free"));
+        }
+        let mut noop = Context::from_waker(Waker::noop());
+        let writer = Box::pin(WaitNode::new(0));
+        // SAFETY: the node is pinned, used with this lock only, and cancelled below.
+        assert!(unsafe { lock.poll_write_node(writer.as_ref(), &mut noop) }.is_pending());
+        let readers = [Box::pin(WaitNode::new(0)), Box::pin(WaitNode::new(0))];
+        let wakers = [counting_waker(), counting_waker()];
+        for (node, (_, waker)) in readers.iter().zip(&wakers) {
+            let mut cx = Context::from_waker(waker);
+            // SAFETY: as above, resolved below.
+            let first = unsafe { lock.poll_read_node(node.as_ref(), &mut cx) };
+            assert!(
+                first.is_pending(),
+                "a reader got in ahead of a waiting writer"
+            );
+        }
+
+        let releaser = {
+            let lock = lock.clone();
+            // SAFETY: the leaked guard gave access to `()` only.
+            thread::spawn(move || assert!(unsafe { lock.force_read_unlock() }))
+        };
+        // SAFETY: nothing else uses `writer` concurrently.
+        unsafe { lock.cancel_node(writer.as_ref()) };
+        releaser.join().unwrap();
+
+        for (wakes, _) in &wakers {
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                1,
+                "a reader behind the writer was stranded"
+            );
+        }
+        assert!(!lock.queued_flag(), "QUEUED is set with nobody waiting");
+        assert!(!lock.is_write_locked());
+        for (node, (wakes, waker)) in readers.iter().zip(&wakers) {
+            assert_eq!(
+                wakes.0.load(Ordering::SeqCst),
+                1,
+                "a reader behind the writer was stranded"
+            );
+            let mut cx = Context::from_waker(waker);
+            // SAFETY: as above.
+            assert!(unsafe { lock.poll_read_node(node.as_ref(), &mut cx) }.is_ready());
+        }
+        assert_eq!(lock.readers(), holders - 1 + 2);
+        for _ in 0..lock.readers() {
+            // SAFETY: the grants gave access to `()` only.
+            assert!(unsafe { lock.force_read_unlock() });
+        }
+        assert_eq!(lock.readers(), 0);
+        assert!(!lock.queued_flag());
+        assert!(!writer.is_pending());
+    });
+}
+
+#[test]
+fn rwlock_writer_leaving_while_the_last_reader_releases() {
+    rwlock_writer_leaving_during_a_read_release(1);
+}
+
+#[test]
+fn rwlock_writer_leaving_while_a_reader_releases_and_another_holds() {
+    rwlock_writer_leaving_during_a_read_release(2);
 }

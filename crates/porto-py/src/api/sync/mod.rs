@@ -68,6 +68,7 @@ fn register_more(module: &Bound<'_, PyModule>) -> PyResult<()> {
     sync_entry::init_entry_type(module.py())?;
     module.add_class::<condition::Condition>()?;
     module.add_class::<condition::ConditionWait>()?;
+    module.add_class::<lock::LockLost>()?;
     module.add_class::<barrier::Barrier>()
 }
 

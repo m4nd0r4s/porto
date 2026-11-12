@@ -22,7 +22,7 @@ use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::gc::PyVisit;
 use pyo3::prelude::*;
 
-use super::lock::{Lock, LockEntry, LockSource, release, release_then_checkpoint};
+use super::lock::{Lock, LockEntry, LockLost, LockSource, release, release_then_checkpoint};
 use super::wait_op::{Grant, SyncWait, Then};
 use crate::api::time::require_lane;
 use crate::async_slots::stop_iteration;
@@ -397,17 +397,21 @@ impl ConditionWait {
     }
 
     /// Closed (the task is being freed, `GeneratorExit`): nothing can wait any more. A released
-    /// lock is taken back if it is free, so the enclosing `async with` releases what it holds;
-    /// one another task holds stays with it (that exit then raises `RuntimeError`).
-    fn close(&mut self) {
+    /// lock is taken back if it is free, so the enclosing `async with` releases what it holds.
+    /// One another task holds (or was handed, when the task gave an unobserved grant up) stays
+    /// with it: the close raises `LockLost` in place of `GeneratorExit`, so that exit releases
+    /// nothing (see [`LockLost`]).
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         let released = match std::mem::replace(&mut self.state, State::Done) {
             State::Waiting(wait) => wait.released.load(Ordering::Relaxed),
             State::Relocking(_) => true,
             State::Fresh | State::Done => false,
         };
-        if released {
-            self.condition.get().lock_source().try_lock();
+        let lock = self.condition.get().lock_source();
+        if !released || lock.try_lock() {
+            return Ok(());
         }
+        Err(LockLost::new_err(py, Arc::clone(lock)))
     }
 
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
