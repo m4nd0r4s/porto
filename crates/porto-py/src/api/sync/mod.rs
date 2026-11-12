@@ -47,6 +47,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     wait_op::init_fast_new(module.py())?;
     module.add_class::<event::Event>()?;
     module.add_class::<event::Notify>()?;
+    module.add_function(wrap_pyfunction!(event::trap_wait_notify, module)?)?;
     module.add_class::<lock::Lock>()?;
     lock::install_raw_methods(module.py())?;
     module.add_class::<lock::LockEntry>()?;

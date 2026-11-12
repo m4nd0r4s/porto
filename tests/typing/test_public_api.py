@@ -4,7 +4,7 @@ The ``check_*`` functions are only type-checked; ``test_*`` also run them.
 """
 
 import asyncio
-from typing import Literal, assert_type
+from typing import Any, Literal, assert_type
 
 import porto
 
@@ -242,3 +242,30 @@ def check_buffer_is_a_buffer() -> None:
 
 def test_buffer_is_a_buffer() -> None:
     check_buffer_is_a_buffer()
+
+
+async def task_handles() -> int:
+    kept: list[porto.Task[bytes]] = []
+    async with porto.scope() as s:
+        task = s.spawn(fetch, "a", 1)
+        kept.append(task)
+        assert_type(task, porto.Task[bytes])
+        assert_type(task.id, int)
+        assert_type(task.name, str)
+        assert_type(task.pinned, bool)
+        assert_type(task.lane, int | None)
+        assert_type(task.done(), bool)
+        assert_type(task.cancelled(), bool)
+        assert_type(task.exception(), BaseException | None)
+        assert_type(await task, bytes)
+    assert_type(kept[0].result(), bytes)
+    assert_type(porto.current_task(), porto.Task[Any])
+    assert_type(porto.lowlevel.current_lane(), int)
+    await porto.lowlevel.trap_yield()
+    await porto.lowlevel.trap_wait_notify(porto.Notify())
+    return len(kept[0].result())
+
+
+def check_lowlevel_calls_are_typed() -> None:
+    porto.lowlevel.trap_wait_notify(porto.Lock())  # pyright: ignore[reportArgumentType]
+    porto.lowlevel.current_lane(1)  # pyright: ignore[reportCallIssue]

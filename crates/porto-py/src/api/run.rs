@@ -89,13 +89,14 @@ fn run_in_root_scope(
         let node = PyScopeNode::new_root(0);
         let root = Py::new(py, Scope::root(node.clone()))?;
         let _published = RootScope::publish(root.clone_ref(py));
-        let task = Py::new(py, Task::new(main.clone().unbind(), false))?;
+        let task = Py::new(py, Task::new(Some(main.clone().unbind()), false))?;
         let spawned = Spawned::Child {
-            task,
+            task: task.clone_ref(py),
             scope: node.clone(),
             pinned: false,
         };
         let main = pytask::spawn(runtime.handle(), coro, spawned)?;
+        task.get().bind(&main);
         let abandoned = Cell::new(0);
         let outcome = runtime.block_on(lane::main_or_interrupt(async {
             let outcome = pytask::join(main).await;

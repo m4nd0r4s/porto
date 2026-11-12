@@ -82,11 +82,11 @@ class Task[T]:     # awaitable
     id: int; name: str
     def done(self) -> bool; def cancelled(self) -> bool
     def result(self) -> T                    # raises InvalidStateError if not done; re-raises failure
-    def exception(self) -> BaseException | None
+    def exception(self) -> BaseException | None   # InvalidStateError if not done; raises Cancelled like result() if cancelled
     def cancel(self) -> None
     def __await__(self) -> Generator[Any, None, T]
-    @property lane(self) -> int | None; @property pinned(self) -> bool
-def current_task() -> Task[Any]
+    @property lane(self) -> int | None; @property pinned(self) -> bool   # lane: the lane it last ran on, None once finished
+def current_task() -> Task[Any]          # NoRuntimeError outside a task; the object spawn returned
 ```
 
 `Scope.spawn` passes only positional arguments to the function (a keyword it does not take raises `TypeError` naming `functools.partial`). `name` names the task (`Task.name`, shown in its repr); without it the task is named after the `__qualname__` of the function or coroutine it runs. `pin=True` pins the task to its lane, `pin=False` does not, and `pin=None` inherits the pinning of the spawning task (pinning is inherited by the subtree, 03). `context` runs the task in that `contextvars.Context` itself, shared with whoever else uses it; without it the task runs in a copy of the current context (11 §8). An option of the wrong type raises `TypeError` that says what to pass.
@@ -122,7 +122,7 @@ Terminated(SystemExit)
 As specified in §17 and §18.
 
 ## `porto.lowlevel`
-`wait_readable`, `wait_writable`, `notify_closing`, `current_driver_kind`, `Trap` constructors for library authors: `trap_yield()`, `trap_wait_notify(notify)`; `current_lane() -> int`; `spawn_rust_lane(fn)` (GIL builds: run a callable that only calls Rust-releasing APIs; advanced).
+`wait_readable`, `wait_writable`, `notify_closing`, `current_driver_kind`, `Trap` constructors for library authors: `trap_yield()` (the trap behind `checkpoint()`), `trap_wait_notify(notify)` (the trap behind `await notify.notified()`; `TypeError` for anything but a `Notify`); `current_lane() -> int`; `spawn_rust_lane(fn)` (GIL builds: run a callable that only calls Rust-releasing APIs; advanced). The trap constructors and `current_lane` raise `NoRuntimeError` outside a task of a porto runtime; a trap freed without being awaited warns like one from `sleep()`.
 
 ## `porto.inspect`
 `tasks() -> list[TaskInfo]`, `tree() -> ScopeInfo`, `stats() -> RuntimeStats`, `dump(file=sys.stderr)`. Dataclasses are defined in §23.

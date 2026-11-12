@@ -1,9 +1,10 @@
 """The native extension module, built from crates/porto-py.
 
 The public API (re-exported by ``porto``): ``run``, ``scope``, ``Scope``, ``Task``, ``sleep``,
-``sleep_until``, ``sleep_forever``, ``checkpoint``, ``current_time``, ``monotonic``, ``Event``,
-``Notify``, ``Lock``, ``Mutex``, ``MutexGuard``, ``Semaphore``, ``CapacityLimiter``, ``RwLock``,
-``Condition``, ``Barrier``, ``Sender``, ``Receiver``, ``Buffer`` and ``__version__``
+``sleep_until``, ``sleep_forever``, ``checkpoint``, ``current_task``, ``current_time``,
+``monotonic``, ``Event``, ``Notify``, ``Lock``, ``Mutex``, ``MutexGuard``, ``Semaphore``,
+``CapacityLimiter``, ``RwLock``, ``Condition``, ``Barrier``, ``Sender``, ``Receiver``, ``Buffer``
+and ``__version__``
 (docs/spec/10-porto-runtime/20-python-api-reference.md).
 Underscore names are internal to porto: the trap protocol's awaitables
 (11-task-model-and-trap-protocol.md §5-§6), the step driver's entry points (§4) and test hooks.
@@ -244,7 +245,16 @@ class Scope:
 
 @final
 class Task(Generic[_T_co]):
-    """A child task of a scope. Its result is readable once its scope's block exited."""
+    """A task: the child of a scope (what ``Scope.spawn`` returns), or the one running now
+    (``porto.current_task()``). Its result is readable once it finished, which is certain once
+    its scope's block exited; a task can also be awaited: ``await task``.
+
+    ``current_task()`` returns the very object ``spawn`` returned. A task spawned by no scope
+    (an internal one) has no handle until ``current_task()`` makes one, named ``Task-<id>``."""
+
+    @property
+    def id(self) -> int:
+        """The task's id: unique in the process, increasing in spawn order."""
 
     @property
     def name(self) -> str:
@@ -256,13 +266,55 @@ class Task(Generic[_T_co]):
         """Whether the task stays on its lane: spawned with ``pin=True``, or without ``pin``
         by a pinned task."""
 
+    @property
+    def lane(self) -> int | None:
+        """The lane the task last ran on (0: a runtime has one lane until M2), ``None`` once it
+        finished."""
+
     def done(self) -> bool:
-        """Whether the task finished (returned or raised)."""
+        """Whether the task finished: it returned, raised, or was cancelled."""
+
+    def cancelled(self) -> bool:
+        """Whether the task ended cancelled: a cancellation reached it (``Scope.cancel()``, a
+        deadline, a failing sibling), or its runtime shut down first."""
 
     def result(self) -> _T_co:
         """What the task returned, or raises what it raised (``porto.Cancelled`` if it was
         cancelled); ``porto.InvalidStateError`` if it has not finished yet,
         ``porto.RuntimeClosed`` if its runtime shut down first."""
+
+    def exception(self) -> BaseException | None:
+        """What the task raised, or ``None`` if it returned. Raises like ``result()`` for a
+        task that was cancelled; ``porto.InvalidStateError`` if it has not finished yet."""
+
+    def __await__(self) -> Generator[Any, Any, _T_co]:
+        """Waits for the task, then evaluates to its result or raises its exception. A task that
+        finished already completes at once. Raises ``porto.NoRuntimeError`` outside a porto
+        task, and ``RuntimeError`` if a task awaits itself."""
+
+    def __class_getitem__(cls, item: object, /) -> object: ...
+
+def current_task() -> Task[Any]:
+    """The ``Task`` of the task that calls it: the object ``Scope.spawn`` returned, or, for a
+    task with no handle, a new one (named ``Task-<id>``) that its next calls return again.
+    Raises ``porto.NoRuntimeError`` outside a task of a porto runtime."""
+
+# Low level (``porto.lowlevel``)
+
+def trap_yield() -> _Trap:
+    """The trap behind ``porto.checkpoint()``: awaiting it yields to the other tasks once, with
+    the cancellation check of every checkpoint. Raises ``porto.NoRuntimeError`` outside
+    ``porto.run``; a trap freed without being awaited emits ``RuntimeWarning``."""
+
+def trap_wait_notify(notify: Notify, /) -> _Trap:
+    """The trap behind ``await notify.notified()``: takes a stored permit, or waits for a
+    ``notify_one``/``notify_all`` that comes after the ``await`` started. Raises
+    ``porto.NoRuntimeError`` outside ``porto.run``, ``TypeError`` for anything but a
+    ``porto.Notify``."""
+
+def current_lane() -> int:
+    """The index of the lane the calling task runs on (0: a runtime has one lane until M2).
+    Raises ``porto.NoRuntimeError`` outside a task of a porto runtime."""
 
 # Synchronization (16-sync-primitives-and-channels.md §1)
 
@@ -910,6 +962,11 @@ def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
 
 def _yield_trap() -> _Trap:
     """A trap that yields to the scheduler once."""
+
+def _task_handles_created() -> int:
+    """Test hook: how many ``porto.Task`` objects were made so far in this process. An internal
+    spawn makes none; ``Scope.spawn`` makes one per task, ``current_task()`` one for a task
+    with none."""
 
 def _sleep_trap(delay: float, /) -> _Trap:
     """A trap that resumes the task ``delay`` seconds from now, never earlier (``delay <= 0``:

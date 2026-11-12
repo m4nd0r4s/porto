@@ -29,6 +29,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // The same function object, so `porto.monotonic is porto.current_time`.
     module.add("monotonic", module.getattr("current_time")?)?;
     module.add_function(wrap_pyfunction!(yield_trap, module)?)?;
+    module.add_function(wrap_pyfunction!(trap_yield, module)?)?;
+    module.add_function(wrap_pyfunction!(current_lane, module)?)?;
     module.add_function(wrap_pyfunction!(sleep_trap, module)?)
 }
 
@@ -184,6 +186,28 @@ fn now(function: &str) -> PyResult<Deadline> {
 #[pyfunction(name = "_yield_trap")]
 fn yield_trap() -> Trap {
     Trap::yield_now()
+}
+
+/// `porto.lowlevel.trap_yield()`: the trap behind `porto.checkpoint()`, for a library that
+/// drives traps by hand: awaiting it yields to the other tasks once, with the cancellation check
+/// of every checkpoint. A trap freed without being awaited emits `RuntimeWarning` ("never
+/// awaited").
+#[pyfunction]
+fn trap_yield() -> PyResult<Trap> {
+    require_lane("lowlevel.trap_yield")?;
+    Ok(Trap::yield_now().watched())
+}
+
+/// `porto.lowlevel.current_lane()`: the index of the lane the calling task runs on (0: a runtime
+/// has one lane until M2). Raises `porto.NoRuntimeError` outside a task of a porto runtime.
+#[pyfunction]
+fn current_lane() -> PyResult<u16> {
+    crate::driver::step::current_lane().ok_or_else(|| {
+        NoRuntimeError::new_err(
+            "porto: porto.lowlevel.current_lane() was called outside a task of a porto runtime; \
+             call it from code that porto.run(main) runs",
+        )
+    })
 }
 
 /// A trap that resumes the task `delay` seconds from now, never earlier. `inf` never resumes;

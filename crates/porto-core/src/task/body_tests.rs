@@ -160,3 +160,30 @@ fn a_panicking_body_completes_and_the_panic_reaches_the_lane() {
         "a panicked body is cancelled, so its joiners are released"
     );
 }
+
+#[test]
+fn a_non_owning_pointer_to_a_body_task_upgrades_while_a_reference_lives_and_not_after() {
+    let rt = Runtime::new();
+    let task = rt
+        .handle()
+        .spawn_body(TestBody::new(Script::Park), TaskFlags::PYTHON);
+    let header = std::ptr::NonNull::from(task.header());
+    // SAFETY: `task` holds a reference, so the allocation is live.
+    let upgraded = unsafe { super::TaskBodyRef::<TestBody>::try_from_header(header.as_ref()) }
+        .expect("a task with a reference upgrades");
+    assert_eq!(upgraded.id(), task.id());
+    assert_eq!(
+        task.header().state().load().ref_count(),
+        3,
+        "queue, task, upgrade"
+    );
+    drop(upgraded);
+    assert_eq!(task.header().state().load().ref_count(), 2);
+    // The state alone: no reference left means no upgrade (the task is being freed).
+    let state = crate::task::state::State::new_scheduled(false);
+    assert!(state.try_ref_inc());
+    assert!(!state.ref_dec(), "the queue's reference is left");
+    assert!(state.ref_dec(), "the last one");
+    assert!(!state.try_ref_inc(), "a freed task is never revived");
+    drop(task);
+}

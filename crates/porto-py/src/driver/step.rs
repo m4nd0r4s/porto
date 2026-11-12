@@ -62,6 +62,7 @@ use super::pending::{Kind, Pending};
 use super::pytask::{CancelStack, PyScopeNode, PyScopeRef, PyTask, Resume, TaskOutcome};
 use super::ready::{ready, ready_none};
 use super::trap::{Trap, TrapKind};
+use crate::api::task::Task;
 use crate::errors::Cancelled;
 use crate::py_compat::{Sent, names, release_spare_value, send, take_exception};
 
@@ -74,8 +75,16 @@ thread_local! {
 /// Lives in `poll`'s frame, which outlives the publication (see `RunningTask`).
 struct Running {
     waker: *const Waker,
+    /// The task's header, alive for the whole poll (the run reference).
+    header: *const Header,
     /// The task's id, the owner of the scopes it enters.
     task_id: u64,
+    /// The task's `porto.Task`, borrowed from the body's `py_handle` (which holds it for the
+    /// whole poll): null if it has none. See [`current_task`].
+    handle: Cell<*mut ffi::PyObject>,
+    /// The handle [`current_task`] made for a task that had none: the poll hands it to the
+    /// body when it ends.
+    made_handle: Cell<Option<Py<Task>>>,
     /// Steps and synchronous completions left in this poll (T2).
     budget: Cell<u32>,
     /// The task's cancel stack while its coroutine runs (moved out of the task around each
@@ -113,6 +122,41 @@ fn running<'a>() -> Option<&'a Running> {
 pub(crate) fn current_waker() -> Option<Waker> {
     // SAFETY: `poll` borrows the waker for as long as it publishes it.
     running().map(|running| unsafe { &*running.waker }.clone())
+}
+
+/// The `porto.Task` of the task running on this thread: the one `Scope.spawn` returned, or, for
+/// a task that has none (an internal spawn), a new one, kept for the task's next calls
+/// (spec 11 §7). `None` if no task is running. The new handle names the task `Task-<id>`.
+pub(crate) fn current_task(py: Python<'_>) -> PyResult<Option<Py<Task>>> {
+    let Some(running) = running() else {
+        return Ok(None);
+    };
+    let known = running.handle.get();
+    if !known.is_null() {
+        // SAFETY: the pointer is the body's `py_handle` (or the handle made below), a `Task`
+        // that the body or `made_handle` holds for the whole poll.
+        return Ok(Some(
+            unsafe { Borrowed::from_ptr(py, known).cast_unchecked::<Task>() }
+                .to_owned()
+                .unbind(),
+        ));
+    }
+    // SAFETY: `poll` publishes `Running` only while it polls the task behind `header`, alive
+    // for that whole time (the run reference).
+    let header = unsafe { &*running.header };
+    let handle = Py::new(py, Task::new(None, header.flags().contains(TaskFlags::PIN)))?;
+    handle.get().bind_header(header);
+    running.handle.set(handle.as_ptr());
+    running.made_handle.set(Some(handle.clone_ref(py)));
+    Ok(Some(handle))
+}
+
+/// The lane the task running on this thread runs on, if a task is running.
+pub(crate) fn current_lane() -> Option<u16> {
+    running().map(|running| {
+        // SAFETY: as in `current_task`: the header is alive for the whole poll.
+        unsafe { &*running.header }.owner_lane()
+    })
 }
 
 /// Whether the task with this header is the one running on this thread (its waker's data is
@@ -318,7 +362,14 @@ pub(super) fn poll(
     };
     let running = Running {
         waker: cx.waker(),
+        header: ptr::from_ref(header),
         task_id: header.id(),
+        handle: Cell::new(
+            task.py_handle
+                .as_ref()
+                .map_or(ptr::null_mut(), |handle| handle.as_ptr()),
+        ),
+        made_handle: Cell::new(None),
         // The lane's budget for this poll (`coop_budget`), kept here so a step does not touch a
         // thread local. Rust futures the task awaits draw on the lane's own count.
         budget: Cell::new(coop::remaining().unwrap_or(u32::MAX)),
@@ -331,6 +382,9 @@ pub(super) fn poll(
         step_until_wait(task, &coro, &running, cx)
     };
     task.coro = Some(coro.unbind());
+    if let Some(handle) = running.made_handle.take() {
+        task.py_handle = Some(handle);
+    }
     // The task gives the lane up: the last result an await returned through the spare
     // `StopIteration` must not live on in it.
     release_spare_value(py);

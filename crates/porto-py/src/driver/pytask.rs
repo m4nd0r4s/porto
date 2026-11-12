@@ -111,8 +111,13 @@ pub(crate) struct PyTask {
     cancel_scope: Option<PyScopeRef>,
     /// Who waits for the task to finish. Closed once the outcome is in `slot`.
     join: JoinWaiters,
-    /// The `porto.Task` wrapper, created lazily: only `Scope.spawn` makes one so far.
-    py_handle: Option<Py<Task>>,
+    /// The `porto.Task` of this task, if it has one: `Scope.spawn` makes it with the task, and
+    /// `current_task()` makes one for a task that has none (an internal spawn creates none:
+    /// spec 11 §7). It holds the handle strongly while the task lives and gives it its
+    /// outcome when it ends. The handle points back at the task *weakly* (`Task::bind`), so
+    /// the two are no cycle: a task parked forever that nothing can wake is freed with its
+    /// runtime, and the handle learns it (see `Drop`).
+    pub(super) py_handle: Option<Py<Task>>,
     pub(super) stats: TaskStats,
     slot_kind: SlotKind,
     pub(super) pending_kind: Kind,
@@ -538,6 +543,12 @@ impl Drop for PyTask {
         // A wait whose waker the task owns cannot be linked here (the link would keep the task
         // alive); this releases what the payload owns.
         self.release_wait();
+        // Freed before it ended (idle, with nothing left to wake it): its handle must not wait
+        // for an outcome that will never come, and must forget the pointer to this body, which
+        // is about to go (`Task::finish` clears it under the lock its readers hold).
+        if let Some(task) = self.py_handle.take() {
+            task.get().finish(TaskOutcome::Cancelled(None));
+        }
     }
 }
 

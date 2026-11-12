@@ -20,10 +20,6 @@ pub struct Header {
     /// Lifecycle bits and refcount, see [`super::state`].
     pub(crate) state: State,
     /// The last lane that ran the task (soft affinity).
-    #[allow(
-        dead_code,
-        reason = "lanes record themselves here once there are several (M2)"
-    )]
     pub(crate) owner_lane: AtomicU16,
     /// Fixed at spawn: PIN, PYTHON, DETACHED_DROP.
     pub(crate) flags: TaskFlags,
@@ -109,6 +105,12 @@ impl Header {
     /// The task's id: unique for the process lifetime and increasing in spawn order.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The lane that last ran the task (soft affinity): 0 until lanes record themselves here
+    /// (M2).
+    pub fn owner_lane(&self) -> u16 {
+        self.owner_lane.load(Ordering::Relaxed)
     }
 
     /// The task's state word.

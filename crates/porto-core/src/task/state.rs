@@ -178,6 +178,29 @@ impl State {
         }
     }
 
+    /// Adds a reference unless the task is being freed (no reference is left): an upgrade, for
+    /// a holder of a non-owning pointer. Returns whether it did. Aborts on overflow.
+    pub(crate) fn try_ref_inc(&self) -> bool {
+        // Acquire on success pairs with the AcqRel decrements, so what the holders of the
+        // other references wrote is visible, as for a clone.
+        let mut current = self.0.load(Ordering::Relaxed);
+        loop {
+            let snapshot = Snapshot(current);
+            if snapshot.ref_count() == 0 {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                snapshot.ref_inc().0,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Drops a reference. Returns `true` if it was the last one and the task must be freed.
     pub(crate) fn ref_dec(&self) -> bool {
         // AcqRel: the last decrement must see every write made through other references.

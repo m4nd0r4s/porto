@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use porto_core::sync::{self as core_sync, WaitNode};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 
 use super::blocking;
 use super::wait_op::{Grant, SyncWait};
 use crate::api::time::require_lane;
 use crate::driver::thin::{WaitSource, Waitable};
+use crate::driver::trap::{Trap, TrapKind};
 
 pub(super) struct EventSource(pub(super) core_sync::Event);
 
@@ -139,4 +141,22 @@ impl Notify {
     fn __repr__(&self) -> &'static str {
         "<porto.Notify>"
     }
+}
+
+/// `porto.lowlevel.trap_wait_notify(notify)`: the trap itself that `await notify.notified()`
+/// waits with, for a library that drives traps by hand. Awaiting it takes a stored permit, or
+/// waits until a `notify_one` or `notify_all` comes after the `await` started. Raises
+/// `porto.NoRuntimeError` outside `porto.run`, `TypeError` for anything but a `porto.Notify`.
+#[pyfunction]
+#[pyo3(signature = (notify, /))]
+pub(super) fn trap_wait_notify(notify: &Bound<'_, PyAny>) -> PyResult<Trap> {
+    require_lane("lowlevel.trap_wait_notify")?;
+    let Ok(notify) = notify.cast::<Notify>() else {
+        return Err(PyTypeError::new_err(format!(
+            "porto: porto.lowlevel.trap_wait_notify() takes a porto.Notify, got {}; pass the \
+             Notify to wait for",
+            notify.get_type().fully_qualified_name()?
+        )));
+    };
+    Ok(Trap::new(TrapKind::Notified(notify.get().notify.target())))
 }

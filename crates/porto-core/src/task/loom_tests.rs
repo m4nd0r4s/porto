@@ -403,3 +403,33 @@ fn completion_and_idle_free_vs_scope_exit_wait() {
         assert!(queue.tasks_freed());
     });
 }
+
+/// The upgrade of a non-owning pointer to a task (`try_ref_inc`, what `TaskBodyRef::try_from_header`
+/// does first) races with the drop of the last reference: either the upgrade fails because the
+/// task is being freed, or it succeeds and holds a reference of its own, so the task is freed
+/// exactly once, by whoever drops the last one.
+#[test]
+fn upgrade_vs_last_reference_drop() {
+    loom::model(|| {
+        let state = Arc::new(super::state::State::new_scheduled(false));
+        let upgraded = {
+            let state = state.clone();
+            thread::spawn(move || {
+                if state.try_ref_inc() {
+                    // The reference was taken before the count could reach zero.
+                    Some(state.ref_dec())
+                } else {
+                    None
+                }
+            })
+        };
+        let dropped_last = state.ref_dec();
+        let upgrade = upgraded.join().unwrap();
+        match upgrade {
+            // Upgraded first: the owner's drop was not the last, the upgrade's was.
+            Some(upgrade_was_last) => assert!(upgrade_was_last ^ dropped_last),
+            // Too late: the owner's drop was the last.
+            None => assert!(dropped_last),
+        }
+    });
+}

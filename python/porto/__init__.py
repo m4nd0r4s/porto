@@ -19,6 +19,7 @@ print(porto.run(main))
 ```
 """
 
+from porto import lowlevel
 from porto._channel import channel, unbounded_channel
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
@@ -39,6 +40,7 @@ from porto._core import (
     Task,
     __version__,
     checkpoint,
+    current_task,
     current_time,
     monotonic,
     move_on_after,
@@ -100,7 +102,9 @@ __all__ = [
     "__version__",
     "channel",
     "checkpoint",
+    "current_task",
     "current_time",
+    "lowlevel",
     "monotonic",
     "move_on_after",
     "run",

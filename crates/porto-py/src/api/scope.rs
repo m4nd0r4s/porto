@@ -30,8 +30,8 @@
 //! `finally:`), a scope is a cancel scope only: entering and leaving it do not await, and
 //! spawning into it raises.
 //!
-//! Not yet: names, `start()` (§3), `Task.cancel()` and awaiting a task (§4), and
-//! spawning from other lanes or threads (C10).
+//! Not yet: names, `start()` (§3), `Task.cancel()` (§4), and spawning from other lanes or
+//! threads (C10).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -558,16 +558,17 @@ impl Scope {
         let coro = coroutine_from(coro_or_fn, args, "Scope.spawn")?;
         let pinned = options.pin.unwrap_or_else(step::running_is_pinned);
         let label = options.name.unwrap_or_else(|| coro_or_fn.clone()).unbind();
-        let task = Py::new(py, Task::new(label, pinned))?;
+        let task = Py::new(py, Task::new(Some(label), pinned))?;
         let spawned = Spawned::Child {
             task: task.clone_ref(py),
             scope: node,
             pinned,
         };
-        match options.context {
+        let body = match options.context {
             None => pytask::spawn(&handle, coro, spawned)?,
             Some(context) => pytask::spawn_in_context(&handle, coro, context.unbind(), spawned)?,
         };
+        task.get().bind(&body);
         Ok(task)
     }
 

@@ -42,7 +42,7 @@ struct PyTaskBody {
     budget: u8,
     result: TaskOutcome,                 // Ok(PyObject) | Err(PyObject) | Cancelled
     join: JoinWaiters,                   // intrusive list of awaiting tasks
-    py_handle: *mut ffi::PyObject,       // weakly-cached porto.Task wrapper (lazily created)
+    py_handle: *mut ffi::PyObject,       // the porto.Task wrapper (lazily created); strong while the task lives, the wrapper points back weakly (§7)
     stats: TaskStats,                    // first_poll, total_poll_ns, steps, last_step_start
     timer: TaskTimer,                    // embedded wheel entry + deadline (§6)
     wait_node: WaitNode,                 // embedded waiter node (§6)
@@ -202,7 +202,9 @@ A cancellable wait that does not resolve at once is registered with the task's i
 
 ## 7. porto.Task (Python handle)
 
-The Python-visible `Task[T]` is created lazily: `scope.spawn` returns it, but internal spawns (Douro request tasks) never create it. It holds a `TaskRef`. Its methods are listed in §20. `await task` produces `TrapKind::Join` (or the ready fast path if already complete).
+The Python-visible `Task[T]` is created lazily: `scope.spawn` returns it, `porto.current_task()` makes one for a task that has none, and internal spawns (Douro request tasks, `_spawn`) never create it. Its methods are listed in §20. `await task` produces `TrapKind::Join` (or, if the task already finished, a synchronous completion: a ready awaitable with the result, or the exception raised, after the T2 checkpoint).
+
+The task and its handle point at each other, and exactly one direction owns. The body's `py_handle` holds the handle strongly until the task ends, when the handle is given the outcome (`Task.finish`); `current_task()` returns that same object every time. The handle holds the task *weakly*: a pointer to its header, upgraded to a counted reference (`TaskBodyRef::try_from_header`, which fails once the last reference is gone) when a method needs the task (`await`, `lane`, `cancel`, §15 §4). A strong reference in both directions would be a cycle that keeps a task alive that nothing can wake any more (parked on something whose waker was dropped at shutdown), with its coroutine and everything the coroutine holds; the weak pointer is cleared under the handle's lock before the task's body is freed, and a body freed unfinished ends its handle as cancelled. After the task ended, the handle owns the outcome (it is traversed by the cycle collector, so an exception whose traceback reaches the handle is collected).
 
 ## 8. contextvars
 - `scope.spawn(coro)` copies the *current* context (`PyContext_CopyCurrent`) by default, matching asyncio semantics. `context=` overrides it: the task runs in that context itself, not a copy, so its changes are visible to whoever holds it.

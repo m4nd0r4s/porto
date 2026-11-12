@@ -3,7 +3,7 @@
 //! - `_WaitProbe`: a wait queue with permits, like a semaphore's; `probe.wait()` is a
 //!   `Notified` trap on it that takes a permit if one is stored;
 //! - `_spawn_joinable(coro, context=None)` spawns a task and returns a `_JoinTarget`, whose
-//!   `join()` is a `Join` trap (the Python `Task` gets `await` with porto-szb.8) and whose
+//!   `join()` is a `Join` trap (what `await task` yields for a `porto.Task`) and whose
 //!   `steps` counts the coroutine resumes (the step loop's round trips are tested with it);
 //! - `_checkpoint_if_needed(value)`: what a synchronous completion returns (T2);
 //! - `_current_task_token()` and `_interrupt(token, exc)`: throw `exc` into a waiting task,
