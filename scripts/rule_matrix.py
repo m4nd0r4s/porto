@@ -65,19 +65,69 @@ def rules_in_specs(specs: Path) -> dict[str, dict[str, str]]:
     return dict(rules)
 
 
+def _mark_name(node: ast.expr) -> str:
+    """The last name of a decorator or mark, ``xfail`` for ``@pytest.mark.xfail(strict=True)``."""
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def never_runs(marks: Iterable[ast.expr]) -> bool:
+    """Whether a test with these decorators (or a ``pytestmark``) is skipped or expected to fail,
+    which proves nothing about the rule: ``skip``, ``xfail``, and ``skipif`` with a true
+    constant. Static: a condition that only evaluates to true at run time is not seen."""
+    for mark in marks:
+        name = _mark_name(mark)
+        if name in {"skip", "xfail"}:
+            return True
+        if name == "skipif" and isinstance(mark, ast.Call):
+            condition = mark.args[0] if mark.args else None
+            for keyword in mark.keywords:
+                if keyword.arg == "condition":
+                    condition = keyword.value
+            if isinstance(condition, ast.Constant) and condition.value:
+                return True
+    return False
+
+
+def _module_marks(tree: ast.Module) -> list[ast.expr]:
+    """The marks ``pytestmark = ...`` puts on every test of the module."""
+    marks: list[ast.expr] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark" for target in node.targets
+        ):
+            value = node.value
+            marks += value.elts if isinstance(value, ast.List | ast.Tuple) else [value]
+    return marks
+
+
+def _claims(nodes: list[ast.stmt], excluded: bool) -> Iterable[tuple[str, bool]]:
+    """``(function name, counts)`` for the tests in ``nodes``, classes included."""
+    for node in nodes:
+        if isinstance(node, ast.ClassDef):
+            yield from _claims(node.body, excluded or never_runs(node.decorator_list))
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            yield node.name, not (excluded or never_runs(node.decorator_list))
+
+
 def tests_by_rule(tests: Path) -> dict[str, list[str]]:
-    """``{rule ID: ["file.py::test_name", ...]}`` from the names of the tests under ``tests``."""
+    """``{rule ID: ["file.py::test_name", ...]}`` from the names of the tests under ``tests``.
+
+    A test that is skipped or expected to fail (``skip``, ``xfail``, ``skipif`` on a true
+    constant, on the test, its class or the module) does not count: a rule whose only tests do
+    not run is not checked by anything.
+    """
     claimed: dict[str, list[str]] = defaultdict(list)
     for path in sorted(tests.rglob("test_*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            match = TEST_NAME.match(node.name)
-            if match:
-                claimed[match.group("id")].append(
-                    f"{path.relative_to(tests).as_posix()}::{node.name}"
-                )
+        excluded = never_runs(_module_marks(tree))
+        for name, counts in _claims(tree.body, excluded):
+            match = TEST_NAME.match(name)
+            if match and counts:
+                claimed[match.group("id")].append(f"{path.relative_to(tests).as_posix()}::{name}")
     return dict(claimed)
 
 

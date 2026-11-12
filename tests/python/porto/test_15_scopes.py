@@ -34,7 +34,6 @@ MIT or the Apache-2.0 license; used here under the MIT license:
 import ast
 import asyncio
 import contextlib
-import functools
 import gc
 import math
 import threading
@@ -572,8 +571,6 @@ def test_X5_started_set_twice_raises_runtime_error() -> None:
 # yet (porto.testing, 24): the timing tests use short real deadlines.
 # ============================================================
 
-differs = functools.partial(pytest.mark.xfail, strict=True)
-
 
 def test_trio_child_crash_basic() -> None:
     my_exc = ValueError("uh oh")
@@ -589,9 +586,10 @@ def test_trio_child_crash_basic() -> None:
     porto.run(main)
 
 
-@differs(
+@pytest.mark.xfail(
+    strict=True,
     reason="15 C4: the body's own exception leaves the scope bare unless a child failed too; "
-    "Trio wraps it in an ExceptionGroup"
+    "Trio wraps it in an ExceptionGroup",
 )
 def test_trio_nursery_main_block_error_basic() -> None:
     exc = ValueError("whoops")
@@ -865,9 +863,10 @@ def test_trio_basic_timeout() -> None:
     porto.run(main)
 
 
-@differs(
+@pytest.mark.xfail(
+    strict=True,
     reason="15 C3 and decision porto-vw8.17: the innermost cancelled scope absorbs the "
-    "Cancelled, Trio's outermost one does"
+    "Cancelled, Trio's outermost one does",
 )
 def test_trio_cancel_scope_nesting_outer_wins() -> None:
     async def main() -> None:
@@ -971,9 +970,10 @@ def test_trio_cancel_unbound() -> None:
     porto.run(main)
 
 
-@differs(
+@pytest.mark.xfail(
+    strict=True,
     reason="15 C9: the timer is armed when the block is entered, so cancel_called of a scope not "
-    "entered yet reads cancel() only; Trio counts a passed deadline at once"
+    "entered yet reads cancel() only; Trio counts a passed deadline at once",
 )
 def test_trio_unentered_scope_with_a_passed_deadline_is_cancel_called() -> None:
     async def main() -> None:
@@ -1090,10 +1090,11 @@ def test_trio_nursery_start_in_a_cancelled_scope() -> None:
     porto.run(main)
 
 
-@differs(
+@pytest.mark.xfail(
+    strict=True,
     reason="15 §3 and C1: start() enters its hidden scope, an ordinary checkpoint of the "
     "cancelled scope around it, so it raises Cancelled before the task runs; Trio runs the task "
-    "and lets one that does not checkpoint finish successfully"
+    "and lets one that does not checkpoint finish successfully",
 )
 def test_trio_nursery_start_with_no_checkpoint_in_a_cancelled_scope() -> None:
     async def started_with_no_checkpoint(*, started: "porto.Started[None]") -> None:
