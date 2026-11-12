@@ -13,8 +13,8 @@
 //! one for a task that has none, and an internal spawn (`_spawn`, the Douro request tasks) makes
 //! none. [`handles_created`] counts them, for the test that proves it.
 
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 use porto_core::scope::CancelReason;
@@ -65,20 +65,11 @@ pub(crate) fn handles_created() -> u64 {
     HANDLES_CREATED.load(Ordering::Relaxed)
 }
 
-/// A pointer to a task's header that the handle may follow only under its lock.
-struct BodyPtr(NonNull<Header>);
-
-// SAFETY: the pointer is only followed while the handle's lock is held, and the task's body
-// takes that lock to clear it (`Task::finish`) before the allocation is released, so it never
-// dangles while it can be read. The header's own fields are `Sync`.
-unsafe impl Send for BodyPtr {}
+/// `Task::body` once the task ended: no pointer to follow any more, and none to set.
+const ENDED: *mut Header = usize::MAX as *mut Header;
 
 /// What a handle knows about its task, under its lock.
 struct Inner {
-    /// The task's id, 0 until the handle is bound to its task.
-    id: u64,
-    /// The task, while it runs: `None` before the handle is bound and once it ended.
-    body: Option<BodyPtr>,
     /// `None` until the task finishes. A parking_lot lock guards it: std's allocates a pthread
     /// mutex per task on macOS (porto-itr.7).
     outcome: Option<TaskOutcome>,
@@ -93,6 +84,14 @@ struct Inner {
 #[pyclass(frozen, module = "porto._core", name = "Task")]
 pub struct Task {
     inner: Mutex<Inner>,
+    /// The task's id, 0 until the handle is bound to its task.
+    id: AtomicU64,
+    /// A pointer to the task's header while it runs: null before the handle is bound, [`ENDED`]
+    /// once it ended. Set by the spawner without the lock (the spawn is a hot path), cleared by
+    /// the task's body under it (`Task::finish`), and followed only under it, so it never
+    /// dangles while it can be followed: the task's body takes that lock before the allocation
+    /// is released.
+    body: AtomicPtr<Header>,
     /// The name given to `spawn` (a `str`), else what was spawned (the async function or the
     /// coroutine object), whose `__qualname__` is the name: read when the name is, so a spawn
     /// pays one reference for it. `None` for a task spawned with neither: it is `Task-<id>`.
@@ -112,11 +111,11 @@ impl Task {
         HANDLES_CREATED.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Mutex::new(Inner {
-                id: 0,
-                body: None,
                 outcome: None,
                 implicit: None,
             }),
+            id: AtomicU64::new(0),
+            body: AtomicPtr::new(ptr::null_mut()),
             label,
             pinned,
             cancel_requested: AtomicBool::new(false),
@@ -166,20 +165,25 @@ impl Task {
     /// [`Task::bind`], from the header of a task that is alive, with its handle already known
     /// by it (or the one polling it).
     pub(crate) fn bind_header(&self, header: &Header) {
-        let mut inner = self.lock();
-        inner.id = header.id();
+        self.id.store(header.id(), Ordering::Relaxed);
         // A task that ended already (another lane ran it to the end before this) has told
-        // the handle: nothing to follow.
-        if inner.outcome.is_none() {
-            inner.body = Some(BodyPtr(NonNull::from(header)));
-        }
+        // the handle (`ENDED`): nothing to follow.
+        let _ended = self.body.compare_exchange(
+            ptr::null_mut(),
+            ptr::from_ref(header).cast_mut(),
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
     }
 
     /// The task's name: the one given to `spawn`, else the `__qualname__` of what was spawned
     /// (as Trio names tasks), else its type's; `Task-<id>` for a task with neither.
     fn resolve_name<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyString>> {
         let Some(label) = &self.label else {
-            return Ok(PyString::new(py, &format!("Task-{}", self.lock().id)));
+            return Ok(PyString::new(
+                py,
+                &format!("Task-{}", self.id.load(Ordering::Relaxed)),
+            ));
         };
         let label = label.bind(py);
         if let Ok(name) = label.cast::<PyString>() {
@@ -199,7 +203,7 @@ impl Task {
     /// forgets the task itself: the handle needs nothing from it any more.
     pub(crate) fn finish(&self, outcome: TaskOutcome) {
         let mut inner = self.lock();
-        inner.body = None;
+        self.body.store(ENDED, Ordering::Release);
         let implicit = inner.implicit.take();
         let previous = inner.outcome.replace(outcome);
         drop(inner);
@@ -208,13 +212,16 @@ impl Task {
     }
 
     /// A counted reference to the task, if it still runs.
-    fn upgrade(inner: &Inner) -> Option<TaskBodyRef<PyTask>> {
-        let body = inner.body.as_ref()?;
-        // SAFETY: `body` points at the header of a task of this handle, which the caller holds
-        // the lock of: the task's body clears the pointer under that lock before it is freed
-        // (`Task::finish`, from `PyTask::drop`), so the allocation is still there. The task is
-        // a PyTask: only `Scope.spawn` and the step driver bind a handle.
-        unsafe { TaskBodyRef::try_from_header(body.0.as_ref()) }
+    fn upgrade(&self, _locked: &Inner) -> Option<TaskBodyRef<PyTask>> {
+        let body = self.body.load(Ordering::Acquire);
+        if body.is_null() || body == ENDED {
+            return None;
+        }
+        // SAFETY: `body` points at the header of a task of this handle, and the caller holds
+        // the lock (`_locked`): the task's body ends the pointer under that lock before it is
+        // freed (`Task::finish`, from `PyTask::drop`), so the allocation is still there. The
+        // task is a PyTask: only `Scope.spawn` and the step driver bind a handle.
+        unsafe { TaskBodyRef::try_from_header(&*body) }
     }
 
     /// The outcome, cloned, if the task finished.
@@ -248,7 +255,7 @@ impl Task {
     /// The task's id: unique in the process, increasing in spawn order.
     #[getter]
     fn id(&self) -> u64 {
-        self.lock().id
+        self.id.load(Ordering::Relaxed)
     }
 
     /// Whether the task finished: it returned, raised, or was cancelled.
@@ -296,7 +303,7 @@ impl Task {
                 return;
             }
             self.cancel_requested.store(true, Ordering::SeqCst);
-            (inner.implicit.clone(), Self::upgrade(&inner))
+            (inner.implicit.clone(), self.upgrade(&inner))
         };
         // The scope's cancel wakes the tasks waiting in it, this one included...
         if let Some(scope) = implicit {
@@ -321,7 +328,7 @@ impl Task {
                     drop(inner);
                     return finished(py, outcome);
                 }
-                None => Self::upgrade(&inner),
+                None => self.upgrade(&inner),
             }
         };
         require_lane("Task.__await__")?;
@@ -364,7 +371,7 @@ impl Task {
     #[getter]
     fn lane(&self) -> Option<u16> {
         let inner = self.lock();
-        let task = Self::upgrade(&inner)?;
+        let task = self.upgrade(&inner)?;
         Some(task.header().owner_lane())
     }
 
