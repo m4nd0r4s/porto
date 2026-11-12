@@ -1,8 +1,8 @@
 """``porto.channel`` and ``porto.unbounded_channel``: the Sender and Receiver API and the
 closure rules (16-sync-primitives-and-channels.md §2.1-§2.3).
 
-Cancellation is not delivered by scopes yet (porto-szb.36): ``_interrupt(token, exc)`` throws
-into a waiting task the way it will, giving the wait up first (T3).
+``_interrupt(token, exc)`` throws into a waiting task the way a cancellation does, giving the
+wait up first (T3); scope cancellation at a synchronous completion is tested with real scopes.
 """
 
 import threading
@@ -524,6 +524,130 @@ def test_a_cancelled_send_waiter_passes_the_room_to_the_next_sender() -> None:
 
     assert run(main()) == ["full", "second"]
     assert outcomes == {"first": "interrupted", "second": "sent"}
+
+
+# Cancellation (T2, C1): a synchronous completion is a checkpoint
+
+Op = Callable[[porto.Sender[int], porto.Receiver[int]], Coroutine[Any, Any, object]]
+
+
+async def _send(tx: porto.Sender[int], rx: porto.Receiver[int]) -> object:
+    await tx.send(99)
+    return None
+
+
+async def _recv(tx: porto.Sender[int], rx: porto.Receiver[int]) -> object:
+    return await rx.recv()
+
+
+async def _recv_many(tx: porto.Sender[int], rx: porto.Receiver[int]) -> object:
+    return await rx.recv_many(4)
+
+
+async def _anext(tx: porto.Sender[int], rx: porto.Receiver[int]) -> object:
+    return await anext(rx)
+
+
+@pytest.mark.parametrize("op", [_send, _recv, _recv_many, _anext])
+def test_a_cancelled_scope_raises_cancelled_at_a_channel_op_that_would_complete(op: Op) -> None:
+    # Room (send) or values (recv) are there, so the op would complete without waiting; being a
+    # synchronous completion it is a checkpoint, and raises before it sends or takes anything.
+    tx, rx = porto.channel[int](4)
+    tx.try_send(1)
+    tx.try_send(2)
+    events: list[str] = []
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.cancel()
+            try:
+                await op(tx, rx)
+                events.append("completed")
+            except porto.Cancelled:
+                events.append("cancelled")
+                raise
+        assert [rx.try_recv(), rx.try_recv()] == [1, 2]
+        with pytest.raises(porto.WouldBlock):
+            rx.try_recv()  # the cancelled send put nothing in
+
+    porto.run(main)
+    assert events == ["cancelled"]
+
+
+def test_a_cancelled_scope_raises_cancelled_at_an_unbounded_send() -> None:
+    tx, rx = porto.unbounded_channel[int]()
+    events: list[str] = []
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.cancel()
+            try:
+                await tx.send(1)
+                events.append("sent")
+            except porto.Cancelled:
+                events.append("cancelled")
+                raise
+        with pytest.raises(porto.WouldBlock):
+            rx.try_recv()
+
+    porto.run(main)
+    assert events == ["cancelled"]
+
+
+def test_a_cancelled_channel_op_does_not_report_a_closed_channel_either() -> None:
+    # Cancellation wins over the outcome the op would have had: a closed channel raises at the
+    # checkpoint as Cancelled, not as EndOfChannel.
+    tx, rx = porto.channel[int](1)
+    tx.close()
+    events: list[str] = []
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            s.cancel()
+            try:
+                await rx.recv()
+            except porto.Cancelled:
+                events.append("cancelled")
+                raise
+
+    porto.run(main)
+    assert events == ["cancelled"]
+
+
+def test_a_shielded_channel_op_in_a_cancelled_scope_still_completes() -> None:
+    tx, rx = porto.channel[int](1)
+
+    async def main() -> int:
+        async with porto.scope() as s:
+            s.cancel()
+            with porto.shield():
+                await tx.send(5)
+                return await rx.recv()
+        raise AssertionError("unreachable")
+
+    assert porto.run(main) == 5
+
+
+def test_a_task_cancelled_between_two_channel_ops_loses_nothing() -> None:
+    tx, rx = porto.channel[int](4)
+    for i in range(3):
+        tx.try_send(i)
+    got: list[int] = []
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            got.append(await rx.recv())
+            s.cancel()
+            try:
+                got.append(await rx.recv())
+            except porto.Cancelled:
+                pass
+            s.cancel()
+        # The cancelled recv took nothing: the rest is still there.
+        assert [rx.try_recv(), rx.try_recv()] == [1, 2]
+
+    porto.run(main)
+    assert got == [0]
 
 
 # blocking_send / blocking_recv (non-runtime threads)

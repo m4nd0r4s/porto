@@ -5,8 +5,11 @@
 //! sends nor loses a value. Each resume tries the operation without waiting:
 //!
 //! - it completed: the await returns its result (`PYGEN_RETURN` through `am_send`). A
-//!   completion on the first try is synchronous, so it spends the task's budget (T2): when the
-//!   budget runs out it yields a `YieldThen` trap instead, and returns what that sends back;
+//!   completion on the first try is synchronous, so it is a checkpoint (T2, spec 11 §5.3): the
+//!   first resume raises `Cancelled` before it tries anything while the task's scope is
+//!   cancelled (C1), so a cancelled task neither sends nor takes a value, and it spends the
+//!   task's budget: when the budget runs out it yields a `YieldThen` trap instead, and returns
+//!   what that sends back;
 //! - it would wait: it yields a `Notified` trap whose target is the handle; the driver parks
 //!   the task's embedded wait node on the channel's waiter list (`Sender::poll_ready`). A wake
 //!   means "retry": the next resume tries again, and waits again if another task was faster;
@@ -153,7 +156,14 @@ impl ChannelOp {
     fn resume(&mut self, py: Python<'_>, sent: &Bound<'_, PyAny>) -> PyResult<Stepped> {
         let (mut op, first) = match std::mem::replace(&mut self.state, State::Done) {
             State::Fresh(_) if !sent.is_none() => return Err(not_started_error()),
-            State::Fresh(op) => (op, true),
+            State::Fresh(op) => {
+                // Before the attempt, which takes a value or sends one: a cancelled task does
+                // neither. Only the first resume: a retry after a wake must act on the wake it
+                // observed (the wake would be lost); the driver delivers a cancellation that
+                // arrives while the task waits.
+                step::raise_if_cancelled(py)?;
+                (op, true)
+            }
             State::Waiting(op) => (op, false),
             State::Delivering => return Ok(Stepped::Return(sent.clone().unbind())),
             State::Done => return Err(reused_error()),
