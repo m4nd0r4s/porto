@@ -6,6 +6,8 @@ discarded)`` tuple per size class, for the lane running the caller (cleared when
 
 import socket
 import sys
+import sysconfig
+import threading
 
 import pytest
 
@@ -168,3 +170,85 @@ def test_a_pending_read_into_holds_its_buffer_at_a_fixed_size() -> None:
             handle.close()
 
     porto.run(main())
+
+
+needs_buffer_dunder = pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="__buffer__ in Python classes needs 3.12 (PEP 688)"
+)
+
+
+@needs_buffer_dunder
+def test_extend_with_data_whose_buffer_exports_this_buffer_is_refused() -> None:
+    """``data.__buffer__`` runs Python code: if it exports ``buf`` and keeps the view, growing
+    ``buf`` would free the memory that view points to."""
+    buffer = porto.Buffer(4)
+    with memoryview(buffer) as view:
+        view[:] = b"keep"
+    kept: list[memoryview] = []
+
+    class Evil:
+        def __buffer__(self, flags: int, /) -> memoryview:
+            kept.append(memoryview(buffer))
+            return memoryview(b"x" * 100_000)
+
+    with pytest.raises(BufferError, match="view of it is exported"):
+        buffer.extend(Evil())  # pyright: ignore[reportArgumentType]
+    assert bytes(kept[0]) == b"keep"
+    assert len(buffer) == 4
+    kept[0].release()
+    buffer.extend(b"!")
+    assert bytes(buffer) == b"keep!"
+
+
+@needs_buffer_dunder
+def test_extend_with_data_whose_buffer_is_this_buffer_is_refused() -> None:
+    buffer = porto.Buffer(4)
+
+    class Mirror:
+        def __buffer__(self, flags: int, /) -> memoryview:
+            return memoryview(buffer)
+
+    with pytest.raises(BufferError, match="view of it is exported"):
+        buffer.extend(Mirror())  # pyright: ignore[reportArgumentType]
+    assert bytes(buffer) == b"\0\0\0\0"
+    buffer.extend(b"ok")
+    assert len(buffer) == 6
+
+
+FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
+@pytest.mark.skipif(not FREE_THREADED, reason="needs a free-threaded build (3.14t)")
+def test_views_and_reads_race_on_threads_without_failing() -> None:
+    """On a free-threaded build, exporting and releasing views while other threads read the
+    buffer never fails, and the export count ends at zero (the buffer can resize again)."""
+    buffer = porto.Buffer(64)
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(4)
+
+    def export_views() -> None:
+        barrier.wait()
+        try:
+            for _ in range(20_000):
+                with memoryview(buffer) as view:
+                    view[0] = 1
+        except BaseException as error:
+            errors.append(error)
+
+    def read() -> None:
+        barrier.wait()
+        try:
+            for _ in range(20_000):
+                assert len(buffer) == 64
+                bytes(buffer)
+                repr(buffer)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=f) for f in (export_views, export_views, read, read)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    buffer.resize(1)
