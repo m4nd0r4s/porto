@@ -13,7 +13,7 @@ use socket2::Socket;
 use super::buffer_view::{PyBufferMut, PyBufferRef};
 use super::op::{IoOp, IoRegistration, os_error, submit};
 use super::sockaddr;
-use crate::driver::lane;
+use crate::driver::{lane, step};
 
 /// The most bytes one receive asks for by default.
 const DEFAULT_MAX: usize = 65536;
@@ -123,16 +123,22 @@ impl IoHandle {
     /// Connects to `address` without blocking: `None` once connected, or the error.
     fn connect(&self, py: Python<'_>, address: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let address = sockaddr::from_py(address)?;
+        // A cancelled task must not start a connection it will never finish (C1).
+        step::raise_if_cancelled(py)?;
         match self
             .registration
             .source()
             .and_then(|socket| socket.connect(&address))
         {
             Ok(()) => {}
-            // Started: Unix reports `EINPROGRESS`, Windows `WSAEWOULDBLOCK`.
+            // Started: Unix reports `EINPROGRESS`, Windows `WSAEWOULDBLOCK`. A signal that
+            // interrupts a nonblocking connect (`EINTR`) leaves it going on asynchronously too:
+            // its outcome comes with writability (POSIX `connect`).
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == EINPROGRESS => {}
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) || error.raw_os_error() == EINPROGRESS => {}
             Err(error) => return Err(os_error(&error)),
         }
         self.submit(py, IoOp::Connect)

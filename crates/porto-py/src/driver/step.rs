@@ -211,6 +211,16 @@ pub(crate) fn proceed_in_task(py: Python<'_>) -> PyResult<Option<bool>> {
     }
 }
 
+/// Raises `Cancelled` while the running task's effective scope is cancelled (C1), spending no
+/// budget: for a call that starts something it cannot take back (a connect) before it returns
+/// its awaitable. Nothing outside a porto task.
+pub(crate) fn raise_if_cancelled(py: Python<'_>) -> PyResult<()> {
+    match running().and_then(|running| running_cancellation(py, running)) {
+        Some(cancelled) => Err(PyErr::from_value(cancelled.into_bound(py).into_any())),
+        None => Ok(()),
+    }
+}
+
 /// T2 for a native awaitable that completed synchronously and suspends by itself: spends one
 /// unit of the running task's budget exactly as [`checkpoint_if_needed`] does, and returns
 /// whether the budget was already spent (the awaitable then yields a `YieldThen` trap with its

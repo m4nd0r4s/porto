@@ -311,6 +311,23 @@ def test_connect_reports_a_refused_connection() -> None:
     run(main())
 
 
+def test_a_cancelled_task_does_not_start_a_connect() -> None:
+    async def main() -> None:
+        with socket.socket() as listener, socket.socket() as client:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            handle = _core._IoHandle(client.fileno())
+            async with porto.scope() as s:
+                s.cancel()
+                with pytest.raises(porto.Cancelled):
+                    handle.connect(listener.getsockname())
+            with pytest.raises(OSError, match="not connected"):
+                client.getpeername()
+            handle.close()
+
+    run(main())
+
+
 def test_a_connect_address_must_be_numeric() -> None:
     async def main() -> None:
         with socket.socket() as client:
