@@ -25,7 +25,9 @@ pub(crate) fn to_py(py: Python<'_>, address: &SockAddr) -> PyResult<Py<PyAny>> {
     }
     #[cfg(unix)]
     {
-        if address.is_unnamed() {
+        // An unbound Unix sender: macOS reports an `AF_UNIX` address with no path, Linux an
+        // empty one (length 0, family 0). Both read as '' on every platform.
+        if address.is_unnamed() || address.len() == 0 {
             return Ok(PyString::new(py, "").into_any().unbind());
         }
         if let Some(path) = address.as_pathname() {
