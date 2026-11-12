@@ -4,6 +4,7 @@
 pub(crate) mod channel;
 pub(crate) mod channel_op;
 pub(crate) mod config;
+pub(crate) mod oneshot;
 pub(crate) mod run;
 pub(crate) mod scope;
 mod scope_deadline;

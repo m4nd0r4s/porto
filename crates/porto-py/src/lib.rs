@@ -56,6 +56,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     driver::freelist::install::<api::channel_op::ChannelOp>(py, &channel_op_freelist::SLOTS)?;
     py_compat::names(py);
     api::channel::register(module)?;
+    api::oneshot::register(module)?;
     api::config::register(module)?;
     api::run::register(module)?;
     api::scope::register(module)?;

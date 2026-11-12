@@ -31,6 +31,7 @@ use porto_core::sync::mpsc::{TryRecvError, TrySendError};
 use super::channel::{
     PyObj, RecvSide, SendSide, collect_many, recv_closed_error, send_closed_error,
 };
+use super::oneshot::{self, OneshotRecvSide};
 use crate::async_slots::{guard_send, stop_iteration};
 use crate::driver::thin::{WaitTarget, Waitable};
 use crate::driver::trap::{Trap, TrapKind};
@@ -54,6 +55,14 @@ pub(super) enum Op {
         side: Arc<Waitable<RecvSide>>,
         max: usize,
     },
+    /// A oneshot receiver's `recv()`.
+    OneshotRecv {
+        side: Arc<Waitable<OneshotRecvSide>>,
+    },
+    /// A oneshot receiver's `__anext__()`: the end is `StopAsyncIteration`.
+    OneshotNext {
+        side: Arc<Waitable<OneshotRecvSide>>,
+    },
 }
 
 impl Op {
@@ -64,6 +73,8 @@ impl Op {
             Self::Recv { .. } => "Receiver.recv()",
             Self::Next { .. } => "anext(receiver)",
             Self::RecvMany { .. } => "Receiver.recv_many(...)",
+            Self::OneshotRecv { .. } => "OneshotReceiver.recv()",
+            Self::OneshotNext { .. } => "anext(oneshot receiver)",
         }
     }
 
@@ -103,6 +114,19 @@ impl Op {
                 Err(TryRecvError::Empty) => Ok(None),
                 Err(TryRecvError::Closed) => Err(recv_closed_error(&side.0)),
             },
+            Self::OneshotRecv { side } => match side.0.try_recv() {
+                Ok(value) => Ok(Some(value)),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Closed) => Err(oneshot::recv_closed_error(&side.0)),
+            },
+            Self::OneshotNext { side } => match side.0.try_recv() {
+                Ok(value) => Ok(Some(value)),
+                Err(TryRecvError::Empty) => Ok(None),
+                Err(TryRecvError::Closed) if side.0.is_handle_closed() => {
+                    Err(oneshot::recv_closed_error(&side.0))
+                }
+                Err(TryRecvError::Closed) => Err(PyStopAsyncIteration::new_err(())),
+            },
         }
     }
 
@@ -113,6 +137,7 @@ impl Op {
             Self::Recv { side } | Self::Next { side } | Self::RecvMany { side, .. } => {
                 side.target()
             }
+            Self::OneshotRecv { side } | Self::OneshotNext { side } => side.target(),
         }
     }
 }

@@ -5,6 +5,7 @@ closure rules (16-sync-primitives-and-channels.md §2.1-§2.3).
 wait up first (T3); scope cancellation at a synchronous completion is tested with real scopes.
 """
 
+import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Coroutine
@@ -638,10 +639,8 @@ def test_a_task_cancelled_between_two_channel_ops_loses_nothing() -> None:
         async with porto.scope() as s:
             got.append(await rx.recv())
             s.cancel()
-            try:
+            with contextlib.suppress(porto.Cancelled):
                 got.append(await rx.recv())
-            except porto.Cancelled:
-                pass
             s.cancel()
         # The cancelled recv took nothing: the rest is still there.
         assert [rx.try_recv(), rx.try_recv()] == [1, 2]

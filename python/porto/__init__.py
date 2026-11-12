@@ -20,7 +20,7 @@ print(porto.run(main))
 """
 
 from porto import lowlevel
-from porto._channel import channel, unbounded_channel
+from porto._channel import channel, oneshot, unbounded_channel
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
     Barrier,
@@ -32,6 +32,8 @@ from porto._core import (
     Mutex,
     MutexGuard,
     Notify,
+    OneshotReceiver,
+    OneshotSender,
     Receiver,
     RwLock,
     Scope,
@@ -88,6 +90,8 @@ __all__ = [
     "MutexGuard",
     "NoRuntimeError",
     "Notify",
+    "OneshotReceiver",
+    "OneshotSender",
     "PortoError",
     "Receiver",
     "RuntimeClosed",
@@ -109,6 +113,7 @@ __all__ = [
     "lowlevel",
     "monotonic",
     "move_on_after",
+    "oneshot",
     "run",
     "scope",
     "shield",

@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from porto import _core
-from porto._core import Receiver, Sender
+from porto._core import OneshotReceiver, OneshotSender, Receiver, Sender
 
 _T = TypeVar("_T")
 
@@ -50,3 +50,16 @@ class unbounded_channel(Generic[_T]):
 
     def __new__(cls) -> tuple[Sender[_T], Receiver[_T]]:
         return _core._unbounded_channel()  # pyright: ignore[reportPrivateUsage]
+
+
+class oneshot(Generic[_T]):
+    """A channel for one value: ``tx, rx = porto.oneshot[int]()``.
+
+    ``tx.send(value)`` never waits, so it is not awaited; ``await rx.recv()`` waits for the
+    value. A sender closed or dropped without sending ends the channel
+    (``porto.EndOfChannel`` at the receiver); a receiver closed or dropped first makes the send
+    raise ``porto.BrokenResourceError``.
+    """
+
+    def __new__(cls) -> tuple[OneshotSender[_T], OneshotReceiver[_T]]:
+        return _core._oneshot()  # pyright: ignore[reportPrivateUsage]

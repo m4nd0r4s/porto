@@ -212,6 +212,44 @@ def check_channel_misuse_is_a_type_error() -> None:
     del objects, ints
 
 
+async def check_oneshot_is_typed() -> None:
+    tx, rx = porto.oneshot[int]()
+    assert_type(tx, porto.OneshotSender[int])
+    assert_type(rx, porto.OneshotReceiver[int])
+    tx.send(1)  # never waits: not awaited
+    assert_type(await rx.recv(), int)
+    assert_type(rx.try_recv(), int)
+    assert_type(rx.blocking_recv(), int)
+    async for item in rx:
+        assert_type(item, int)
+    async with tx:
+        pass
+    tx.close()
+    rx.close()
+
+
+def check_oneshot_misuse_is_a_type_error() -> None:
+    tx, rx = porto.oneshot[int]()
+    tx.send("one")  # pyright: ignore[reportArgumentType]
+    tx.send()  # pyright: ignore[reportCallIssue]
+    porto.oneshot[int](1)  # pyright: ignore[reportCallIssue]
+    rx.recv_many(2)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+    tx.clone()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+    objects: porto.OneshotReceiver[object] = porto.oneshot[int]()[1]
+    ints: porto.OneshotSender[int] = porto.oneshot[object]()[0]
+    del objects, ints
+
+
+async def oneshot_roundtrip() -> int:
+    tx, rx = porto.oneshot[int]()
+    tx.send(5)
+    return await rx.recv()
+
+
+def test_the_oneshot_sample_runs() -> None:
+    assert porto.run(oneshot_roundtrip) == 5
+
+
 def test_the_channel_sample_runs() -> None:
     assert porto.run(pipeline, ["a", "b", "c"]) == ["a", "b", "c"]
 

@@ -310,7 +310,7 @@ impl Receiver {
 }
 
 /// `cls[item]` at runtime, so `porto.Sender[int]` works in annotations that are evaluated.
-fn generic_alias<'py>(
+pub(super) fn generic_alias<'py>(
     cls: &Bound<'py, PyType>,
     item: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {

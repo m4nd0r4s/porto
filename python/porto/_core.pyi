@@ -879,6 +879,71 @@ class Receiver(Generic[_T_co]):
 def _channel(capacity: int, /) -> tuple[Sender[Any], Receiver[Any]]: ...
 def _unbounded_channel() -> tuple[Sender[Any], Receiver[Any]]: ...
 
+# Oneshot channel (porto.oneshot): one value, from one sender to one receiver. Sending never
+# waits, so ``send`` is a plain call.
+
+@final
+class OneshotSender(Generic[_T_contra]):
+    """The sending end of a oneshot channel: sends one value, then is used up.
+
+    Closing it (``close()``, ``async with``, or dropping the last reference) without sending
+    ends the channel for the receiver.
+    """
+
+    def send(self, value: _T_contra, /) -> None:
+        """Sends ``value``; never waits, so it is not awaited. Raises
+        ``porto.BrokenResourceError`` if the receiver is gone, ``porto.ClosedResourceError`` if
+        this sender was closed or already sent."""
+
+    def close(self) -> None:
+        """Closes this sender without sending: the receiver sees ``porto.EndOfChannel``.
+        Closing twice, or after sending, does nothing."""
+
+    def is_closed(self) -> bool:
+        """Whether a send would fail: this sender was closed or used up, or the receiver is
+        gone."""
+
+    async def __aenter__(self) -> Self: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> None: ...
+
+@final
+class OneshotReceiver(Generic[_T_co]):
+    """The receiving end of a oneshot channel.
+
+    Closing it (``close()``, or dropping the last reference) makes sends raise
+    ``porto.BrokenResourceError`` and drops a value that was sent but not received.
+    """
+
+    def recv(self) -> Awaitable[_T_co]:
+        """The value, waiting until it is sent. Raises ``porto.EndOfChannel`` if the sender was
+        closed or dropped without sending, or the value was already received,
+        ``porto.ClosedResourceError`` if this receiver was closed. Nothing happens until it is
+        awaited; one freed unawaited emits ``RuntimeWarning``."""
+
+    def try_recv(self) -> _T_co:
+        """The value if it was sent; raises ``porto.WouldBlock`` if not yet, and the errors of
+        ``recv``."""
+
+    def blocking_recv(self) -> _T_co:
+        """``recv`` from a thread that does not run porto, blocking that thread until the
+        value is sent. Raises ``RuntimeError`` on a porto lane thread."""
+
+    def close(self) -> None:
+        """Closes this receiver. Receives already waiting through it raise
+        ``porto.ClosedResourceError``. Closing twice does nothing."""
+
+    def __aiter__(self) -> Self: ...
+    def __anext__(self) -> Awaitable[_T_co]:
+        """``async for value in rx``: yields the one value, then the loop ends."""
+
+def _oneshot() -> tuple[OneshotSender[Any], OneshotReceiver[Any]]: ...
+
 @final
 class _Trap:
     """A request to the driver. Awaiting it yields the trap, then returns what the driver sends.
