@@ -15,7 +15,7 @@
 
 use std::cell::Cell;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
 use porto_core::scope::CancelReason;
@@ -25,6 +25,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyString, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
+use super::scope_children::{ChildList, unlink};
 use super::time::require_lane;
 use crate::driver::pytask::{PyScopeNode, PyScopeRef, PyTask, TaskOutcome, shut_down_error};
 use crate::driver::step;
@@ -111,6 +112,10 @@ pub struct Task {
     /// one since (15 C11). Still set when the task returns normally, the cancellation was
     /// swallowed. Written by the task's own lane at its cold paths, read when it ends.
     cancel_delivered: AtomicBool,
+    /// The list of the scope this task is listed in for `Scope.tasks`, null if none
+    /// (`scope_children`); `slot` is its place in it. Both change under that list's lock.
+    home: AtomicPtr<ChildList>,
+    slot: AtomicU32,
 }
 
 impl Task {
@@ -129,6 +134,8 @@ impl Task {
             pinned,
             cancel_requested: AtomicBool::new(false),
             cancel_delivered: AtomicBool::new(false),
+            home: AtomicPtr::new(ptr::null_mut()),
+            slot: AtomicU32::new(0),
         }
     }
 
@@ -145,8 +152,29 @@ impl Task {
         self.cancel_delivered.load(Ordering::Relaxed)
     }
 
-    /// Whether the task ended (its outcome is stored, or the task was freed unfinished), for
-    /// the scope's list of children to drop it.
+    /// The task's id, for ordering a scope's tasks in a snapshot.
+    pub(super) fn task_id(&self) -> u64 {
+        self.id.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn slot(&self) -> u32 {
+        self.slot.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_slot(&self, slot: u32) {
+        self.slot.store(slot, Ordering::Relaxed);
+    }
+
+    pub(super) fn set_home(&self, home: *mut ChildList) {
+        self.home.store(home, Ordering::Release);
+    }
+
+    /// Clears the link to the scope list and returns it (null if there was none).
+    pub(super) fn take_home(&self) -> *mut ChildList {
+        self.home.swap(ptr::null_mut(), Ordering::AcqRel)
+    }
+
+    /// Whether the task ended (its outcome is stored, or the task was freed unfinished).
     #[inline]
     pub(crate) fn has_ended(&self) -> bool {
         self.body.load(Ordering::Acquire) == ENDED
@@ -244,6 +272,9 @@ impl Task {
         let implicit = inner.implicit.take();
         let previous = inner.outcome.replace(outcome);
         drop(inner);
+        // Off its scope's list before anything else can free the handle: the list holds no
+        // reference (scope_children).
+        unlink(self);
         drop(previous);
         drop(implicit);
     }

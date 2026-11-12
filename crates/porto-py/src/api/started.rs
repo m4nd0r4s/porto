@@ -95,7 +95,7 @@ impl Started {
         }
         // `Scope.tasks` of the target lists it from now on.
         if let Some(task) = step::current_task(py)? {
-            self.target_scope.get().register_child(task);
+            self.target_scope.get().register_child(task.bind(py));
         }
         Ok(())
     }

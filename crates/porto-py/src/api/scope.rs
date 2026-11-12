@@ -37,14 +37,13 @@
 //! `Scope.name` is the name `porto.scope(name=)` gave (`""` for none, `"root"` for the root
 //! scope); it names the scope in the exception group its exit raises. `Scope.tasks` is a
 //! snapshot of the tasks spawned into it (`Scope.spawn`, or moved in by `started.set`) that
-//! have not ended: the scope keeps their handles in a list that spawning compacts.
+//! have not ended: the scope lists them (`scope_children`) and a task takes itself off when it
+//! ends.
 //!
 //! Not yet: spawning from other lanes or threads (C10).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
-
-use parking_lot::Mutex as FastMutex;
 
 use porto_core::Handle;
 use porto_core::scope::{CancelReason, ScopeNode};
@@ -54,9 +53,9 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
-use pyo3::{PyTraverseError, PyVisit};
 
 use super::run::{closing_on_error, coroutine_from};
+use super::scope_children::ChildList;
 use super::scope_deadline::{self, ScopeDeadline, seconds};
 use super::scope_exit;
 use super::scope_exit::ScopeExit;
@@ -190,56 +189,7 @@ pub struct Scope {
     /// The name `porto.scope(name=)` gave, `None` for an unnamed scope.
     name: Option<Py<PyString>>,
     /// The tasks spawned into the scope that may still run (`Scope.tasks`).
-    children: FastMutex<Children>,
-}
-
-/// The handles of a scope's children, for `Scope.tasks`. A task is taken out lazily: spawning
-/// drops the ended ones once the list has grown to four times what the last compaction kept
-/// (at least 256), so a scope that spawns a million short tasks one after another keeps a few
-/// hundred handles, an exit drops them all, and a scope with 10k live tasks is scanned a
-/// handful of times, not at every spawn (porto-szb.43 measured the cost).
-struct Children {
-    tasks: Vec<Py<Task>>,
-    /// Compact at this length.
-    compact_at: usize,
-}
-
-impl Children {
-    const COMPACT_MIN: usize = 256;
-
-    const fn new() -> Self {
-        Self {
-            tasks: Vec::new(),
-            compact_at: Self::COMPACT_MIN,
-        }
-    }
-
-    /// Adds `task`, compacting first if the list reached its limit. Returns the handles taken
-    /// out, to be dropped by the caller after it released the lock (dropping one may run Python
-    /// code).
-    fn push(&mut self, task: Py<Task>) -> Vec<Py<Task>> {
-        let ended = if self.tasks.len() >= self.compact_at {
-            self.compact()
-        } else {
-            Vec::new()
-        };
-        self.tasks.push(task);
-        ended
-    }
-
-    /// Takes the ended handles out, keeping the others in order.
-    fn compact(&mut self) -> Vec<Py<Task>> {
-        let mut kept = 0;
-        for index in 0..self.tasks.len() {
-            if !self.tasks[index].get().has_ended() {
-                self.tasks.swap(kept, index);
-                kept += 1;
-            }
-        }
-        let ended = self.tasks.split_off(kept);
-        self.compact_at = Self::COMPACT_MIN.max(kept.saturating_mul(4));
-        ended
-    }
+    children: ChildList,
 }
 
 /// The bits of `Scope::flags`.
@@ -639,18 +589,7 @@ impl Scope {
     /// not yet moved here (before `started.set`).
     #[getter]
     fn tasks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let (live, ended) = {
-            let mut children = self.children.lock();
-            let ended = children.compact();
-            let live: Vec<Py<Task>> = children
-                .tasks
-                .iter()
-                .map(|task| task.clone_ref(py))
-                .collect();
-            (live, ended)
-        };
-        drop(ended);
-        PyTuple::new(py, live)
+        PyTuple::new(py, self.children.snapshot(py))
     }
 
     fn __repr__(&self) -> String {
@@ -683,23 +622,6 @@ impl Scope {
             "<porto.Scope {phase}{cancelled}, {} live tasks{exit}>",
             state.live_children
         )
-    }
-    // A child's outcome may reference the scope again (an exception's traceback reaches the
-    // frame that holds `s`): let the cycle collector see through the list of children.
-    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
-        // Never block in the collector; a held lock means a spawn or an exit is in progress.
-        let Some(children) = self.children.try_lock() else {
-            return Ok(());
-        };
-        for task in &children.tasks {
-            visit.call(task)?;
-        }
-        Ok(())
-    }
-
-    fn __clear__(&self) {
-        let listed = std::mem::take(&mut self.children.lock().tasks);
-        drop(listed);
     }
 }
 
@@ -734,7 +656,7 @@ impl Scope {
             raise_on_timeout,
             bare_error: false,
             name: None,
-            children: FastMutex::new(Children::new()),
+            children: ChildList::new(),
         }
     }
 
@@ -779,14 +701,13 @@ impl Scope {
             Some(context) => pytask::spawn_in_context(&handle, coro, context.unbind(), spawned)?,
         };
         task.get().bind(&body);
-        self.register_child(task.clone_ref(py));
+        self.register_child(task.bind(py));
         Ok(task)
     }
 
     /// Lists `task` among the scope's children (`Scope.tasks`).
-    pub(crate) fn register_child(&self, task: Py<Task>) {
-        let ended = self.children.lock().push(task);
-        drop(ended);
+    pub(crate) fn register_child(&self, task: &Bound<'_, Task>) {
+        self.children.register(task);
     }
 
     /// The node of a scope that tasks can be spawned into: entered with `async with` and not
@@ -892,10 +813,9 @@ impl Scope {
     /// returns the children's failures.
     pub(crate) fn close(&self) -> Vec<Py<PyBaseException>> {
         self.flags.fetch_or(ScopeFlags::CLOSED, Ordering::AcqRel);
-        // Every child ended (C5), or the scope never ran: nothing is left to list. Dropped
-        // after the lock.
-        let listed = std::mem::take(&mut self.children.lock().tasks);
-        drop(listed);
+        // Every child ended (C5), or the scope never ran: nothing is left to list, and the
+        // tasks of a root scope abandoned at shutdown must not point at the list any more.
+        self.children.detach_all();
         let Some(node) = self.node.get() else {
             return Vec::new();
         };

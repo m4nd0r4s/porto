@@ -394,10 +394,28 @@ def test_tasks_lists_a_started_task_only_once_it_called_set() -> None:
     porto.run(main)
 
 
-def test_tasks_stays_exact_when_a_scope_spawns_many_short_tasks_in_turn() -> None:
-    """The list that backs it is compacted by spawning: it must neither lose live tasks nor keep
-    ended ones in the snapshot."""
+def test_tasks_stays_exact_when_tasks_end_in_any_order() -> None:
+    """The scope's list moves the last task into the place of one that ended: whichever ends,
+    ``tasks`` must hold exactly the others, in spawn order."""
 
+    async def main() -> None:
+        releases = [[] for _ in range(40)]  # type: list[list[bool]]
+        async with porto.scope() as s:
+            tasks = [s.spawn(_hold, release) for release in releases]
+            assert s.tasks == tuple(tasks)
+            live = list(tasks)
+            for index in (7, 0, 39, 20, 21, 1, 38):  # first, last and middle ones
+                releases[index].append(True)
+                await tasks[index]
+                live.remove(tasks[index])
+                assert s.tasks == tuple(live)
+            for release in releases:
+                release.append(True)
+
+    porto.run(main)
+
+
+def test_tasks_stays_exact_when_a_scope_spawns_many_short_tasks_in_turn() -> None:
     async def main() -> None:
         release: list[bool] = []
         async with porto.scope() as s:
@@ -408,6 +426,25 @@ def test_tasks_stays_exact_when_a_scope_spawns_many_short_tasks_in_turn() -> Non
             release.append(True)
 
     porto.run(main)
+
+
+def test_a_task_that_outlives_its_scope_object_is_unlisted_safely() -> None:
+    """The root scope is closed with abandoned tasks still running: they end afterwards."""
+    import gc
+    import warnings
+
+    async def main() -> None:
+        async def stubborn() -> None:
+            while True:
+                with contextlib.suppress(porto.Cancelled):
+                    await porto.sleep(0.001)
+
+        _core._root_scope().spawn(stubborn)  # pyright: ignore[reportPrivateUsage]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        porto.run(main, cancel_timeout=0.01)
+    gc.collect()
 
 
 def test_tasks_of_a_cancelled_scope_empty_as_the_children_end() -> None:

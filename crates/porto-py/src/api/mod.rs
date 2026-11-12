@@ -9,6 +9,7 @@ pub(crate) mod net;
 pub(crate) mod oneshot;
 pub(crate) mod run;
 pub(crate) mod scope;
+mod scope_children;
 mod scope_deadline;
 mod scope_exit;
 mod started;
