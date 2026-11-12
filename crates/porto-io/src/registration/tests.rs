@@ -129,6 +129,44 @@ fn try_io_reads_once_ready_and_clears_on_would_block() {
 }
 
 #[test]
+fn attempt_io_reads_before_the_driver_reports_and_clears_on_would_block() {
+    let driver = driver();
+    let (mut left, right) = socketpair();
+    let registration = register(&driver, right);
+    left.write_all(b"early").unwrap();
+    let read_now = |registration: &Registration<UnixStream>| {
+        registration.attempt_io(Interest::READABLE, |mut stream| {
+            let mut buffer = [0; 64];
+            let read = stream.read(&mut buffer)?;
+            Ok(buffer[..read].to_vec())
+        })
+    };
+    assert_eq!(
+        read_now(&registration).unwrap(),
+        b"early",
+        "the fast path reads without waiting for the driver"
+    );
+    // Once the driver reported readiness, an attempt that hits `WouldBlock` clears it.
+    left.write_all(b"late").unwrap();
+    assert!(driver.turn(LONG).unwrap() >= 1);
+    let reported = registration
+        .scheduled_io()
+        .ready_event(registration.id(), Interest::READABLE);
+    assert!(reported.ready().is_readable());
+    assert_eq!(read_now(&registration).unwrap(), b"late");
+    assert_eq!(
+        read_now(&registration).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let event = registration
+        .scheduled_io()
+        .ready_event(registration.id(), Interest::READABLE);
+    assert!(event.ready().is_empty(), "the stale readiness was cleared");
+    registration.close().unwrap();
+    assert_closed(&read_now(&registration).unwrap_err());
+}
+
+#[test]
 fn close_wakes_every_waiter_with_a_closed_error() {
     let driver = driver();
     let (_left, right) = socketpair();

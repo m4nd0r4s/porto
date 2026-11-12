@@ -165,6 +165,33 @@ impl<S> Registration<S> {
         result
     }
 
+    /// Runs `f`, a nonblocking operation on the source, at once, whatever readiness was
+    /// observed: the fast path of an operation that may succeed before the driver reported
+    /// anything (a fresh registration, data that arrived since the last turn). If `f` hits
+    /// `WouldBlock`, clears the readiness observed before the attempt, unless newer readiness
+    /// arrived meanwhile, so the next wait does not return at once for nothing.
+    ///
+    /// # Errors
+    ///
+    /// A [`ClosedResource`] error once the registration is closed or released, or `f`'s error
+    /// (`WouldBlock` when the source is not ready: wait with [`readiness`](Self::readiness),
+    /// then try again).
+    pub fn attempt_io<R>(
+        &self,
+        interest: Interest,
+        f: impl FnOnce(&S) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let source = self.source()?;
+        let event = self.checked(self.scheduled_io().ready_event(self.id, interest))?;
+        let result = source.with(f);
+        if !event.ready().is_empty()
+            && matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        {
+            self.scheduled_io().clear_readiness(event);
+        }
+        result
+    }
+
     /// Runs `f`, a nonblocking operation on the source, until it does not hit `WouldBlock`,
     /// waiting for readiness matching `interest` before each attempt.
     ///
