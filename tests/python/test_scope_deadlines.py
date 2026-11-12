@@ -487,9 +487,21 @@ def test_a_deadline_set_after_its_run_ended_is_recorded_and_arms_nothing() -> No
         porto.run(main, cancel_timeout=0.01)
     (s,) = kept
     kept.clear()
+    assert s.deadline != math.inf, "the armed deadline still reads back after the run"
     s.deadline = 123.0
     assert s.deadline == 123.0
     worker = threading.Thread(target=lambda: setattr(s, "deadline", 456.0))
     worker.start()
     worker.join()
     assert s.deadline == 456.0
+
+
+def test_a_scope_reads_its_deadline_back_after_its_run_ended() -> None:
+    async def main() -> tuple[porto.Scope, float]:
+        async with porto.move_on_after(5) as s:
+            deadline = s.deadline
+        return s, deadline
+
+    s, deadline = porto.run(main)
+    assert deadline != math.inf
+    assert s.deadline == deadline

@@ -37,6 +37,9 @@ struct Pending {
     /// scope that outlives its run must not keep the runtime's state alive, and a deadline set
     /// after the run ended has nothing to arm on (it is recorded, inert).
     entered_on: Option<WeakHandle>,
+    /// A deadline set after the run ended (nothing to arm it on): what `Scope.deadline` reads
+    /// from then on, in place of the node's.
+    set_after_run: Option<f64>,
 }
 
 impl ScopeDeadline {
@@ -48,6 +51,7 @@ impl ScopeDeadline {
                 deadline: deadline.unwrap_or(f64::INFINITY),
                 timeout,
                 entered_on: None,
+                set_after_run: None,
             }),
         }
     }
@@ -71,15 +75,13 @@ impl ScopeDeadline {
         ScopeNode::set_deadline(node, handle, deadline);
     }
 
-    /// `Scope.deadline`: the node's once entered, else the deadline given (a `timeout=` is
-    /// not counted until the entry).
+    /// `Scope.deadline`: the node's once entered (also after its run ended, unless set since),
+    /// else the deadline given (a `timeout=` is not counted until the entry).
     pub(super) fn get(&self, node: Option<&PyScopeNode>) -> f64 {
         let pending = self.lock();
-        match (
-            node,
-            pending.entered_on.as_ref().and_then(WeakHandle::upgrade),
-        ) {
-            (Some(node), Some(_)) => seconds_of(node.deadline()),
+        match (node, pending.entered_on.is_some(), pending.set_after_run) {
+            (_, true, Some(seconds)) => seconds,
+            (Some(node), true, None) => seconds_of(node.deadline()),
             _ => pending.deadline,
         }
     }
@@ -96,7 +98,7 @@ impl ScopeDeadline {
             }
             // Entered, but its runtime is gone: no clock and no wheel, so the deadline is only
             // recorded (and reads back), and nothing is armed or kept alive.
-            (Some(_), Some(None)) => pending.deadline = seconds,
+            (Some(_), Some(None)) => pending.set_after_run = Some(seconds),
             _ => {
                 pending.deadline = seconds;
                 pending.timeout = None;
