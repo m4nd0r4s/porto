@@ -15,4 +15,4 @@ mio.workspace = true
 workspace = true
 
 [target."cfg(loom)".dev-dependencies]
-loom = "0.7.2"
+loom = { version = "0.7.2", features = ["checkpoint"] }
