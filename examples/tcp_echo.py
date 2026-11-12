@@ -16,6 +16,7 @@ bytes into a ``bytes``. A stream belongs to the ``porto.run`` that opened it.
 """
 
 import socket
+import sys
 import threading
 
 import porto
@@ -114,4 +115,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    porto.run(main)
+    if sys.platform == "win32":
+        # The Windows I/O backend (IOCP) is not written yet: porto cannot register sockets there.
+        print("tcp_echo: skipped, porto has no sockets on Windows yet")
+    else:
+        porto.run(main)
