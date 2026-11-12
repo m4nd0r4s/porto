@@ -68,7 +68,9 @@ enum IoOp {
     ReadBuffer { max: usize },           // → porto.Buffer (pooled, no bytes copy)
     ReadInto { buf: PyBufferMut },       // → int
     Write { data: PyBufferRef, off: usize },   // loops until all written → None
-    Accept,                              // → (TcpStream, addr)
+    WriteV { buffers: Vec<PyBufferRef>, written: usize },   // vectored → None
+    Accept,                              // → (IoHandle, addr)   (test hook)
+    AcceptTcp,                           // → TcpStream
     Connect,                             // → None (check SO_ERROR)
     RecvFrom { max: usize },             // → (bytes, addr)
     SendTo { data: PyBufferRef, addr: SockAddr },
@@ -77,7 +79,7 @@ enum IoOp {
 ```
 The driver-side `poll` re-executes the op when readiness fires. This keeps one generic trap kind for all socket ops and avoids per-op Rust futures.
 
-The call that makes the awaitable attempts the op once, nonblocking, whatever readiness the driver has reported (the fast path, 10 §4): on success it returns a ready awaitable, and on `WouldBlock` it clears the readiness it observed (unless newer readiness arrived) and returns one `Io` trap. The call first raises `Cancelled` if the task is cancelled (C1), so a fast path never consumes data it cannot deliver, and a task out of budget gets the trap without an attempt (T2). The trap's wait waits for readiness, attempts again, and resumes the task in the poll whose attempt succeeds. T3: a dropped receive, accept or connect wait consumed nothing. A `Write` sends what it can at each attempt, so one cancelled after a partial send (`off > 0`) has sent part of its data and the stream is in an unknown state, as with trio's `send_all`: the public stream API marks such a stream broken (later writes raise `porto.BrokenResourceError`). `connect()` checks for cancellation before it starts the OS connect. `WaitReadable` and `WaitWritable` always return the trap. OS errors become `OSError` with their errno, so Python picks the subclass (`ConnectionRefusedError`, …).
+The call that makes the awaitable attempts the op once, nonblocking, whatever readiness the driver has reported (the fast path, 10 §4): on success it returns a ready awaitable, and on `WouldBlock` it clears the readiness it observed (unless newer readiness arrived) and returns one `Io` trap. The call first raises `Cancelled` if the task is cancelled (C1), so a fast path never consumes data it cannot deliver, and a task out of budget gets the trap without an attempt (T2). The trap's wait waits for readiness, attempts again, and resumes the task in the poll whose attempt succeeds. T3: a dropped receive, accept or connect wait consumed nothing. A `Write` (or `WriteV`) sends what it can at each attempt, so one cancelled after a partial send (`off > 0`) has sent part of its data and the stream is in an unknown state, as with trio's `send_all`: the public stream API marks such a stream broken (later writes raise `porto.BrokenResourceError`). `connect()` checks for cancellation before it starts the OS connect. `WaitReadable` and `WaitWritable` always return the trap. OS errors become `OSError` with their errno, so Python picks the subclass (`ConnectionRefusedError`, …).
 
 ## 6. Buffers
 - `porto.Buffer` is a Rust-owned, growable byte buffer that exposes the buffer protocol (read/write). It is pooled per lane (size classes 4K, 16K, 64K, 256K).

@@ -5,6 +5,7 @@ pub(crate) mod broadcast;
 pub(crate) mod channel;
 pub(crate) mod channel_op;
 pub(crate) mod config;
+pub(crate) mod net;
 pub(crate) mod oneshot;
 pub(crate) mod run;
 pub(crate) mod scope;

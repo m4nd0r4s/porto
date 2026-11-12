@@ -19,6 +19,8 @@ await porto.net.serve_tcp(handler, host=None, port=0, *, tls=None,
 ```
 `connect_tcp` resolves DNS (§4) and performs RFC 8305 Happy Eyeballs v2 using a scope of racing attempts. Timeouts come from the enclosing scope's deadline.
 
+**Runs.** A socket is registered with the driver of the run that opened it (13 §4) and belongs to it: any operation from another run raises `RuntimeError` at the call, saying to open the socket in the run that uses it.
+
 ### 1.1 Stream API (`TcpStream`, `UnixStream`, `TlsStream` share the `porto.abc.ByteStream` protocol)
 | Method | Semantics |
 |---|---|
@@ -34,7 +36,15 @@ await porto.net.serve_tcp(handler, host=None, port=0, *, tls=None,
 | `await sendfile(file, offset=0, count=None)` | zero-copy where the OS supports it |
 | `await shutdown_write()` | half-close |
 | `await aclose()` / `async with` | graceful close; for TLS sends close_notify |
-| `set_nodelay`, `set_keepalive(idle, interval, count)`, `peername`, `sockname`, `fileno()` | |
+| `set_nodelay(bool)`, `set_keepalive(idle, interval, count)`, `peername`, `sockname`, `fileno()` | `idle` and `interval` are positive seconds, rounded up to whole seconds (what the OS keeps), `count >= 1`; `ValueError` otherwise. `peername`/`sockname` are `(host, port)` or `(host, port, flowinfo, scope_id)`, remembered once read (an accepted stream knows its peer from the accept, so it survives a reset). `fileno()` is the OS descriptor, still owned by the stream; `ClosedResourceError` once closed |
+
+Details of the implemented subset:
+- `read(max)`, `read_buffer(max)` need `max >= 1` and `read_into(buf)` a non-empty buffer (`ValueError`): a receive of 0 bytes returns 0, which reads as the end of the stream. Cancelling a read loses no bytes (T3).
+- `write` and `writev` raise `TypeError` for anything that is not a bytes-like object, naming the argument (`writev()'s buffers[1]`); `writev` takes any iterable of them and sends with as few vectored system calls as the OS allows.
+- `shutdown_write` after which a `write` raises `BrokenPipeError`; a peer reset raises `ConnectionResetError` with `errno` (§5).
+- `aclose()` closes at once and is idempotent; it closes even when the calling task is cancelled. Operations waiting on the stream, and every later one, raise `porto.ClosedResourceError` (13 §4). `async with stream` calls it.
+- `TcpStream` is a `porto.abc.ByteStream`: a `runtime_checkable` `Protocol` of the methods the stream types share. It holds the methods above now; the buffered reads and `sendfile` join it with their beads.
+- `porto.net._connect_tcp_numeric(host, port, *, nodelay=True)` is the private core of `connect_tcp` (a numeric address, no resolution, no Happy Eyeballs), kept until `connect_tcp` replaces it.
 
 **Internal read buffer:** each stream owns a lane-pooled receive buffer. `read_until`/`readline` scan it without copying until the delimiter is found. Cancel safety (T3) is guaranteed because unconsumed bytes stay in the buffer.
 

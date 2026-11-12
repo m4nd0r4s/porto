@@ -11,9 +11,9 @@ use pyo3::prelude::*;
 use socket2::Socket;
 
 use super::buffer_view::{PyBufferMut, PyBufferRef};
-use super::op::{IoOp, IoRegistration, ensure_same_run, os_error, submit};
+use super::op::{IoOp, IoRegistration, os_error, start_connect, submit};
 use super::sockaddr;
-use crate::driver::{lane, step};
+use crate::driver::lane;
 
 /// The most bytes one receive asks for by default.
 const DEFAULT_MAX: usize = 65536;
@@ -28,19 +28,10 @@ impl IoHandle {
     /// Registers `socket`, which MUST be nonblocking, with the driver of the run on this
     /// thread.
     pub(crate) fn adopt(py: Python<'_>, socket: Socket) -> PyResult<Py<Self>> {
-        let Some(driver) = lane::current().and_then(|handle| handle.driver().cloned()) else {
-            return Err(PyRuntimeError::new_err(
-                "porto: an I/O handle must be made inside a running porto runtime; create it \
-                 from a task (inside porto.run)",
-            ));
-        };
-        let registration =
-            IoRegistration::new(driver, socket, Interest::READABLE | Interest::WRITABLE)
-                .map_err(|error| os_error(&error))?;
         Py::new(
             py,
             Self {
-                registration: Arc::new(registration),
+                registration: register_on_lane(socket, "an I/O handle")?,
             },
         )
     }
@@ -48,6 +39,20 @@ impl IoHandle {
     fn submit(&self, py: Python<'_>, op: IoOp) -> PyResult<Py<PyAny>> {
         submit(py, &self.registration, op)
     }
+}
+
+/// Registers `socket`, which MUST be nonblocking, with the driver of the run on this thread,
+/// for reading and writing. `what` names what is being made, for the error outside a run.
+pub(crate) fn register_on_lane(socket: Socket, what: &str) -> PyResult<Arc<IoRegistration>> {
+    let Some(driver) = lane::current().and_then(|handle| handle.driver().cloned()) else {
+        return Err(PyRuntimeError::new_err(format!(
+            "porto: {what} must be made inside a running porto runtime; create it from a task \
+             (inside porto.run)"
+        )));
+    };
+    IoRegistration::new(driver, socket, Interest::READABLE | Interest::WRITABLE)
+        .map(Arc::new)
+        .map_err(|error| os_error(&error))
 }
 
 /// A new socket owning a duplicate of `fd`, nonblocking.
@@ -123,25 +128,7 @@ impl IoHandle {
     /// Connects to `address` without blocking: `None` once connected, or the error.
     fn connect(&self, py: Python<'_>, address: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let address = sockaddr::from_py(address)?;
-        ensure_same_run(&self.registration)?;
-        // A cancelled task must not start a connection it will never finish (C1).
-        step::raise_if_cancelled(py)?;
-        match self
-            .registration
-            .source()
-            .and_then(|socket| socket.connect(&address))
-        {
-            Ok(()) => {}
-            // Started: Unix reports `EINPROGRESS`, Windows `WSAEWOULDBLOCK`. A signal that
-            // interrupts a nonblocking connect (`EINTR`) leaves it going on asynchronously too:
-            // its outcome comes with writability (POSIX `connect`).
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) || error.raw_os_error() == EINPROGRESS => {}
-            Err(error) => return Err(os_error(&error)),
-        }
+        start_connect(py, &self.registration, &address)?;
         self.submit(py, IoOp::Connect)
     }
 
@@ -185,12 +172,3 @@ impl IoHandle {
         self.registration.is_closed()
     }
 }
-
-/// `EINPROGRESS`, which a nonblocking connect returns once started (`ErrorKind::InProgress` is
-/// unstable).
-#[cfg(any(target_os = "linux", target_os = "android"))]
-const EINPROGRESS: Option<i32> = Some(115);
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const EINPROGRESS: Option<i32> = Some(36);
-#[cfg(not(unix))]
-const EINPROGRESS: Option<i32> = None;

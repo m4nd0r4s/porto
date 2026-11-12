@@ -19,7 +19,7 @@ print(porto.run(main))
 ```
 """
 
-from porto import lowlevel
+from porto import abc, lowlevel, net
 from porto._channel import broadcast, channel, oneshot, unbounded_channel, watch
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
@@ -114,6 +114,7 @@ __all__ = [
     "WatchSender",
     "WouldBlock",
     "__version__",
+    "abc",
     "broadcast",
     "channel",
     "checkpoint",
@@ -122,6 +123,7 @@ __all__ = [
     "lowlevel",
     "monotonic",
     "move_on_after",
+    "net",
     "oneshot",
     "run",
     "scope",

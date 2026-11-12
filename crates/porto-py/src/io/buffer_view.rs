@@ -141,6 +141,11 @@ impl PyBufferMut {
         View::new(object, true, what).map(Self)
     }
 
+    /// Whether the view holds no bytes.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.len == 0
+    }
+
     /// The bytes, to receive into.
     pub(crate) fn spare(&mut self) -> &mut [MaybeUninit<u8>] {
         let len = self.0.len;

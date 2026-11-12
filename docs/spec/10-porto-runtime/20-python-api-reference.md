@@ -121,6 +121,8 @@ Terminated(SystemExit)
 ## `porto.net`, `porto.tls`, `porto.fs`, `porto.process`, `porto.signals`
 As specified in §17 and §18.
 
+Implemented so far: `porto.net.TcpStream` (the §17 1.1 methods up to `shutdown_write`/`aclose`, with `set_nodelay`, `set_keepalive`, `peername`, `sockname`, `fileno()`), a final class users do not construct, and `porto.abc.ByteStream`, the `runtime_checkable` protocol it implements. A socket belongs to the `porto.run` that opened it (17 §1).
+
 ## `porto.lowlevel`
 `wait_readable`, `wait_writable`, `notify_closing`, `current_driver_kind`, `Trap` constructors for library authors: `trap_yield()` (the trap behind `checkpoint()`), `trap_wait_notify(notify)` (the trap behind `await notify.notified()`; `TypeError` for anything but a `Notify`); `current_lane() -> int`; `spawn_rust_lane(fn)` (GIL builds: run a callable that only calls Rust-releasing APIs; advanced). The trap constructors and `current_lane` raise `NoRuntimeError` outside a task of a porto runtime; a trap freed without being awaited warns like one from `sleep()`.
 

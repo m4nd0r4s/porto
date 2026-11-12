@@ -647,12 +647,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "porto-net"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "socket2",
+]
+
+[[package]]
 name = "porto-py"
 version = "0.0.0"
 dependencies = [
  "parking_lot",
  "porto-core",
  "porto-io",
+ "porto-net",
  "pyo3",
  "pyo3-build-config",
  "socket2",

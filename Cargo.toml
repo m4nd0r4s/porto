@@ -16,6 +16,7 @@ publish = false
 [workspace.dependencies]
 porto-core = { path = "crates/porto-core" }
 porto-io = { path = "crates/porto-io" }
+porto-net = { path = "crates/porto-net" }
 # No abi3: it is unavailable for free-threaded builds (ADR-024), so wheels are per Python version.
 pyo3 = "0.30"
 # The `Py_3_12`-style cfgs for code that differs between CPython versions (porto-py's build.rs).
@@ -26,8 +27,9 @@ mio = { version = "1.2.4", default-features = false, features = ["os-poll", "os-
 # Mutex allocates a pthread mutex per lock on macOS (porto-itr.7). No `deadlock_detection`.
 parking_lot = { version = "0.12.5", default-features = false }
 # Nonblocking socket syscalls on a registered handle (accept, connect, recv, send, recvfrom,
-# sendto) for the `Io` trap's operations, on every OS mio supports (13-io-driver.md §5).
-socket2 = "0.6.3"
+# sendto) for the `Io` trap's operations, on every OS mio supports (13-io-driver.md §5). `all`:
+# `accept4`, `SO_REUSEPORT` and the keepalive interval and count (17-networking-tls-dns.md §1).
+socket2 = { version = "0.6.3", features = ["all"] }
 # Physical core count for `lanes="auto"` (12-scheduler-and-lanes.md §7); std only knows logical.
 num_cpus = "1.17"
 # Property and model-based tests (dev only; 52-testing-strategy.md item 1).

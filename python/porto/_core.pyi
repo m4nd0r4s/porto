@@ -11,9 +11,20 @@ Underscore names are internal to porto: the trap protocol's awaitables
 """
 
 import contextvars
-from collections.abc import Awaitable, Callable, Coroutine, Generator
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterable
 from types import TracebackType
-from typing import Any, Generic, Literal, NoReturn, Self, TypeVar, TypeVarTuple, final, overload
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    NoReturn,
+    Self,
+    TypeAlias,
+    TypeVar,
+    TypeVarTuple,
+    final,
+    overload,
+)
 
 from porto._config import RuntimeConfig
 
@@ -402,6 +413,98 @@ class Buffer:
 
     def extend(self, data: Buffer | bytes | bytearray | memoryview, /) -> None:
         """Appends the bytes of ``data``."""
+
+# Networking (17-networking-tls-dns.md §1)
+
+_SocketAddress: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
+
+@final
+class TcpStream:
+    """A TCP connection: ``porto.net.TcpStream``, a ``porto.abc.ByteStream``. Open one with
+    ``porto.net.listen_tcp(...).accept()``. It belongs to the ``porto.run`` that opened it:
+    using it from another run raises ``RuntimeError`` at the call."""
+
+    def read(self, max: int = 65536, /) -> Awaitable[bytes]:
+        """Receives at most ``max`` bytes (``max >= 1``): ``b""`` at the end of the stream, once
+        the peer closed or shut down its writing side. Cancelling loses no bytes."""
+
+    def read_buffer(self, max: int = 65536, /) -> Awaitable[Buffer]:
+        """Like ``read``, into a ``porto.Buffer`` from the lane's pool, with no ``bytes`` copy.
+        An empty buffer at the end of the stream."""
+
+    def read_into(self, buffer: bytearray | memoryview | Buffer, /) -> Awaitable[int]:
+        """Receives into the writable ``buffer`` (not empty): the number of bytes received, 0
+        at the end of the stream."""
+
+    def write(self, data: bytes | bytearray | memoryview | Buffer, /) -> Awaitable[None]:
+        """Sends all of ``data``, waiting while the socket's buffers are full."""
+
+    def writev(
+        self, buffers: Iterable[bytes | bytearray | memoryview | Buffer], /
+    ) -> Awaitable[None]:
+        """Sends all of ``buffers`` in order, with as few system calls as the OS allows."""
+
+    def shutdown_write(self) -> Awaitable[None]:
+        """Half-close: the peer reads the end of the stream; this side can still read."""
+
+    def aclose(self) -> Awaitable[None]:
+        """Closes the stream (what was sent is still delivered); operations waiting on it fail
+        with ``porto.ClosedResourceError``. Closing again does nothing."""
+
+    def __aenter__(self) -> Awaitable[Self]: ...
+    def __aexit__(self, *exception: object) -> Awaitable[None]: ...
+    def set_nodelay(self, nodelay: bool, /) -> None:
+        """``TCP_NODELAY``: send small writes at once instead of coalescing them."""
+
+    def set_keepalive(self, idle: float, interval: float, count: int, /) -> None:
+        """Turns on TCP keepalive: the first probe after ``idle`` seconds of silence, then one
+        every ``interval`` seconds, the connection dropped after ``count`` unanswered probes.
+        Fractions of a second round up. ``ValueError`` unless all are positive."""
+
+    @property
+    def peername(self) -> _SocketAddress:
+        """The peer's address: ``(host, port)``, or ``(host, port, flowinfo, scope_id)``."""
+
+    @property
+    def sockname(self) -> _SocketAddress:
+        """This end's address, in the same shape."""
+
+    def fileno(self) -> int:
+        """The OS file descriptor (the socket handle on Windows); the stream still owns it.
+        ``porto.ClosedResourceError`` once closed."""
+
+    @staticmethod
+    def _connecting(address: _SocketAddress, /) -> TcpStream: ...
+    def _finish_connect(self) -> Awaitable[None]: ...
+
+@final
+class TcpListener:
+    """A listening TCP socket: ``porto.net.TcpListener``, made by ``porto.net.listen_tcp``."""
+
+    def accept(self) -> Awaitable[TcpStream]:
+        """Waits for a connection and accepts it."""
+
+    @property
+    def port(self) -> int:
+        """The port the listener is bound to (the one the OS picked, for ``port=0``)."""
+
+    @property
+    def sockname(self) -> _SocketAddress:
+        """The address the listener is bound to."""
+
+    def fileno(self) -> int:
+        """The OS file descriptor (the socket handle on Windows); the listener still owns it."""
+
+    def aclose(self) -> Awaitable[None]:
+        """Stops listening: an ``accept()`` waiting on it fails with
+        ``porto.ClosedResourceError``. Closing again does nothing."""
+
+    def __aenter__(self) -> Awaitable[Self]: ...
+    def __aexit__(self, *exception: object) -> Awaitable[None]: ...
+
+def _listen_tcp(
+    host: str | None, port: int, backlog: int, reuse_port: bool, dual_stack: bool, /
+) -> TcpListener: ...
 
 @final
 class Event:

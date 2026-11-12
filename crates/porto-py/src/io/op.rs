@@ -11,10 +11,11 @@
 //! resolves the wait at once, so dropping a pending wait (a cancellation) never loses data; it
 //! unlinks the waiter it registered.
 
-use std::io;
+use std::io::{self, IoSlice};
 use std::sync::Arc;
 
 use porto_io::{ClosedResource, Interest, Registration};
+use porto_net::tcp;
 use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -25,6 +26,7 @@ use super::buffer_view::{PyBufferMut, PyBufferRef};
 use super::handle::IoHandle;
 use super::pool::PooledBytes;
 use super::sockaddr;
+use crate::api::net::TcpStream;
 use crate::driver::pending::IoWait;
 use crate::driver::pytask::Resume;
 use crate::driver::ready::ready;
@@ -42,6 +44,9 @@ const SEND_FLAGS: std::ffi::c_int = 0x4000;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const SEND_FLAGS: std::ffi::c_int = 0;
 
+/// The most buffers one vectored send hands the kernel (`IOV_MAX` is 1024 on Linux and macOS).
+const MAX_IOVECS: usize = 64;
+
 /// An operation on a registered socket, and its state between attempts.
 pub(crate) enum IoOp {
     /// Receive at most `max` bytes → `bytes` (empty at end of stream).
@@ -52,8 +57,15 @@ pub(crate) enum IoOp {
     ReadInto { buf: PyBufferMut },
     /// Send all of `data`, from `off` on → `None`. Sends what it can at each attempt.
     Write { data: PyBufferRef, off: usize },
+    /// Send all of `buffers`, from byte `written` on, in as few vectored sends as it can → `None`.
+    WriteV {
+        buffers: Vec<PyBufferRef>,
+        written: usize,
+    },
     /// Accept a connection → `(socket, address)`.
     Accept,
+    /// Accept a TCP connection → `porto.net.TcpStream`.
+    AcceptTcp,
     /// Finish a nonblocking connect → `None`, or the connect's error (`SO_ERROR`).
     Connect,
     /// Receive one datagram of at most `max` bytes → `(bytes, address)`.
@@ -78,6 +90,8 @@ pub(crate) enum Completed {
     Done,
     /// An accepted connection and its peer's address.
     Accepted(Socket, SockAddr),
+    /// An accepted TCP connection and its peer's address.
+    AcceptedTcp(Socket, SockAddr),
     /// A datagram and its sender's address.
     Received(Vec<u8>, SockAddr),
 }
@@ -90,11 +104,14 @@ impl IoOp {
             | Self::ReadBuffer { .. }
             | Self::ReadInto { .. }
             | Self::Accept
+            | Self::AcceptTcp
             | Self::RecvFrom { .. }
             | Self::WaitReadable => Interest::READABLE,
-            Self::Write { .. } | Self::Connect | Self::SendTo { .. } | Self::WaitWritable => {
-                Interest::WRITABLE
-            }
+            Self::Write { .. }
+            | Self::WriteV { .. }
+            | Self::Connect
+            | Self::SendTo { .. }
+            | Self::WaitWritable => Interest::WRITABLE,
         }
     }
 
@@ -142,10 +159,35 @@ impl IoOp {
                 }
                 Ok(Completed::Done)
             }
+            Self::WriteV { buffers, written } => {
+                let total: usize = buffers.iter().map(|buffer| buffer.bytes().len()).sum();
+                while *written < total {
+                    let mut skip = *written;
+                    let slices: Vec<IoSlice<'_>> = buffers
+                        .iter()
+                        .filter_map(|buffer| {
+                            let bytes = buffer.bytes();
+                            let taken = skip.min(bytes.len());
+                            skip -= taken;
+                            let rest = &bytes[taken..];
+                            (!rest.is_empty()).then(|| IoSlice::new(rest))
+                        })
+                        .take(MAX_IOVECS)
+                        .collect();
+                    match socket.send_vectored_with_flags(&slices, SEND_FLAGS)? {
+                        0 => return Err(io::ErrorKind::WriteZero.into()),
+                        sent => *written += sent,
+                    }
+                }
+                Ok(Completed::Done)
+            }
             Self::Accept => {
-                let (connection, address) = socket.accept()?;
-                connection.set_nonblocking(true)?;
+                let (connection, address) = tcp::accept(socket)?;
                 Ok(Completed::Accepted(connection, address))
+            }
+            Self::AcceptTcp => {
+                let (connection, address) = tcp::accept(socket)?;
+                Ok(Completed::AcceptedTcp(connection, address))
             }
             Self::Connect => {
                 if let Some(error) = socket.take_error()? {
@@ -199,6 +241,9 @@ impl Completed {
                     .into_any()
                     .unbind()
             }
+            Self::AcceptedTcp(connection, address) => {
+                Py::new(py, TcpStream::adopt(py, connection, Some(address))?)?.into_any()
+            }
             Self::Received(bytes, address) => {
                 (PyBytes::new(py, &bytes), sockaddr::to_py(py, &address)?)
                     .into_pyobject(py)?
@@ -247,6 +292,47 @@ pub(crate) fn ensure_same_run(registration: &IoRegistration) -> PyResult<()> {
         )),
     }
 }
+
+/// Starts connecting `registration`'s socket to `address` without blocking: the socket is
+/// connected once the [`IoOp::Connect`] that follows completes.
+///
+/// Raises `Cancelled` first while the running task is cancelled: a cancelled task must not
+/// start a connection it will never finish (C1).
+pub(crate) fn start_connect(
+    py: Python<'_>,
+    registration: &IoRegistration,
+    address: &SockAddr,
+) -> PyResult<()> {
+    ensure_same_run(registration)?;
+    step::raise_if_cancelled(py)?;
+    match registration
+        .source()
+        .and_then(|socket| socket.connect(address))
+    {
+        Ok(()) => Ok(()),
+        // Started: Unix reports `EINPROGRESS`, Windows `WSAEWOULDBLOCK`. A signal that
+        // interrupts a nonblocking connect (`EINTR`) leaves it going on asynchronously too:
+        // its outcome comes with writability (POSIX `connect`).
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) || error.raw_os_error() == EINPROGRESS =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(os_error(&error)),
+    }
+}
+
+/// `EINPROGRESS`, which a nonblocking connect returns once started (`ErrorKind::InProgress` is
+/// unstable).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EINPROGRESS: Option<i32> = Some(115);
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const EINPROGRESS: Option<i32> = Some(36);
+#[cfg(not(unix))]
+const EINPROGRESS: Option<i32> = None;
 
 /// Runs `op` on `registration` and returns what the caller's `await` gets: a ready awaitable
 /// if it completed at once, else an `Io` trap that completes it.

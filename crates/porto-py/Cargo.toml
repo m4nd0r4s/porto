@@ -18,6 +18,8 @@ parking_lot.workspace = true
 porto-core.workspace = true
 # The I/O driver the Python lane parks in (12-scheduler-and-lanes.md §9).
 porto-io.workspace = true
+# The sockets the Python `porto.net` types wrap (17-networking-tls-dns.md §1).
+porto-net.workspace = true
 pyo3.workspace = true
 socket2.workspace = true
 
