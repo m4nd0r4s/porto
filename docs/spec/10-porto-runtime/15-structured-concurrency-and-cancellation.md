@@ -101,3 +101,21 @@ Reading the outcome of a task that ended cancelled (`task.result()`, or joining 
 | spawn after close | `RuntimeError` |
 | await outside a Porto task (no runtime) | `porto.NoRuntimeError(RuntimeError)` |
 | `started.set` twice | `RuntimeError` |
+
+## 7. Rule IDs for the traceability matrix
+The tests of this section carry the rule they check in their name, `test_<ID>_<what>` (52 §3), and `scripts/rule_matrix.py` greps those names against the IDs below and the `C1`–`C12` of §2: every ID needs at least one test (`rule_matrix.py --check 15`, run by CI). The sections without numbered rules are given IDs here; a change to one of them changes its row.
+
+| ID | Rule |
+|---|---|
+| SP1 | `start` injects `started=Started()`, takes no other keyword but `name`, and returns the value passed to `set` (§3). |
+| SP2 | Until `set`, the task runs in a hidden scope the caller waits in: what it raises comes out of `start` bare, and cancelling the caller cancels it (§3). |
+| SP3 | `set` moves the task into the scope `start` was called on and adopts the hidden scope; it raises `RuntimeError` twice, from another task, or into a closed scope (§3). |
+| SP4 | A task that ends without calling `set` makes `start` raise `RuntimeError`, or `Cancelled` if the caller was cancelled (§3). |
+| K1 | `task.cancel()` cancels that task and what it runs in scopes it entered, not its siblings or its scope, and its `Cancelled` is not a failure (§4). |
+| K2 | `task.cancel()` is level-triggered, held off by a shield the task entered, and a no-op on a finished task or a second time (§4). |
+| K3 | Reading a task that ended cancelled raises a fresh `porto.Cancelled` whose `__cause__` is the one the task ended with (§4). |
+| X1 | A deadline hit raises `TimeoutError` with `raise_on_timeout=True` (§6). |
+| X2 | A failed child raises `ExceptionGroup`, or `BaseExceptionGroup` with a `BaseException` in it (§6). |
+| X3 | `spawn` after the scope closed raises `RuntimeError` (§6). |
+| X4 | Awaiting outside a porto task raises `porto.NoRuntimeError` (§6). |
+| X5 | `started.set` twice raises `RuntimeError` (§6). |
