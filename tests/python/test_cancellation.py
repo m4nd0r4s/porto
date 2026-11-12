@@ -513,7 +513,7 @@ def test_szb105_a_wait_resolving_when_the_budget_runs_out_keeps_its_grant_throug
 
 def test_a_task_waiting_in_a_scope_is_freed_when_the_run_ends() -> None:
     # The scope keeps the waker of a task in a cancellable wait (for a cancel to wake it), a
-    # cycle the lane breaks at the end of the run like the other linked waits.
+    # cycle the runtime's task registry breaks at the end of the run (it cancels every live task).
     closed: list[str] = []
 
     async def sleeper() -> None:

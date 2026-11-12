@@ -13,9 +13,10 @@
 //! waker (12-scheduler-and-lanes.md §9).
 //!
 //! The lane also keeps what belongs to one run and must not outlive it: an error that stops the
-//! run (see [`fail`]), the interrupts a test hook files for waiting tasks (see [`interrupt`]),
-//! and the wakers of tasks whose wait would otherwise keep them alive forever once the run ends
-//! (see [`keep_linked_wait`]).
+//! run (see [`fail`]) and the interrupts a test hook files for waiting tasks (see [`interrupt`]).
+//! Tasks whose wait would keep them alive forever once the run ends (a join, a sync primitive, a
+//! scope exit: a waker cycle) are cancelled by the runtime's registry as it is dropped
+//! (23-observability.md §1).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -92,8 +93,6 @@ impl Hasher for AddressHasher {
 
 #[derive(Default)]
 struct LaneState {
-    /// The wakers of the tasks in a linked wait, by the key `keep_linked_wait` got.
-    linked_waits: HashMap<usize, Waker, ByAddress>,
     /// Exceptions to throw into tasks at their next wait that is not over, by task key.
     interrupts: HashMap<usize, Py<PyBaseException>, ByAddress>,
     /// An exception that stops the run, raised out of `porto.run` in place of main's outcome.
@@ -106,9 +105,10 @@ struct LaneState {
 /// `io_backend`, `io_backend_strict`, `timer_resolution`, `coop_budget`, `blocking_threads` and
 /// `blocking_keepalive`), on this
 /// (attached) thread. The runtime is dropped before returning, still attached, so the tasks it
-/// frees release their Python objects directly. Then every task still in a linked wait (a join,
-/// a sync primitive, a scope exit) is cancelled: its wait is given up and its coroutine closed
-/// (spec 11 §3.2), so no task of the run outlives it.
+/// frees release their Python objects directly. Dropping it cancels every task still alive
+/// (the registry, 23 §1), including those kept only by a waker cycle (a join, a sync primitive,
+/// a scope exit): its wait is given up and its coroutine closed (spec 11 §3.2), so no task of
+/// the run outlives it.
 ///
 /// # Errors
 ///
@@ -134,7 +134,6 @@ pub(crate) fn run<T>(
         body(&runtime)
     };
     drop(runtime);
-    cancel_linked_waits();
     // Taken out first: dropping a waker may free its task and close its coroutine, which runs
     // Python code that may reach the lane state again.
     let state = LANE.take();
@@ -196,43 +195,6 @@ pub(crate) fn current() -> Option<Handle> {
         Handle::try_current()
     } else {
         None
-    }
-}
-
-/// Keeps `waker`, the waker of the task keyed `key`, until [`forget_linked_wait`]: the task
-/// waits on something that holds its waker while the task holds it (a join, a sync primitive,
-/// a scope exit), a cycle nothing outside it may ever end. If the run ends first, the lane
-/// wakes the waker, which cancels the task ([`run`]).
-pub(crate) fn keep_linked_wait(key: usize, waker: &Waker) {
-    let previous = LANE.with_borrow_mut(|lane| lane.linked_waits.insert(key, waker.clone()));
-    drop(previous);
-}
-
-/// Stops keeping the waker of the task keyed `key`: its wait ended.
-///
-/// Safe from any thread: a task cancelled off its lane (a wake after shutdown) finds nothing
-/// to forget there, also while that thread's locals are being destroyed.
-pub(crate) fn forget_linked_wait(key: usize) {
-    let kept = LANE
-        .try_with(|lane| lane.borrow_mut().linked_waits.remove(&key))
-        .ok()
-        .flatten();
-    // Dropped after the borrow: the last reference to a task frees it, which runs Python code.
-    drop(kept);
-}
-
-/// Cancels every task still in a linked wait, once the runtime is gone: a wake after shutdown
-/// cancels its task, which gives the wait up (T3) and closes the coroutine. A cancelled task
-/// may release others (the target of its join), which then are freed too.
-fn cancel_linked_waits() {
-    loop {
-        let waiting = LANE.with_borrow_mut(|lane| std::mem::take(&mut lane.linked_waits));
-        if waiting.is_empty() {
-            return;
-        }
-        for waker in waiting.into_values() {
-            waker.wake();
-        }
     }
 }
 

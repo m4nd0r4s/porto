@@ -19,14 +19,13 @@
 //!
 //! A `Notified`, `Join` or `ScopeExit` wait is a reference cycle while it is pending: the task
 //! holds what it waits on (the payload), which holds the task's waker. If nothing ends the wait,
-//! nothing ever frees either, so the lane keeps the waker too ([`lane::keep_linked_wait`]) and
-//! wakes it when the run ends, which cancels the task (spec 11 §3.2).
+//! nothing ever frees either. The runtime breaks such cycles when it ends: dropping it cancels
+//! every task still on its registry (spec 23 §1, 11 §3.2), so nothing here keeps the waker.
 //!
 //! A cancellable wait (every kind but the yields and `ScopeExit`, which never abandons its
 //! children, C5) of a task in a scope is also filed with its innermost scope
 //! ([`PyTask::watch_cancel`]), so a cancel that reaches the scope wakes it, from any thread
-//! (C10). That is the same cycle (the task holds its scope), so the lane keeps those wakers
-//! too.
+//! (C10). That is the same cycle (the task holds its scope), broken the same way.
 
 use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker};
@@ -34,7 +33,6 @@ use std::task::{Context, Poll, Waker};
 use porto_core::scope::ScopeNode;
 use pyo3::prelude::*;
 
-use super::lane;
 use super::pending::{Kind, Payload, Pending};
 use super::pytask::{PyTask, Resume, TaskOutcome, joined_cancelled, shut_down_error};
 
@@ -43,10 +41,8 @@ use super::pytask::{PyTask, Resume, TaskOutcome, joined_cancelled, shut_down_err
 pub(super) struct WaitLinks;
 
 impl WaitLinks {
-    /// The lane ([`lane::keep_linked_wait`]).
-    const LANE: u8 = 1;
     /// The task's innermost scope ([`porto_core::scope::ScopeNode::register_waiter`]).
-    const SCOPE: u8 = 2;
+    const SCOPE: u8 = 1;
 }
 
 impl PyTask {
@@ -113,7 +109,7 @@ impl PyTask {
                 // only, until the wait is resolved or released (here and `release_wait`), which
                 // only the task's own poll, cancel and drop do, one at a time.
                 if unsafe { target.poll_wait(self.wait_node(), cx) }.is_pending() {
-                    return self.linked_pending(cx.waker());
+                    return self.linked_pending();
                 }
                 Resume::None
             }
@@ -125,7 +121,7 @@ impl PyTask {
                 let joined =
                     unsafe { PyTask::join_waiters(target).poll_wait(self.wait_node(), cx) };
                 if joined.is_pending() {
-                    return self.linked_pending(cx.waker());
+                    return self.linked_pending();
                 }
                 // SAFETY: the wait returned ready, so the join list is closed and the outcome
                 // published; the reference keeps the body alive.
@@ -135,7 +131,7 @@ impl PyTask {
                 // SAFETY: `scope` is the live field of a ScopeExit payload.
                 let scope = unsafe { &*self.pending_payload.scope };
                 if poll_scope_exit(scope, cx.waker()).is_pending() {
-                    return self.linked_pending(cx.waker());
+                    return self.linked_pending();
                 }
                 Resume::None
             }
@@ -204,18 +200,10 @@ impl PyTask {
         self.take_pending()
     }
 
-    /// `Pending` for a wait whose target now holds `waker` (the task's), which the lane then
-    /// keeps too, once per wait: see the module docs.
-    fn linked_pending(&mut self, waker: &Waker) -> Poll<Resume> {
-        self.keep_on_lane(waker);
+    /// `Pending` for a wait whose target now holds the task's waker.
+    #[inline]
+    fn linked_pending(&mut self) -> Poll<Resume> {
         Poll::Pending
-    }
-
-    fn keep_on_lane(&mut self, waker: &Waker) {
-        if self.wait_links & WaitLinks::LANE == 0 {
-            self.wait_links |= WaitLinks::LANE;
-            lane::keep_linked_wait(self.key(), waker);
-        }
     }
 
     /// Files `waker` (the task's) with its innermost scope for the pending wait, if the wait
@@ -232,18 +220,17 @@ impl PyTask {
         };
         let cancelled = scope.register_waiter(key, waker);
         self.wait_links |= WaitLinks::SCOPE;
-        self.keep_on_lane(waker);
         cancelled
     }
 
-    /// The key the lane keeps the task's linked wait under: the body's address, which is the
-    /// task's while it lives (the lane's waker keeps it alive while the key is in use).
+    /// The key the task's scope files its waker under: the body's address, which is the task's
+    /// while it lives.
     fn key(&self) -> usize {
         ptr::from_ref(self).addr()
     }
 
-    /// Moves the payload out; the task waits for nothing afterwards, and neither its scope nor
-    /// the lane keeps its waker.
+    /// Moves the payload out; the task waits for nothing afterwards, and its scope does not
+    /// keep its waker.
     fn take_pending(&mut self) -> Pending {
         self.unlink_wait();
         let kind = std::mem::replace(&mut self.pending_kind, Kind::None);
@@ -252,7 +239,7 @@ impl PyTask {
         unsafe { Pending::unpack(kind, &payload) }
     }
 
-    /// Takes the task's waker back from its scope and the lane, if the wait filed it there.
+    /// Takes the task's waker back from its scope, if the wait filed it there.
     /// Every end of a wait comes through here once, whatever ended it (resolved, abandoned,
     /// released): the links are cleared on the way, so a second call does nothing. A stale
     /// link would keep the entry filed with a scope the task may since have left, and make the
@@ -278,9 +265,6 @@ impl PyTask {
             if let Some(scope) = scope {
                 scope.unregister_waiter(self.key());
             }
-        }
-        if links & WaitLinks::LANE != 0 {
-            lane::forget_linked_wait(self.key());
         }
     }
 
