@@ -15,7 +15,7 @@ use std::io;
 use std::sync::Arc;
 
 use porto_io::{ClosedResource, Interest, Registration};
-use pyo3::exceptions::{PyMemoryError, PyOSError};
+use pyo3::exceptions::{PyMemoryError, PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use socket2::{SockAddr, Socket};
@@ -28,8 +28,8 @@ use super::sockaddr;
 use crate::driver::pending::IoWait;
 use crate::driver::pytask::Resume;
 use crate::driver::ready::ready;
-use crate::driver::step;
 use crate::driver::trap::{self, Trap, TrapKind};
+use crate::driver::{lane, step};
 
 /// A registered socket that operations run on.
 pub(crate) type IoRegistration = Registration<Socket>;
@@ -226,6 +226,26 @@ pub(crate) fn os_error(error: &io::Error) -> PyErr {
     }
 }
 
+/// Raises `RuntimeError` unless the running task belongs to the run whose driver `registration`
+/// is registered with (13-io-driver.md §4). Only that run's lane polls the driver: a task of
+/// another run (another thread's `porto.run`, a later one) would wait for readiness nobody
+/// reports, forever, so the operation is refused at the call.
+pub(crate) fn ensure_same_run(registration: &IoRegistration) -> PyResult<()> {
+    let driver = lane::current().and_then(|handle| handle.driver().cloned());
+    match driver {
+        Some(driver) if registration.is_driven_by(&driver) => Ok(()),
+        Some(_) => Err(PyRuntimeError::new_err(
+            "porto: this socket was opened in another run (another thread's porto.run, or an \
+             earlier one) than the one using it, so it can never become ready here; open the \
+             socket in the run that uses it",
+        )),
+        None => Err(PyRuntimeError::new_err(
+            "porto: a socket can only be used from a task of the run that opened it; call this \
+             from a task inside porto.run, and open the socket in that run",
+        )),
+    }
+}
+
 /// Runs `op` on `registration` and returns what the caller's `await` gets: a ready awaitable
 /// if it completed at once, else an `Io` trap that completes it.
 ///
@@ -237,6 +257,7 @@ pub(crate) fn submit(
     registration: &Arc<IoRegistration>,
     mut op: IoOp,
 ) -> PyResult<Py<PyAny>> {
+    ensure_same_run(registration)?;
     if !op.waits_only() && step::proceed(py)? {
         match registration.attempt_io(op.interest(), |socket| op.attempt(socket)) {
             Ok(completed) => return ready(py, completed.into_py(py)?),

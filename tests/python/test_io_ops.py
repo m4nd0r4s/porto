@@ -12,6 +12,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Coroutine
 from typing import Any
 
@@ -515,3 +516,61 @@ def test_an_io_handle_needs_an_open_socket() -> None:
             _core._IoHandle(-1)
 
     run(main())
+
+
+def test_a_handle_of_an_earlier_run_is_refused_at_the_call() -> None:
+    left, right = socketpair()
+    with left, right:
+
+        async def open_handle() -> Any:
+            return _core._IoHandle(right.fileno())
+
+        handle = run(open_handle())
+
+        async def use_it() -> None:
+            for call in (lambda: handle.read(8), lambda: handle.write(b"x")):
+                with pytest.raises(RuntimeError, match="open the socket in the run that uses it"):
+                    call()
+            with pytest.raises(RuntimeError, match="open the socket in the run"):
+                handle.connect(("127.0.0.1", 1))
+            handle.close()  # closing needs no run
+
+        run(use_it())
+
+
+def test_a_handle_of_a_run_on_another_thread_is_refused_at_the_call() -> None:
+    errors: list[BaseException] = []
+
+    async def other_run(handle: Any) -> None:
+        try:
+            handle.read(8)
+        except RuntimeError as error:
+            errors.append(error)
+
+    async def main() -> None:
+        left, right = socketpair()
+        with left, right:
+            handle = _core._IoHandle(right.fileno())
+            thread = threading.Thread(target=run, args=(other_run(handle),))
+            thread.start()
+            thread.join()
+            # Its own run still works.
+            left.send(b"mine")
+            assert await handle.read(8) == b"mine"
+            handle.close()
+
+    run(main())
+    assert len(errors) == 1
+    assert "open the socket in the run that uses it" in str(errors[0])
+
+
+def test_a_handle_used_outside_any_run_is_refused() -> None:
+    left, right = socketpair()
+    with left, right:
+
+        async def open_handle() -> Any:
+            return _core._IoHandle(right.fileno())
+
+        handle = run(open_handle())
+        with pytest.raises(RuntimeError, match="inside porto.run"):
+            handle.read(8)

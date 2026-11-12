@@ -89,6 +89,18 @@ fn readiness_and_close_without_an_os_driver() {
 }
 
 #[test]
+fn a_registration_is_driven_by_the_driver_it_was_made_with_only() {
+    let (_peer, stream) = socketpair();
+    let first = driver();
+    let second = driver();
+    let registration = register(&first, stream);
+    let first: Arc<dyn Driver> = first;
+    let second: Arc<dyn Driver> = second;
+    assert!(registration.is_driven_by(&first));
+    assert!(!registration.is_driven_by(&second));
+}
+
+#[test]
 fn new_registers_and_drop_deregisters() {
     let driver = driver();
     let (_left, right) = socketpair();

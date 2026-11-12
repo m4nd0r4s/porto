@@ -11,7 +11,7 @@ use pyo3::prelude::*;
 use socket2::Socket;
 
 use super::buffer_view::{PyBufferMut, PyBufferRef};
-use super::op::{IoOp, IoRegistration, os_error, submit};
+use super::op::{IoOp, IoRegistration, ensure_same_run, os_error, submit};
 use super::sockaddr;
 use crate::driver::{lane, step};
 
@@ -123,6 +123,7 @@ impl IoHandle {
     /// Connects to `address` without blocking: `None` once connected, or the error.
     fn connect(&self, py: Python<'_>, address: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let address = sockaddr::from_py(address)?;
+        ensure_same_run(&self.registration)?;
         // A cancelled task must not start a connection it will never finish (C1).
         step::raise_if_cancelled(py)?;
         match self

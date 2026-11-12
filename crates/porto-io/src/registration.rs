@@ -80,6 +80,13 @@ impl<S> Registration<S> {
         self.id
     }
 
+    /// Whether `driver` is the driver this registration was made with: the only one that ever
+    /// polls it, so a task of any other run that waits on it would wait forever.
+    pub fn is_driven_by(&self, driver: &Arc<dyn Driver>) -> bool {
+        // Compared by address only: two vtables for one type may differ between codegen units.
+        std::ptr::addr_eq(Arc::as_ptr(&self.driver), Arc::as_ptr(driver))
+    }
+
     /// Whether [`close`](Self::close) was called.
     pub fn is_closed(&self) -> bool {
         self.gate.is_closed()
