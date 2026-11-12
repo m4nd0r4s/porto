@@ -429,6 +429,21 @@ def test_read_sizes_out_of_range_are_value_errors(max_bytes: int) -> None:
     run(main())
 
 
+def test_none_means_the_default_read_size() -> None:
+    async def main() -> tuple[bytes, int]:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            await client.write(b"x" * 100_000)
+            await porto.sleep(0.05)
+            first = await server.read(None)
+            buffer = await server.read_buffer(None)
+            return first, len(buffer)
+
+    first, buffered = run(main())
+    assert 0 < len(first) <= 65536
+    assert 0 <= buffered <= 65536
+
+
 def test_a_read_of_no_bytes_is_refused_because_it_would_look_like_the_end() -> None:
     async def main() -> None:
         client, server, listener = await connected()
@@ -513,7 +528,7 @@ def test_a_write_cancelled_midway_breaks_the_stream() -> None:
             for call in (lambda: client.write(b"more"), lambda: client.writev([b"more"])):
                 with pytest.raises(porto.BrokenResourceError, match="close the stream") as caught:
                     await call()
-                assert "left mid-write by a cancellation" in str(caught.value)
+                assert "left mid-write" in str(caught.value)
             # Reading is unaffected, and so is the other side.
             await server.write(b"reply")
             assert await read_exactly(client, 5) == b"reply"

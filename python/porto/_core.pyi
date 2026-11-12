@@ -424,13 +424,14 @@ class TcpStream:
     ``porto.net.listen_tcp(...).accept()``. It belongs to the ``porto.run`` that opened it:
     using it from another run raises ``RuntimeError`` at the call."""
 
-    def read(self, max: int = 65536, /) -> Awaitable[bytes]:
-        """Receives at most ``max`` bytes (``max >= 1``; ``ValueError`` otherwise): ``b""`` at the
+    def read(self, max: int | None = None, /) -> Awaitable[bytes]:
+        """Receives at most ``max`` bytes (``max >= 1``; ``ValueError`` otherwise; ``None``, the
+        default, is 65536): ``b""`` at the
         end of the stream, once the peer closed or shut down its writing side. Cancelling loses
         no bytes. Only one task may read a stream at a time: a second concurrent read raises
         ``porto.BusyResourceError``."""
 
-    def read_buffer(self, max: int = 65536, /) -> Awaitable[Buffer]:
+    def read_buffer(self, max: int | None = None, /) -> Awaitable[Buffer]:
         """Like ``read``, into a ``porto.Buffer`` from the lane's pool, with no ``bytes`` copy.
         An empty buffer at the end of the stream."""
 

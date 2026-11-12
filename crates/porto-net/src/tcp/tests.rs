@@ -212,6 +212,71 @@ fn a_connection_that_failed_before_accept_is_skipped_not_raised() {
     assert!(!is_aborted_connection(&io::ErrorKind::WouldBlock.into()));
 }
 
+#[test]
+fn windows_reports_a_connection_reset_in_the_backlog_as_a_reset() {
+    // `WSAECONNRESET` (10054) from Winsock's accept is skipped on Windows only: elsewhere a
+    // reset connection is accepted and fails at its first read.
+    let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+    assert_eq!(is_aborted_connection(&reset), cfg!(windows));
+    #[cfg(windows)]
+    assert!(is_aborted_connection(&io::Error::from_raw_os_error(10054)));
+}
+
+#[test]
+fn skipping_is_capped_so_a_persistent_error_cannot_hold_the_caller() {
+    let mut calls = 0;
+    let result: io::Result<()> = accept_skipping(|| {
+        calls += 1;
+        Err(io::Error::from(io::ErrorKind::ConnectionAborted))
+    });
+    assert_eq!(
+        calls, MAX_SKIPPED_CONNECTIONS,
+        "no more attempts than the cap"
+    );
+    let error = result.unwrap_err();
+    let limit = AcceptSkipLimit::of(&error).expect("the skip limit, not the raw error");
+    assert_eq!(limit.last_error().kind(), io::ErrorKind::ConnectionAborted);
+    assert!(error.to_string().contains("64 connections in a row"));
+    assert!(!is_aborted_connection(&error), "it is not itself skipped");
+    assert!(!is_resource_exhaustion(&error));
+}
+
+#[test]
+fn skipping_stops_at_the_first_connection_that_works_or_the_first_other_error() {
+    let mut calls = 0;
+    let accepted = accept_skipping(|| {
+        calls += 1;
+        if calls < 10 {
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted))
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(accepted.unwrap(), 10);
+    let mut calls = 0;
+    let blocked: io::Result<()> = accept_skipping(|| {
+        calls += 1;
+        if calls < 5 {
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted))
+        } else {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+    });
+    assert_eq!(blocked.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(calls, 5);
+    // The cap counts consecutive skips: a connection that works starts the count over.
+    let mut calls = 0;
+    let result = accept_skipping(|| {
+        calls += 1;
+        if calls < MAX_SKIPPED_CONNECTIONS {
+            Err(io::Error::from(io::ErrorKind::ConnectionAborted))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_ok(), "one short of the cap still gets through");
+}
+
 #[cfg(unix)]
 #[test]
 fn accept_skips_a_connection_the_client_reset_and_returns_the_next() {

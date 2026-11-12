@@ -154,11 +154,16 @@ impl IoOp {
         }
     }
 
-    /// The operation ended, by completing or failing: it no longer marks its stream mid-write
-    /// when dropped. Only a cancellation, which drops it unfinished, leaves the stream broken;
-    /// an OS error is the stream's own to report again (spec 13 §5).
-    fn finish(&mut self) {
-        if let Self::Write { mid_write, .. } | Self::WriteV { mid_write, .. } = self {
+    /// The operation ended: it completed (`error` is `None`) or failed with `error`.
+    ///
+    /// A write that ended after sending only part of its data leaves the stream mid-message
+    /// (the flag [`Drop`] sets) unless its error is one the connection cannot survive, which
+    /// every later write fails with again ([`is_sticky_write_error`]). Any other error (a
+    /// transient `ENOBUFS`, `WriteZero`) leaves the connection open at a message boundary the
+    /// caller never reached, so the stream stays broken like after a cancellation.
+    fn finish(&mut self, error: Option<&io::Error>) {
+        let sticky = error.is_none_or(is_sticky_write_error);
+        if sticky && let Self::Write { mid_write, .. } | Self::WriteV { mid_write, .. } = self {
             *mid_write = None;
         }
     }
@@ -305,6 +310,21 @@ impl IoOp {
     }
 }
 
+/// Whether `error`, from a send, means the connection is gone for good, so that every later
+/// send fails again (the peer reset it, it timed out, it is not connected, it was closed or
+/// shut down). Anything else may be transient (`ENOBUFS`, `ENOMEM`, `WriteZero`).
+fn is_sticky_write_error(error: &io::Error) -> bool {
+    ClosedResource::is(error)
+        || matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::TimedOut
+        )
+}
+
 /// An empty buffer of capacity `max` to receive into; `OutOfMemory` if it cannot be allocated.
 fn receive_buffer(max: usize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -330,9 +350,9 @@ impl Drop for IoOp {
             } => (mid_write, *written, *total),
             _ => return,
         };
-        // Dropped unfinished (`finish` was not called: a cancellation) with part of the data
-        // out and the rest never to follow: the stream's bytes now stop in the middle of what
-        // the caller meant to send.
+        // Dropped with part of the data out and the rest never to follow (a cancellation, or
+        // an error the connection survives, see `finish`): the stream's bytes now stop in the
+        // middle of what the caller meant to send.
         if sent > 0 && sent < total {
             mid_write.store(true, Ordering::Release);
         }
@@ -345,6 +365,14 @@ impl IoOp {
     /// retried after a pause ([`tcp::ACCEPT_BACKOFF`]).
     fn backs_off_on(&self, error: &io::Error) -> bool {
         matches!(self, Self::Accept | Self::AcceptTcp { .. }) && tcp::is_resource_exhaustion(error)
+    }
+
+    /// Whether `error` says the accept skipped [`tcp::MAX_SKIPPED_CONNECTIONS`] connections in
+    /// a row: the operation yields its lane and tries again (readiness is not cleared, more
+    /// may be waiting), and backs off with a warning if that keeps happening.
+    fn skipped_too_many(&self, error: &io::Error) -> bool {
+        matches!(self, Self::Accept | Self::AcceptTcp { .. })
+            && tcp::AcceptSkipLimit::of(error).is_some()
     }
 
     /// `error` as the exception this operation raises.
@@ -374,15 +402,27 @@ pub(crate) fn clear_run_state() {
         *limit.borrow_mut() = tcp::RateLimit::new(tcp::EXHAUSTION_WARNING_INTERVAL);
     });
 }
-/// Logs (rate limited) that an accept ran out of file descriptors and backs off.
-fn warn_descriptors_exhausted(py: Python<'_>, error: &io::Error) {
+/// Logs (rate limited) that an accept backs off: out of file descriptors or memory, or
+/// failing for every connection it takes.
+fn warn_accept_backs_off(py: Python<'_>, error: &io::Error) {
     if !EXHAUSTION_WARNINGS.with_borrow_mut(|limit| limit.allow(Instant::now())) {
         return;
     }
+    let cause = if tcp::AcceptSkipLimit::of(error).is_some() {
+        format!(
+            "keeps failing for the connections it takes ({error}); a firewall, a seccomp \
+             policy or the network is refusing them, or clients are resetting them before they \
+             are accepted"
+        )
+    } else {
+        format!(
+            "ran out of file descriptors or memory ({error}); close connections you no \
+             longer need, or raise the limit (ulimit -n)"
+        )
+    };
     let message = format!(
-        "porto: accept() ran out of file descriptors or memory ({error}); the pending \
-         connections wait and accept retries every {} ms. Close connections you no longer \
-         need, or raise the limit (ulimit -n); this is logged at most once every {} s",
+        "porto: accept() {cause}; the pending connections wait and accept retries every {} \
+         ms. This is logged at most once every {} s",
         tcp::ACCEPT_BACKOFF.as_millis(),
         tcp::EXHAUSTION_WARNING_INTERVAL.as_secs(),
     );
@@ -529,20 +569,42 @@ pub(crate) fn submit_claimed(
     if !op.waits_only() && step::proceed(py)? {
         match registration.attempt_io(op.interest(), |socket| op.attempt(socket)) {
             Ok(completed) => {
-                op.finish();
+                op.finish(None);
                 return ready(py, completed.into_py(py)?);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             // The trap tries again after a pause (below), so it fails to the caller never.
-            Err(error) if op.backs_off_on(&error) => warn_descriptors_exhausted(py, &error),
+            Err(error) if op.backs_off_on(&error) => warn_accept_backs_off(py, &error),
+            // The trap yields the lane before it accepts again.
+            Err(error) if op.skipped_too_many(&error) => {}
             Err(error) => {
-                op.finish();
+                op.finish(Some(&error));
                 return Err(op.raise(&error));
             }
         }
     }
     let wait = IoWait::new(wait_for(Arc::clone(registration), op, claim));
     Ok(trap::fast_new::object(py, Trap::new(TrapKind::Io(wait)))?.into_any())
+}
+
+/// How many rounds in a row an accept may skip its [`tcp::MAX_SKIPPED_CONNECTIONS`] before it
+/// stops yielding the lane and backs off (with the warning) instead.
+const CAPPED_ROUNDS_BEFORE_BACKOFF: usize = 4;
+
+/// Lets the other tasks of the lane run, then continues: wakes itself and reports pending
+/// once, like the cooperative budget does.
+async fn yield_lane() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// Waits [`tcp::ACCEPT_BACKOFF`], or until `registration` is closed, whichever is first: closing
@@ -570,6 +632,9 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option
             .await
             .map(|_| Completed::Done)
     } else {
+        // Rounds in a row that skipped the most connections an accept may: the first ones
+        // yield the lane (more connections may be waiting), then the accept backs off.
+        let mut capped_rounds = 0;
         loop {
             let result = registration
                 .async_io(interest, |socket| op.attempt(socket))
@@ -577,15 +642,25 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option
             match result {
                 Err(error) if op.backs_off_on(&error) => {
                     // SAFETY: an `Io` wait is polled by the step loop, on its lane, attached.
-                    warn_descriptors_exhausted(unsafe { Python::assume_attached() }, &error);
+                    warn_accept_backs_off(unsafe { Python::assume_attached() }, &error);
                     back_off(&registration).await;
+                }
+                Err(error) if op.skipped_too_many(&error) => {
+                    capped_rounds += 1;
+                    if capped_rounds < CAPPED_ROUNDS_BEFORE_BACKOFF {
+                        yield_lane().await;
+                    } else {
+                        // SAFETY: as above.
+                        warn_accept_backs_off(unsafe { Python::assume_attached() }, &error);
+                        back_off(&registration).await;
+                    }
                 }
                 result => break result,
             }
         }
     };
     // It ended by completing or failing, not by a cancellation.
-    op.finish();
+    op.finish(result.as_ref().err());
     // SAFETY: an `Io` wait is polled by the step loop, on its lane, attached.
     let py = unsafe { Python::assume_attached() };
     let value = result
@@ -597,5 +672,135 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option
     match value {
         Ok(value) => Resume::Value(value),
         Err(error) => Resume::Throw(error.into_value(py)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::types::PyBytes;
+
+    use super::*;
+
+    fn flag() -> MidWrite {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// A write of 10 bytes of which `sent` went out.
+    fn write(py: Python<'_>, sent: usize, mid_write: &MidWrite) -> IoOp {
+        let data = PyBufferRef::new(PyBytes::new(py, b"0123456789").as_any(), "data").unwrap();
+        IoOp::Write {
+            data,
+            off: sent,
+            mid_write: Some(Arc::clone(mid_write)),
+        }
+    }
+
+    /// A vectored write of 10 bytes in two buffers of which `sent` went out.
+    fn write_v(py: Python<'_>, sent: usize, mid_write: &MidWrite) -> IoOp {
+        let buffers = [b"01234".as_slice(), b"56789".as_slice()]
+            .map(|bytes| PyBufferRef::new(PyBytes::new(py, bytes).as_any(), "data").unwrap())
+            .into();
+        let mut op = IoOp::write_v(buffers, Some(Arc::clone(mid_write)));
+        if let IoOp::WriteV { written, .. } = &mut op {
+            *written = sent;
+        }
+        op
+    }
+
+    fn ended_with(error: Option<io::Error>, sent: usize) -> [bool; 2] {
+        Python::initialize();
+        Python::attach(|py| {
+            [write, write_v].map(|make| {
+                let mid_write = flag();
+                let mut op = make(py, sent, &mid_write);
+                op.finish(error.as_ref());
+                drop(op);
+                mid_write.load(Ordering::Acquire)
+            })
+        })
+    }
+
+    #[test]
+    fn a_write_dropped_unfinished_after_a_partial_send_marks_the_stream() {
+        Python::initialize();
+        Python::attach(|py| {
+            for make in [write, write_v] {
+                for (sent, broken) in [(0, false), (4, true), (10, false)] {
+                    let mid_write = flag();
+                    drop(make(py, sent, &mid_write)); // a cancellation: no `finish`
+                    assert_eq!(mid_write.load(Ordering::Acquire), broken, "sent {sent}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_partial_write_that_failed_with_an_error_the_connection_survives_marks_the_stream() {
+        // WriteZero, a transient ENOBUFS or ENOMEM (BSD, macOS), an interrupted syscall...
+        let transient = [
+            io::Error::from(io::ErrorKind::WriteZero),
+            io::Error::from(io::ErrorKind::OutOfMemory),
+            io::Error::from(io::ErrorKind::Other),
+            #[cfg(unix)]
+            io::Error::from_raw_os_error(55), // ENOBUFS on macOS and the BSDs (105 on Linux)
+        ];
+        for error in transient {
+            assert_eq!(
+                ended_with(Some(error), 4),
+                [true, true],
+                "a later write would start mid-message"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partial_write_that_failed_with_a_lost_connection_leaves_it_to_the_sockets_own_errors() {
+        let sticky = [
+            io::Error::from(io::ErrorKind::ConnectionReset),
+            io::Error::from(io::ErrorKind::ConnectionAborted),
+            io::Error::from(io::ErrorKind::BrokenPipe),
+            io::Error::from(io::ErrorKind::NotConnected),
+            io::Error::from(io::ErrorKind::TimedOut),
+        ];
+        for error in sticky {
+            assert_eq!(ended_with(Some(error), 4), [false, false]);
+        }
+    }
+
+    /// Closed under the write: the error a closed registration reports.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_write_that_failed_because_the_stream_was_closed_leaves_it_to_the_close() {
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        left.set_nonblocking(true).unwrap();
+        let driver: Arc<dyn porto_io::Driver> = Arc::new(porto_io::MioDriver::new().unwrap());
+        let registration =
+            Registration::new(driver, std::os::fd::OwnedFd::from(left), Interest::READABLE)
+                .unwrap();
+        registration.close().unwrap();
+        let closed = registration.source().err().expect("closed");
+        assert_eq!(ended_with(Some(closed), 4), [false, false]);
+    }
+
+    #[test]
+    fn a_completed_write_never_marks_the_stream() {
+        assert_eq!(ended_with(None, 10), [false, false]);
+    }
+
+    #[test]
+    fn accept_classifies_what_to_yield_and_what_to_back_off_on() {
+        let accept = IoOp::AcceptTcp {
+            ending_iteration: false,
+        };
+        let skipped = tcp::AcceptSkipLimit::error(io::ErrorKind::ConnectionAborted.into());
+        assert!(accept.skipped_too_many(&skipped));
+        assert!(
+            !accept.backs_off_on(&skipped),
+            "a pause is for resource errors"
+        );
+        assert!(!accept.skipped_too_many(&io::Error::from(io::ErrorKind::WouldBlock)));
+        #[cfg(unix)]
+        assert!(accept.backs_off_on(&io::Error::from_raw_os_error(24))); // EMFILE
+        assert!(!IoOp::Connect.skipped_too_many(&skipped));
     }
 }

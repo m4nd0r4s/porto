@@ -133,9 +133,64 @@ fn set_reuse_port(_socket: &Socket) -> io::Result<()> {
 /// otherwise. A connection that failed before `accept` could return it (see
 /// [`is_aborted_connection`]) is skipped: the next queued one is accepted.
 pub fn accept(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
+    accept_skipping(|| accept_once(listener))
+}
+
+/// The most connections [`accept`] skips in a row before it gives the caller back its thread.
+pub const MAX_SKIPPED_CONNECTIONS: usize = 64;
+
+/// What [`accept`] returns, inside an [`io::Error`] (see [`AcceptSkipLimit::of`]), after it
+/// skipped [`MAX_SKIPPED_CONNECTIONS`] connections in a row: more may be waiting, or the same
+/// error may persist (a firewall or seccomp policy refusing every accept, a dead network), so
+/// the caller yields its thread, tries again, and after repeated rounds backs off and warns.
+#[derive(Debug)]
+pub struct AcceptSkipLimit {
+    last: io::Error,
+}
+
+impl AcceptSkipLimit {
+    /// The error [`accept`] returns after it skipped too many connections, `last` being the
+    /// error of the last one.
+    pub fn error(last: io::Error) -> io::Error {
+        io::Error::other(Self { last })
+    }
+
+    /// The `AcceptSkipLimit` in `error`, if it carries one.
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+
+    /// The error of the last skipped connection.
+    pub fn last_error(&self) -> &io::Error {
+        &self.last
+    }
+}
+
+impl std::fmt::Display for AcceptSkipLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "accept skipped {MAX_SKIPPED_CONNECTIONS} connections in a row that failed before \
+             they were accepted (the last: {})",
+            self.last
+        )
+    }
+}
+
+impl std::error::Error for AcceptSkipLimit {}
+
+/// Runs `next` until it returns something other than an aborted connection, skipping at most
+/// [`MAX_SKIPPED_CONNECTIONS`] of them.
+fn accept_skipping<T>(mut next: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut skipped = 0;
     loop {
-        match accept_once(listener) {
-            Err(error) if is_aborted_connection(&error) => {}
+        match next() {
+            Err(error) if is_aborted_connection(&error) => {
+                skipped += 1;
+                if skipped == MAX_SKIPPED_CONNECTIONS {
+                    return Err(AcceptSkipLimit::error(error));
+                }
+            }
             result => return result,
         }
     }
@@ -183,38 +238,44 @@ fn accept_once(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
 /// `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH`: accept(2) lists these to be treated
 /// like `EAGAIN`). `accept` skips them silently, like trio and asyncio do.
 pub fn is_aborted_connection(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::ConnectionAborted {
-        return true;
+    // `ConnectionAborted` is `ECONNABORTED` and `WSAECONNABORTED`; `ConnectionReset` is what
+    // Winsock's accept returns (`WSAECONNRESET`) for a connection reset while it was still in
+    // the backlog. On Unix a reset connection is accepted fine and fails at its first read.
+    match error.kind() {
+        io::ErrorKind::ConnectionAborted => return true,
+        io::ErrorKind::ConnectionReset if cfg!(windows) => return true,
+        _ => {}
     }
-    #[cfg(unix)]
-    {
-        const CODES: [i32; 3] = [libc::EPROTO, libc::EPERM, libc::ENETDOWN];
-        let linux_only = {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                [
-                    libc::ENOPROTOOPT,
-                    libc::EHOSTDOWN,
-                    libc::ENONET,
-                    libc::EHOSTUNREACH,
-                    libc::EOPNOTSUPP,
-                    libc::ENETUNREACH,
-                ]
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            {
-                [0; 6]
-            }
-        };
-        matches!(
-            error.raw_os_error(),
-            Some(code) if CODES.contains(&code) || linux_only.contains(&code)
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    error.raw_os_error().is_some_and(is_unix_aborted_errno)
+}
+
+#[cfg(unix)]
+fn is_unix_aborted_errno(code: i32) -> bool {
+    matches!(code, libc::EPROTO | libc::EPERM | libc::ENETDOWN) || is_network_errno(code)
+}
+
+#[cfg(not(unix))]
+fn is_unix_aborted_errno(_code: i32) -> bool {
+    false
+}
+
+/// The network errors accept(2) on Linux says to treat like `EAGAIN`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_network_errno(code: i32) -> bool {
+    matches!(
+        code,
+        libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ENETUNREACH
+    )
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn is_network_errno(_code: i32) -> bool {
+    false
 }
 
 /// Whether `error` is the OS running out of what a connection needs: file descriptors

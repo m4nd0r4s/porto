@@ -4,8 +4,9 @@
 //!
 //! The stream keeps three facts of its own (13-io-driver.md §5):
 //!
-//! - whether a write was cancelled after it sent part of its data: the bytes on the wire then
-//!   stop in the middle of what the caller meant to send, so later writes raise
+//! - whether a write was cancelled, or failed with an error that did not end the connection,
+//!   after it sent part of its data: the bytes on the wire then stop in the middle of what the
+//!   caller meant to send, so later writes raise
 //!   `porto.BrokenResourceError` instead of continuing the message from the wrong place;
 //! - whether a task is reading it, and whether a task is writing it: a second reader or writer
 //!   raises `porto.BusyResourceError` (two writers would interleave their bytes inside one
@@ -39,7 +40,7 @@ const DEFAULT_MAX: usize = 65536;
 #[pyclass(frozen, module = "porto.net", name = "TcpStream")]
 pub(crate) struct TcpStream {
     registration: Arc<IoRegistration>,
-    /// Set when a write was cancelled after sending part of its data.
+    /// Set when a write ended after sending part of its data and the connection lives on.
     mid_write: MidWrite,
     /// Held by the operation of the task reading the stream.
     reading: Arc<AtomicBool>,
@@ -83,10 +84,11 @@ impl TcpStream {
     fn ensure_not_mid_write(&self) -> PyResult<()> {
         if self.mid_write.load(Ordering::Acquire) {
             return Err(BrokenResourceError::new_err(
-                "porto: this stream was left mid-write by a cancellation: a write was cancelled \
-                 after it had sent part of its data, so the bytes on the wire stop in the middle \
-                 of a message and anything written now would corrupt it; close the stream \
-                 (await stream.aclose()) and open a new connection",
+                "porto: this stream was left mid-write: an earlier write was cancelled, or failed \
+                 with an error that did not end the connection, after it had sent part of its \
+                 data, so the bytes on the wire stop in the middle of a message and anything \
+                 written now would corrupt it; close the stream (await stream.aclose()) and \
+                 open a new connection",
             ));
         }
         Ok(())
