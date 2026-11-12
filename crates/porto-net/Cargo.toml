@@ -14,6 +14,7 @@ socket2.workspace = true
 [lints]
 workspace = true
 
-[target.'cfg(unix)'.dev-dependencies]
-# `fcntl(F_GETFD)`, to test that sockets are close-on-exec.
+[target.'cfg(unix)'.dependencies]
+# `SOCK_NONBLOCK | SOCK_CLOEXEC` for `accept4`; also `fcntl(F_GETFD)` in the tests, to check
+# that sockets are close-on-exec.
 libc = "0.2"

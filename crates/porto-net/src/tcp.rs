@@ -143,7 +143,7 @@ pub fn accept(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
         target_os = "cygwin",
     ))]
     {
-        let flags = i32::from(Type::NONBLOCK) | i32::from(Type::CLOEXEC);
+        let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
         listener.accept4(flags)
     }
     #[cfg(not(any(
