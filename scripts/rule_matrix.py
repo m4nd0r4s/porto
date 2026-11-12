@@ -75,7 +75,9 @@ def tests_by_rule(tests: Path) -> dict[str, list[str]]:
                 continue
             match = TEST_NAME.match(node.name)
             if match:
-                claimed[match.group("id")].append(f"{path.relative_to(tests)}::{node.name}")
+                claimed[match.group("id")].append(
+                    f"{path.relative_to(tests).as_posix()}::{node.name}"
+                )
     return dict(claimed)
 
 
