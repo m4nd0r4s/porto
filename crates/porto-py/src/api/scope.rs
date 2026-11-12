@@ -24,7 +24,13 @@
 //! default, and `porto.timeout()`) it raises the builtin `TimeoutError` instead (C3), and
 //! `timed_out` turns true either way.
 //!
-//! Not yet: shields (C8), names, `start()` (§3), `Task.cancel()` and awaiting a task (§4), and
+//! A shielded scope (`porto.scope(shield=True)`, `porto.shield()`, the read/write
+//! `Scope.shield`) stops the walk: the cancels and deadlines of the scopes it is in do not reach
+//! it, its own do (C8). Entered with sync `with` (`with porto.shield(timeout=5):` in a
+//! `finally:`), a scope is a cancel scope only: entering and leaving it do not await, and
+//! spawning into it raises.
+//!
+//! Not yet: names, `start()` (§3), `Task.cancel()` and awaiting a task (§4), and
 //! spawning from other lanes or threads (C10).
 
 use std::sync::OnceLock;
@@ -46,9 +52,9 @@ use super::scope_exit::ScopeExit;
 use super::task::Task;
 use crate::async_slots;
 use crate::driver::pytask::{self, PyScopeNode, PyScopeRef, Spawned};
-use crate::driver::ready::{Ready, ready_none};
+use crate::driver::ready::{Ready, ready, ready_none};
 use crate::driver::step::{self, checkpoint_if_needed, checkpoint_if_needed_none};
-use crate::driver::trap::TrapKind;
+use crate::driver::trap::{Trap, TrapKind};
 use crate::driver::{freelist, lane};
 use crate::errors::{Cancelled, NoRuntimeError};
 
@@ -61,24 +67,42 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     freelist::install::<ScopeExit>(module.py(), &exit_freelist::SLOTS)?;
     module.add_function(wrap_pyfunction!(scope, module)?)?;
     module.add_function(wrap_pyfunction!(timeout, module)?)?;
-    module.add_function(wrap_pyfunction!(move_on_after, module)?)
+    module.add_function(wrap_pyfunction!(move_on_after, module)?)?;
+    module.add_function(wrap_pyfunction!(shield, module)?)
 }
 
 freelist::gil_freelist!(exit_freelist, 64);
 
-/// `porto.scope(*, timeout=None, deadline=None, raise_on_timeout=True)`: a new scope, to
-/// enter with `async with`. `timeout` counts seconds from the entry, `deadline` is a time on
-/// the runtime clock; with both, the earlier wins.
+/// `porto.scope(*, timeout=None, deadline=None, shield=False, raise_on_timeout=True)`: a new
+/// scope, to enter with `async with`. `timeout` counts seconds from the entry, `deadline` is a
+/// time on the runtime clock; with both, the earlier wins. `shield=True` keeps the cancels of
+/// the scopes it is in out (C8).
 #[pyfunction]
-#[pyo3(signature = (*, timeout=None, deadline=None, raise_on_timeout=true))]
-fn scope(timeout: Option<f64>, deadline: Option<f64>, raise_on_timeout: bool) -> PyResult<Scope> {
+#[pyo3(signature = (*, timeout=None, deadline=None, shield=false, raise_on_timeout=true))]
+fn scope(
+    timeout: Option<f64>,
+    deadline: Option<f64>,
+    shield: bool,
+    raise_on_timeout: bool,
+) -> PyResult<Scope> {
     let timeout = timeout
         .map(|value| seconds("porto.scope()", "timeout", value))
         .transpose()?;
     let deadline = deadline
         .map(|value| seconds("porto.scope()", "deadline", value))
         .transpose()?;
-    Ok(Scope::new(timeout, deadline, raise_on_timeout))
+    Ok(Scope::new(timeout, deadline, raise_on_timeout).shielded(shield))
+}
+
+/// `porto.shield(*, timeout=None)`: `porto.scope(shield=True, timeout=timeout)` (C8), also
+/// usable with sync `with` in a `finally:` block that awaits cleanup.
+#[pyfunction]
+#[pyo3(signature = (*, timeout=None))]
+fn shield(timeout: Option<f64>) -> PyResult<Scope> {
+    let timeout = timeout
+        .map(|value| seconds("porto.shield()", "timeout", value))
+        .transpose()?;
+    Ok(Scope::new(timeout, None, true).shielded(true))
 }
 
 /// `porto.timeout(seconds)`: a scope whose block raises `TimeoutError` if it is still running
@@ -132,6 +156,10 @@ impl ScopeFlags {
     const TIMED_OUT: u8 = 16;
     /// The runtime's root scope, which has no deadline.
     const ROOT: u8 = 32;
+    /// Shielded, as asked before the block was entered (the node's own bit from then on).
+    const SHIELD: u8 = 64;
+    /// Entered with sync `with`: a cancel scope only, which cannot spawn (C8).
+    const SYNC: u8 = 128;
 }
 
 /// Where a scope is in its life.
@@ -188,34 +216,79 @@ impl Scope {
         if this.node.get().is_some() {
             return Err(entered_twice());
         }
+        let py = slf.py();
+        let value = slf.clone().into_any().unbind();
+        if this.has(ScopeFlags::SHIELD) {
+            // C8: a shield is entered before anything else, so the cancellation it shields
+            // from is never raised at its entry (`finally: async with porto.shield():` in a
+            // cancelled task). T2 still holds: the entry spends budget, and yields once the
+            // budget is spent.
+            this.enter(ScopeFlags::ENTERED)?;
+            if step::spend_budget() {
+                return Ok(Py::new(py, Trap::new(TrapKind::YieldThen(value)))?.into_any());
+            }
+            return ready(py, value);
+        }
         // T2: entering completes synchronously. The checkpoint belongs to the enclosing scope
         // (a cancellation there raises here, before this scope exists); the scope is entered
         // as its effect.
-        let entered = checkpoint_if_needed(slf.py(), slf.clone().into_any().unbind())?;
-        let node = step::enter_cancel_scope(|parent, owner| match parent {
-            Some(parent) => ScopeNode::new_child(parent, owner, false),
-            None => ScopeNode::new_root(owner),
-        })?
-        .ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "porto: a scope must be entered by a porto task, inside its coroutine: \
-                 `async with porto.scope() as s:` in code that porto.run() runs",
-            )
-        })?;
-        if this.node.set(node.clone()).is_err() {
-            // Another task entered it at the same time.
-            step::exit_cancel_scope(&node);
+        let entered = checkpoint_if_needed(py, value)?;
+        this.enter(ScopeFlags::ENTERED)?;
+        Ok(entered)
+    }
+
+    /// `with porto.shield():` (C8): the scope as a cancel scope only, entered and exited
+    /// without awaiting, for a `finally:` block that must await cleanup. It cannot spawn.
+    fn __enter__(slf: &Bound<'_, Self>) -> PyResult<Py<Self>> {
+        if !lane::is_active() {
+            return Err(NoRuntimeError::new_err(
+                "porto: `with porto.shield()` only works in tasks of a porto runtime; start the \
+                 program with porto.run(main) and open the scope inside main",
+            ));
+        }
+        let this = slf.get();
+        if this.node.get().is_some() {
             return Err(entered_twice());
         }
-        let flags = this.flags.fetch_or(ScopeFlags::ENTERED, Ordering::AcqRel);
-        if flags & ScopeFlags::CANCEL_REQUESTED != 0 {
-            // Cancelled before it was entered.
-            node.cancel(CancelReason::Explicit);
+        this.enter(ScopeFlags::ENTERED | ScopeFlags::SYNC)?;
+        Ok(slf.clone().unbind())
+    }
+
+    /// Leaves a scope entered with `with`: absorbs a `Cancelled` it caused (C3), or raises
+    /// `TimeoutError` if its deadline cut the block short.
+    #[pyo3(signature = (_exc_type, exc, _traceback, /))]
+    fn __exit__(
+        &self,
+        _exc_type: &Bound<'_, PyAny>,
+        exc: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        if !self.has(ScopeFlags::SYNC) {
+            return Err(PyRuntimeError::new_err(
+                "porto: Scope.__exit__ leaves a scope entered with `with`; this one was not: \
+                 exit it the way it was entered (`async with` for `async with`), and do not \
+                 call __exit__ yourself",
+            ));
         }
-        if let Some(handle) = Handle::try_current() {
-            this.deadline.enter(&node, &handle);
+        let node = self.node.get();
+        // As in `__aexit__`: the owner closed at shutdown has no cancel stack to pop.
+        if exc.is_instance_of::<PyGeneratorExit>() {
+            if let Some(node) = node {
+                step::exit_cancel_scope(node);
+            }
+            drop(self.close());
+            return Ok(false);
         }
-        Ok(entered)
+        if let Some(node) = node
+            && !step::exit_cancel_scope(node)
+        {
+            return Err(PyRuntimeError::new_err(
+                "porto: a scope must be exited by the task that entered it, innermost first; \
+                 use `with porto.shield():` and do not call __exit__ yourself",
+            ));
+        }
+        // No child can run (spawn is refused), so nothing to wait for or cancel.
+        self.finish(exc)
     }
 
     #[pyo3(signature = (_exc_type, exc, _traceback, /))]
@@ -329,6 +402,39 @@ impl Scope {
         self.deadline.get(self.node.get())
     }
 
+    /// Whether the scope is shielded from the cancellation of the scopes it is in (C8): their
+    /// cancels and deadlines do not reach it, its own still do.
+    #[getter(shield)]
+    fn get_shield(&self) -> bool {
+        match self.node.get() {
+            Some(node) if self.has(ScopeFlags::ENTERED) => node.is_shielded(),
+            _ => self.has(ScopeFlags::SHIELD),
+        }
+    }
+
+    /// Shields the scope, or stops shielding it, from any thread: the tasks in it are
+    /// re-evaluated at once, and unshielding wakes the waiting ones an outer cancel now reaches.
+    #[setter(shield)]
+    fn set_shield(&self, shield: bool) -> PyResult<()> {
+        if self.has(ScopeFlags::ROOT) {
+            return Err(PyRuntimeError::new_err(
+                "porto: the root scope has no enclosing scope to be shielded from; shield a \
+                 scope inside main: `with porto.shield():`",
+            ));
+        }
+        let flags = if shield {
+            self.flags.fetch_or(ScopeFlags::SHIELD, Ordering::AcqRel)
+        } else {
+            self.flags.fetch_and(!ScopeFlags::SHIELD, Ordering::AcqRel)
+        };
+        if flags & ScopeFlags::ENTERED != 0
+            && let Some(node) = self.node.get()
+        {
+            node.set_shield(shield);
+        }
+        Ok(())
+    }
+
     /// Moves the deadline (C9): the timer re-arms, and a time already passed cancels the scope
     /// now. A scope already cancelled stays cancelled, whatever its new deadline.
     #[setter(deadline)]
@@ -393,6 +499,14 @@ impl Scope {
         scope
     }
 
+    /// Marks a scope not entered yet as shielded.
+    fn shielded(self, shield: bool) -> Self {
+        if shield {
+            self.flags.fetch_or(ScopeFlags::SHIELD, Ordering::Relaxed);
+        }
+        self
+    }
+
     fn new(timeout: Option<f64>, deadline: Option<f64>, raise_on_timeout: bool) -> Self {
         Self {
             node: SetOnce::new(),
@@ -417,6 +531,12 @@ impl Scope {
                  start the program with porto.run(main) and open the scope inside main",
             ));
         };
+        if self.has(ScopeFlags::SYNC) {
+            return Err(PyRuntimeError::new_err(
+                "porto: a scope entered with sync `with` is only a cancel scope and cannot \
+                 spawn tasks; enter it with `async with` to spawn into it",
+            ));
+        }
         let node = match (self.phase(), self.node.get_arc()) {
             (Phase::Open, Some(node)) => node,
             (Phase::Closed, _) => return Err(scope_closed()),
@@ -446,7 +566,7 @@ impl Scope {
     fn phase(&self) -> Phase {
         if self.has(ScopeFlags::CLOSED) {
             Phase::Closed
-        } else if self.node.get().is_some() {
+        } else if self.has(ScopeFlags::ENTERED) {
             Phase::Open
         } else {
             Phase::New
@@ -465,6 +585,45 @@ impl Scope {
         }
         let scope = self.node.get_arc()?;
         Some(TrapKind::ScopeExit { scope })
+    }
+
+    /// Enters the block in the running task: makes the node (shielded if asked), publishes it
+    /// with `entered` (`ENTERED`, and `SYNC` for `with`), then applies what was asked before:
+    /// a `cancel()`, a shield change, the deadline.
+    fn enter(&self, entered: u8) -> PyResult<()> {
+        let shield = self.has(ScopeFlags::SHIELD);
+        let node = step::enter_cancel_scope(|parent, owner| match parent {
+            Some(parent) => ScopeNode::new_child(parent, owner, shield),
+            None => {
+                let root = ScopeNode::new_root(owner);
+                root.set_shield(shield);
+                root
+            }
+        })?
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(
+                "porto: a scope must be entered by a porto task, inside its coroutine: \
+                 `async with porto.scope() as s:` in code that porto.run() runs",
+            )
+        })?;
+        if self.node.set(node.clone()).is_err() {
+            // Another task entered it at the same time.
+            step::exit_cancel_scope(&node);
+            return Err(entered_twice());
+        }
+        let flags = self.flags.fetch_or(entered, Ordering::AcqRel);
+        if flags & ScopeFlags::CANCEL_REQUESTED != 0 {
+            // Cancelled before it was entered.
+            node.cancel(CancelReason::Explicit);
+        }
+        if (flags & ScopeFlags::SHIELD != 0) != shield {
+            // The shield changed between the node's making and its publication.
+            node.set_shield(!shield);
+        }
+        if let Some(handle) = Handle::try_current() {
+            self.deadline.enter(&node, &handle);
+        }
+        Ok(())
     }
 
     /// Children spawned and not ended.

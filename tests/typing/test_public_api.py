@@ -48,6 +48,12 @@ async def with_deadlines() -> bool:
     async with porto.scope(timeout=1, deadline=5.0, raise_on_timeout=False) as both:
         pass
     porto.timeout("1")  # pyright: ignore[reportArgumentType]
+    with porto.shield(timeout=5) as shielded:
+        assert_type(shielded, porto.Scope)
+        await porto.sleep(0)
+    async with porto.scope(shield=True) as also:
+        assert_type(also.shield, bool)
+        also.shield = False
     return limited.timed_out or quiet.timed_out or both.timed_out
 
 

@@ -109,6 +109,7 @@ def scope(
     *,
     timeout: float | None = None,
     deadline: float | None = None,
+    shield: bool = False,
     raise_on_timeout: bool = True,
 ) -> Scope:
     """A new scope; enter it with ``async with porto.scope() as s:``.
@@ -118,7 +119,20 @@ def scope(
     it passed, the scope is cancelled. Its exit then raises the builtin ``TimeoutError`` if the
     cancel cut the block short, or goes on quietly with ``raise_on_timeout=False``
     (``timed_out`` tells). 0 or less expires at once; ``inf`` never does; NaN raises
-    ``ValueError``."""
+    ``ValueError``. ``shield=True`` keeps the cancels and deadlines of the scopes it is in out
+    of it (its own still count)."""
+
+def shield(*, timeout: float | None = None) -> Scope:
+    """``porto.scope(shield=True, timeout=timeout)``: a scope the cancels and deadlines of the
+    scopes it is in do not reach. In a ``finally:`` that must await cleanup, enter it with sync
+    ``with``::
+
+        finally:
+            with porto.shield(timeout=5):
+                await conn.rollback()
+
+    A scope entered with ``with`` is a cancel scope only: spawning into it raises
+    ``RuntimeError``."""
 
 def timeout(seconds: float, /) -> Scope:
     """``porto.scope(timeout=seconds)``: the block raises ``TimeoutError`` if it is still running
@@ -185,6 +199,15 @@ class Scope:
     @deadline.setter
     def deadline(self, value: float) -> None: ...
     @property
+    def shield(self) -> bool:
+        """Whether the cancels and deadlines of the scopes this one is in are kept out of it
+        (its own still count). Settable from any thread: the tasks in it are re-evaluated at
+        once, and unshielding wakes the waiting ones an outer cancel now reaches. The root scope
+        cannot be shielded: setting it raises ``RuntimeError``."""
+
+    @shield.setter
+    def shield(self, value: bool) -> None: ...
+    @property
     def timed_out(self) -> bool:
         """Whether the scope's deadline cut its block short: the exit absorbed a
         ``porto.Cancelled`` the deadline caused. The exit raised ``TimeoutError`` then, unless
@@ -199,6 +222,17 @@ class Scope:
         this one; one the block catches and swallows does not count."""
 
     async def __aenter__(self) -> Self: ...
+    def __enter__(self) -> Self:
+        """Enters the scope as a cancel scope only (``with porto.shield():``): no await, and
+        spawning into it raises ``RuntimeError``."""
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> bool: ...
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,

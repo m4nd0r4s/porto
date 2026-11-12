@@ -44,6 +44,7 @@ from porto._core import (
     move_on_after,
     run,
     scope,
+    shield,
     sleep,
     timeout,
 )
@@ -104,6 +105,7 @@ __all__ = [
     "move_on_after",
     "run",
     "scope",
+    "shield",
     "sleep",
     "timeout",
     "unbounded_channel",
