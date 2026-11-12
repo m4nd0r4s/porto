@@ -288,8 +288,19 @@ impl ScheduledIo {
             id,
             linked: false,
             node: UnsafeCell::new(WaiterNode::new(interest)),
+            release_only: false,
             _pinned: PhantomPinned,
         }
+    }
+
+    /// A future that resolves, with the closed event, once the slot of `id` is released, and
+    /// never for any readiness: not even the closed bits a hang-up sets (which are never
+    /// cleared, so waiting on them would resolve at every poll). A wake for readiness may
+    /// poll it, and it stays pending.
+    pub fn released(&self, id: RegistrationId) -> Readiness<'_> {
+        let mut released = self.readiness(id, Interest::PRIORITY);
+        released.release_only = true;
+        released
     }
 
     fn lock_waiters(&self) -> MutexGuard<'_, Waiters> {
@@ -353,7 +364,23 @@ pub struct Readiness<'a> {
     linked: bool,
     /// Only touched with `io.waiters` locked, since the list points into it.
     node: UnsafeCell<WaiterNode>,
+    /// Resolves on the release of the slot only, whatever readiness is set (see
+    /// [`ScheduledIo::released`]).
+    release_only: bool,
     _pinned: PhantomPinned,
+}
+
+impl Readiness<'_> {
+    /// The event this wait resolves with at `word`, if it does.
+    fn observe(&self, word: usize, mask: Ready) -> Option<ReadyEvent> {
+        if self.release_only {
+            let generation = unpack_generation(word);
+            (generation != self.id.generation())
+                .then(|| ReadyEvent::closed(mask, self.id.generation()))
+        } else {
+            event_if_ready(word, self.id, mask)
+        }
+    }
 }
 
 // SAFETY: `node` is only accessed with the `ScheduledIo` mutex held, so the future can move
@@ -375,7 +402,7 @@ impl Future for Readiness<'_> {
         let mask = Ready::from_interest(unsafe { (*node_ptr).interest });
 
         if !this.linked
-            && let Some(event) = event_if_ready(io.readiness.load(Ordering::Acquire), this.id, mask)
+            && let Some(event) = this.observe(io.readiness.load(Ordering::Acquire), mask)
         {
             return Poll::Ready(event);
         }
@@ -393,7 +420,7 @@ impl Future for Readiness<'_> {
         // Not linked, or notified (and so unlinked): look at the word again under the lock,
         // so a dispatch that races with linking cannot be missed.
         this.linked = false;
-        if let Some(event) = event_if_ready(io.readiness.load(Ordering::Acquire), this.id, mask) {
+        if let Some(event) = this.observe(io.readiness.load(Ordering::Acquire), mask) {
             return Poll::Ready(event);
         }
         node.notified = false;

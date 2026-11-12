@@ -143,15 +143,15 @@ impl<S> Registration<S> {
     /// already is: what a waiting task that is not waiting for readiness selects against to
     /// end promptly when the resource is closed under it.
     ///
-    /// It waits on the priority interest, which a TCP source never reports (readiness other
-    /// than a close is forgotten and waited out again), so only [`ClosedResource`] ends it.
+    /// Only the release of the registration ends it, never readiness: a hang-up (which sets
+    /// closed bits that are never cleared) leaves it pending.
     pub async fn closed(&self) {
-        loop {
-            match self.readiness(Interest::PRIORITY).await {
-                Err(_) => return,
-                Ok(event) => self.clear_readiness(event),
-            }
-        }
+        let released = RegistrationReadiness {
+            registration: self,
+            inner: self.scheduled_io().released(self.id),
+        };
+        // Resolves with the closed error, the only thing it can resolve with.
+        drop(released.await);
     }
 
     /// Forgets the readiness in `event`, which an operation consumed (it hit `WouldBlock`),

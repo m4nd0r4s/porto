@@ -121,6 +121,37 @@ fn closed_completes_when_the_registration_is_closed() {
 }
 
 #[test]
+fn closed_ignores_readiness_including_a_hang_up_whose_bits_never_clear() {
+    let driver = driver();
+    let (peer, stream) = socketpair();
+    let registration = register(&driver, stream);
+    let mut closed = std::pin::pin!(registration.closed());
+    let (counter, waker) = CountingWaker::new();
+    let mut cx = Context::from_waker(&waker);
+    assert!(closed.as_mut().poll(&mut cx).is_pending());
+    // The peer shuts down: the driver reports readable and read-closed, and the closed bits
+    // stay set for good.
+    peer.shutdown(std::net::Shutdown::Both).unwrap();
+    driver.turn(LONG).unwrap();
+    let event = registration.readiness(Interest::READABLE);
+    let mut event = std::pin::pin!(event);
+    assert!(
+        event.as_mut().poll(&mut cx).is_ready(),
+        "the hang-up is readiness"
+    );
+    // However often it is polled, `closed` stays pending: no loop around it can spin.
+    for _ in 0..1000 {
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(
+        counter.wakes() <= 2,
+        "at most the wakes the hang-up itself caused"
+    );
+    registration.close().unwrap();
+    assert!(closed.as_mut().poll(&mut cx).is_ready());
+}
+
+#[test]
 fn new_registers_and_drop_deregisters() {
     let driver = driver();
     let (_left, right) = socketpair();

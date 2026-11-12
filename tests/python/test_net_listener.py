@@ -422,6 +422,53 @@ def test_closing_a_listener_ends_an_accept_that_is_backing_off() -> None:
     assert raised
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="needs the connection that hit EMFILE to stay queued (Linux)"
+)
+def test_a_hang_up_during_the_backoff_does_not_spin_the_lane() -> None:
+    """A dup of the listener's descriptor shut down while accept backs off sets closed bits on
+    the registration that never clear: waiting for the close must not resolve on them, or the
+    lane would spin inside one poll and no timer or cancellation could run again."""
+
+    async def main() -> tuple[float, float, type[BaseException]]:
+        logging.getLogger("porto.net")
+        listener = await net.listen_tcp(LOOPBACK)
+        client = socket.socket()
+        client.connect((LOOPBACK, listener.port))  # queued by the kernel
+        duplicate = socket.socket(fileno=os.dup(listener.fileno()))
+        failure: list[BaseException] = []
+
+        async def accept_one() -> None:
+            try:
+                await listener.accept()
+            except OSError as error:
+                failure.append(error)
+
+        try:
+            async with porto.scope() as s:
+                accepting = s.spawn(accept_one())
+                with no_descriptors_left():
+                    await porto.sleep(0.03)  # backing off
+                    duplicate.shutdown(socket.SHUT_RDWR)  # HUP on the listener's registration
+                    cpu_before = time.process_time()
+                    wall_before = time.monotonic()
+                    await porto.sleep(0.4)  # four backoff periods: timers still run
+                    cpu = time.process_time() - cpu_before
+                    wall = time.monotonic() - wall_before
+                    assert not accepting.done(), "still backing off for want of a descriptor"
+                # Descriptors are back: the shut-down listener now fails its accept (EINVAL).
+                await accepting
+        finally:
+            duplicate.close()
+            client.close()
+            await listener.aclose()
+        return cpu, wall, type(failure[0])
+
+    cpu, wall, failure = run(main())
+    assert cpu < 0.25 * wall, f"the lane spun: {cpu:.2f}s of CPU in {wall:.2f}s"
+    assert issubclass(failure, OSError)
+
+
 def test_the_exhaustion_warning_is_rate_limited_per_run(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
