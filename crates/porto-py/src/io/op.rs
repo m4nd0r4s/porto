@@ -88,7 +88,8 @@ pub(crate) enum IoOp {
     /// Receive into a writable buffer → the number of bytes received.
     ReadInto { buf: PyBufferMut },
     /// Send all of `data`, from `off` on → `None`. Sends what it can at each attempt. If it
-    /// ends having sent only part of `data` (it was cancelled), it sets `mid_write`.
+    /// ends having sent only part of `data` (cancelled, or failed with an error that did not end the
+    /// connection), it sets `mid_write`.
     Write {
         data: PyBufferRef,
         off: usize,
@@ -587,7 +588,7 @@ pub(crate) fn submit_claimed(
     Ok(trap::fast_new::object(py, Trap::new(TrapKind::Io(wait)))?.into_any())
 }
 
-/// How many rounds in a row an accept may skip its [`tcp::MAX_SKIPPED_CONNECTIONS`] before it
+/// How many rounds (over the operation's life) an accept may skip its [`tcp::MAX_SKIPPED_CONNECTIONS`] before it
 /// stops yielding the lane and backs off (with the warning) instead.
 const CAPPED_ROUNDS_BEFORE_BACKOFF: usize = 4;
 
@@ -632,7 +633,7 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option
             .await
             .map(|_| Completed::Done)
     } else {
-        // Rounds in a row that skipped the most connections an accept may: the first ones
+        // Rounds (over the operation's life) that skipped the most connections an accept may: the first ones
         // yield the lane (more connections may be waiting), then the accept backs off.
         let mut capped_rounds = 0;
         loop {

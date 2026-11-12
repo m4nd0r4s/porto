@@ -236,7 +236,8 @@ fn accept_once(listener: &Socket) -> io::Result<(Socket, SockAddr)> {
 /// reset it first (`ECONNABORTED`), the protocol failed on it (`EPROTO`), a firewall refused it
 /// (`EPERM`), or the network under it went away (`ENETDOWN`, `ENOPROTOOPT`, `EHOSTDOWN`,
 /// `ENONET`, `EHOSTUNREACH`, `EOPNOTSUPP`, `ENETUNREACH`: accept(2) lists these to be treated
-/// like `EAGAIN`). `accept` skips them silently, like trio and asyncio do.
+/// like `EAGAIN`); on Windows, a connection reset in the backlog (`WSAECONNRESET`). `accept`
+/// skips them silently, like trio and asyncio do.
 pub fn is_aborted_connection(error: &io::Error) -> bool {
     // `ConnectionAborted` is `ECONNABORTED` and `WSAECONNABORTED`; `ConnectionReset` is what
     // Winsock's accept returns (`WSAECONNRESET`) for a connection reset while it was still in

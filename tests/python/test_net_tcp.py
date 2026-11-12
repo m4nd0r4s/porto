@@ -580,8 +580,8 @@ def test_a_completed_write_leaves_the_stream_usable_after_a_cancel() -> None:
 
 
 def test_a_write_that_fails_with_an_os_error_after_a_partial_send_does_not_blame_a_cancel() -> None:
-    """The break is for cancellations only: after a reset the stream's own errors are the
-    answer, not a ``BrokenResourceError`` that says a cancellation left it mid-write."""
+    """A reset does not break the stream (other errors after a partial send do): after a reset
+    the stream's own errors are the answer, not a ``BrokenResourceError``."""
     payload = b"x" * (64 * 1024 * 1024)
 
     async def main() -> tuple[type[BaseException], type[BaseException]]:

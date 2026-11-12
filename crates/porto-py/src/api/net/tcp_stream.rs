@@ -80,7 +80,8 @@ impl TcpStream {
         Claim::acquire(&self.writing).ok_or_else(|| busy(call, "writing to", "write"))
     }
 
-    /// Raises `BrokenResourceError` if a cancelled write left the stream mid-message.
+    /// Raises `BrokenResourceError` if an earlier write left the stream mid-message (cancelled, or
+    /// failed with an error that did not end the connection).
     fn ensure_not_mid_write(&self) -> PyResult<()> {
         if self.mid_write.load(Ordering::Acquire) {
             return Err(BrokenResourceError::new_err(
@@ -168,7 +169,8 @@ impl TcpStream {
     }
 
     /// Sends all of `data`, waiting while the socket's buffers are full: `None` once the last
-    /// byte went out. A cancellation after part of it was sent leaves the stream broken.
+    /// byte went out. A cancellation, or an error that does not end the connection, after part of
+    /// it was sent leaves the stream broken.
     fn write(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let data = PyBufferRef::new(data, "write()'s data")?;
         let claim = self.claim_writer("write()")?;

@@ -4,6 +4,7 @@ so these tests run on Unix."""
 
 import contextlib
 import errno
+import faulthandler
 import logging
 import os
 import socket
@@ -464,7 +465,13 @@ def test_a_hang_up_during_the_backoff_does_not_spin_the_lane() -> None:
             await listener.aclose()
         return cpu, wall, type(failure[0])
 
-    cpu, wall, failure = run(main())
+    # If the spin came back it would hold the lane (and the GIL) inside one poll, so no Python
+    # timeout could fire: faulthandler's C watchdog ends the process instead of hanging CI.
+    faulthandler.dump_traceback_later(30, exit=True)
+    try:
+        cpu, wall, failure = run(main())
+    finally:
+        faulthandler.cancel_dump_traceback_later()
     assert cpu < 0.25 * wall, f"the lane spun: {cpu:.2f}s of CPU in {wall:.2f}s"
     assert issubclass(failure, OSError)
 
