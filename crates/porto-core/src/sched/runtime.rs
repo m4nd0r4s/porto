@@ -223,7 +223,8 @@ impl Runtime {
     {
         let (task, join) = new_joinable_task(future, self.lane.handle.clone());
         // This thread owns the runtime, so it is the lane's for the registry's purposes.
-        self.lane.register(&task);
+        // SAFETY: as above, and the task was just spawned.
+        unsafe { self.lane.register_new(&task) };
         self.lane.local.borrow_mut().push_back(task);
         join
     }

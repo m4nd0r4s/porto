@@ -11,8 +11,10 @@ use super::header::Header;
 /// `repr(C)` allocation, so the implementation casts it back to the concrete cell. One static
 /// vtable exists per task type; the header points at it.
 pub struct TaskVTable {
-    /// Polls the task once. Consumes the reference its run queue owned.
-    pub(crate) poll: unsafe fn(NonNull<Header>),
+    /// Polls the task once. Consumes the reference its run queue owned. The flag says the caller is
+    /// the lane thread that owns the task's registry (a lane running its own queue), so completion
+    /// unlinks the task without looking the lane up.
+    pub(crate) poll: unsafe fn(NonNull<Header>, bool),
     /// Drops the task's future (or coroutine) in place, keeping the allocation. The caller
     /// holds RUNNING, which grants exclusive access to the body.
     #[allow(
@@ -60,10 +62,11 @@ impl RawTask {
     }
 
     /// # Safety
-    /// The caller transfers one reference (the run queue's) to the poll.
-    pub(crate) unsafe fn poll(self) {
+    /// The caller transfers one reference (the run queue's) to the poll, and `on_lane` is only
+    /// true on the lane thread that owns the task's registry.
+    pub(crate) unsafe fn poll(self, on_lane: bool) {
         // SAFETY: the vtable belongs to this allocation and the caller hands over a reference.
-        unsafe { (self.header().vtable.poll)(self.ptr) }
+        unsafe { (self.header().vtable.poll)(self.ptr, on_lane) }
     }
 
     /// # Safety

@@ -103,6 +103,13 @@ pub unsafe trait Schedule: Clone + Send + Sync + 'static {
         None
     }
 
+    /// [`Schedule::registration`]'s registry, for a caller that knows it is on the lane thread
+    /// (a lane polling its own queue) and does not need to look that up.
+    fn registry(&self) -> Option<&crate::registry::TaskRegistry> {
+        self.registration()
+            .map(|registration| registration.registry)
+    }
+
     /// Called after a task freed off its lane was handed to the registry's lane, which frees it
     /// at its next maintenance tick: the scheduler wakes the lane for it. `self` is an owned
     /// clone.
@@ -120,14 +127,24 @@ pub struct Registration<'a> {
 /// A task completed on this thread: unlinks it from its registry if it is linked, which the
 /// scheduler's lane does for a task it completes itself.
 #[inline]
-fn unregister_completed<S: Schedule>(header: &Header, scheduler: &S) {
-    if header.registry.is_linked_relaxed() {
-        unregister_completed_slow(header, scheduler);
+fn unregister_completed<S: Schedule>(header: &Header, scheduler: &S, on_lane: bool) {
+    if !header.registry.is_linked_relaxed() {
+        return;
+    }
+    if on_lane {
+        // The lane polling its own queue (the hot path of every registered task): the caller's
+        // word for it, no lookup.
+        if let Some(registry) = scheduler.registry() {
+            registry.completed(header, true);
+        }
+    } else {
+        unregister_completed_elsewhere(header, scheduler);
     }
 }
 
+#[cold]
 #[inline(never)]
-fn unregister_completed_slow<S: Schedule>(header: &Header, scheduler: &S) {
+fn unregister_completed_elsewhere<S: Schedule>(header: &Header, scheduler: &S) {
     if let Some(registration) = scheduler.registration() {
         registration
             .registry
@@ -199,7 +216,18 @@ impl Notified {
         let task = self.into_raw();
         // SAFETY: the queue entry owned a reference to a SCHEDULED task, which the poll takes
         // over.
-        unsafe { task.poll() }
+        unsafe { task.poll(false) }
+    }
+
+    /// [`Notified::run`] on the lane thread that owns the task's registry, which spares the
+    /// completion a lookup of the lane (`crate::registry`).
+    ///
+    /// # Safety
+    /// The calling thread runs the lane the task belongs to, polling its own queues.
+    pub(crate) unsafe fn run_on_lane(self) {
+        let task = self.into_raw();
+        // SAFETY: as for `run`, and the caller's contract for the flag.
+        unsafe { task.poll(true) }
     }
 
     /// The task's id.
@@ -242,7 +270,7 @@ impl Drop for Notified {
         );
         // SAFETY: the entry owns a reference to a SCHEDULED task; the poll takes it over and,
         // seeing CANCEL_REQ, completes the task as cancelled without polling the future.
-        let cancel = || unsafe { task.poll() };
+        let cancel = || unsafe { task.poll(false) };
         if std::thread::panicking() {
             // A second panic while unwinding aborts the process (a queue dropped during a
             // panic): the cancellation's own panic (a panicking future or waker drop) is

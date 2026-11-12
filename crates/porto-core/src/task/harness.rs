@@ -148,7 +148,7 @@ unsafe fn cell<'a, F: Future, S>(ptr: NonNull<Header>) -> &'a Cell<F, S> {
 /// # Safety
 /// `ptr` is a `Cell<F, S>` in the SCHEDULED state, and the caller hands over the queue's
 /// reference.
-unsafe fn poll<F, S>(ptr: NonNull<Header>)
+unsafe fn poll<F, S>(ptr: NonNull<Header>, on_lane: bool)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -194,7 +194,7 @@ where
         }
     };
     // SAFETY: still RUNNING with the run reference, which `complete` releases.
-    unsafe { complete::<F, S>(task, output) }
+    unsafe { complete::<F, S>(task, output, on_lane) }
 }
 
 /// Poll end with `Ready`: drop the future, store `output`, set COMPLETE, hand the output to
@@ -204,7 +204,7 @@ where
 ///
 /// # Safety
 /// The caller holds RUNNING and the run reference, which this consumes.
-unsafe fn complete<F, S>(task: RawTask, output: Result<F::Output, JoinError>)
+unsafe fn complete<F, S>(task: RawTask, output: Result<F::Output, JoinError>, on_lane: bool)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -270,7 +270,7 @@ where
         let notified = panic::catch_unwind(AssertUnwindSafe(|| scope.end(end)));
         unhandled = unhandled.or(notified.err());
     }
-    super::unregister_completed(&cell.header, &cell.scheduler);
+    super::unregister_completed(&cell.header, &cell.scheduler, on_lane);
     cell.scheduler.task_completed(&cell.header);
 
     if cell.header.state.ref_dec() {

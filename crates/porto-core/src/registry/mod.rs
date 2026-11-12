@@ -183,6 +183,20 @@ impl TaskRegistry {
 
     // ----- hot path: the lane -----------------------------------------------------------
 
+    /// Links a task the lane just spawned, which is linked nowhere yet. A closed registry links
+    /// nothing: its tasks are cancelled as they come.
+    ///
+    /// # Safety
+    /// As for [`TaskRegistry::link_if_new`], and `task` is unlinked.
+    #[inline]
+    pub unsafe fn link_new(&self, task: NonNull<Header>) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: the lane thread of an open registry, and the task is unlinked.
+        unsafe { self.push_front(task) };
+    }
+
     /// Links a task the lane spawned or took from the injector, unless it is linked already.
     /// A closed registry links nothing: its tasks are cancelled as they come.
     ///

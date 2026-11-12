@@ -459,6 +459,10 @@ unsafe impl Schedule for Handle {
         })
     }
 
+    fn registry(&self) -> Option<&crate::registry::TaskRegistry> {
+        Some(&self.shared.lanes[0].registry)
+    }
+
     fn zombie_pushed(&self) {
         // The lane frees the task at its next maintenance tick: make sure there is one soon.
         self.shared.notify_lane(0);

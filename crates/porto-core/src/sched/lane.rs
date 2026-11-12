@@ -86,6 +86,17 @@ impl Lane {
         &self.shared().lanes[self.index]
     }
 
+    /// Links a task that was just spawned on this lane, which is linked nowhere yet.
+    ///
+    /// # Safety
+    /// As for `register`, and the task is new.
+    #[inline]
+    pub(crate) unsafe fn register_new(&self, task: &Notified) {
+        // SAFETY: the lane's own thread (the caller's contract), a queued task is live with
+        // the provenance of its allocation, and a new one is unlinked.
+        unsafe { self.remote().registry.link_new(task.ptr()) };
+    }
+
     /// Links a task that is about to run on this lane into its registry (a no-op for one that
     /// is linked already). Called on the lane's own thread, for what it spawns and for what it
     /// takes from the injector.
@@ -122,7 +133,8 @@ impl Lane {
         let Some(task) = self.next_task(tick) else {
             return false;
         };
-        self.with_budget(|| task.run());
+        // SAFETY: this is the lane's own thread, polling a task from its own queues.
+        self.with_budget(|| unsafe { task.run_on_lane() });
         true
     }
 

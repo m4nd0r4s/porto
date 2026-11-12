@@ -45,7 +45,8 @@ pub(crate) fn push_new(handle: &Handle, task: Notified) -> Result<(), Notified> 
         if lane.handle.same_runtime(handle)
             && let Some(task) = task.take()
         {
-            lane.register(&task);
+            // SAFETY: this thread runs the lane, and the task was just spawned.
+            unsafe { lane.register_new(&task) };
             lane.local.borrow_mut().push_back(task);
         }
     });

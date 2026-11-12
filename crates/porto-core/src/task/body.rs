@@ -269,7 +269,7 @@ unsafe fn body_mut<B, S>(cell: &BodyCell<B, S>) -> Pin<&mut B> {
 /// # Safety
 /// `ptr` is a `BodyCell<B, S>` in the SCHEDULED state, and the caller hands over the queue's
 /// reference.
-unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
+unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>, on_lane: bool) {
     // SAFETY: the caller's reference keeps the allocation alive.
     let task = unsafe { RawTask::from_raw(ptr) };
     // SAFETY: as above; the borrow is not used once the run reference is released.
@@ -302,7 +302,7 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
             IdleAction::Dealloc => unsafe { task.dealloc() },
         },
         // SAFETY: still RUNNING with the run reference, which `complete` releases.
-        Ok(Poll::Ready(Some(end))) => unsafe { complete::<B, S>(task, end, None) },
+        Ok(Poll::Ready(Some(end))) => unsafe { complete::<B, S>(task, end, None, on_lane) },
         // A panic in `take_failure` fails the task without a payload for the scope, and goes
         // on once the task is released, like a panic in the poll (but the body is not
         // cancelled: it already finished).
@@ -317,7 +317,7 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
                 Err(payload) => (TaskEnd::Failed(None), Some(payload)),
             };
             // SAFETY: still RUNNING with the run reference, which `complete` releases.
-            unsafe { complete::<B, S>(task, end, unhandled) }
+            unsafe { complete::<B, S>(task, end, unhandled, on_lane) }
         }
         // A body that panics completes: it is not polled again, and the panic goes on from
         // here once the task is released. It is cancelled first, so its joiners are released
@@ -328,7 +328,7 @@ unsafe fn poll<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
                 unsafe { body_mut(cell) }.cancel(&cell.header);
             })));
             // SAFETY: as above.
-            unsafe { complete::<B, S>(task, TaskEnd::Failed(None), Some(payload)) }
+            unsafe { complete::<B, S>(task, TaskEnd::Failed(None), Some(payload), on_lane) }
         }
     }
 }
@@ -343,6 +343,7 @@ unsafe fn complete<B: TaskBody, S: Schedule>(
     task: RawTask,
     end: TaskEnd,
     mut unhandled: Option<Box<dyn Any + Send>>,
+    on_lane: bool,
 ) {
     // SAFETY: the run reference keeps the allocation alive until the `ref_dec` below.
     let cell = unsafe { cell::<B, S>(task.as_ptr()) };
@@ -353,7 +354,7 @@ unsafe fn complete<B: TaskBody, S: Schedule>(
         let notified = panic::catch_unwind(AssertUnwindSafe(|| scope.end(end)));
         unhandled = unhandled.or(notified.err());
     }
-    super::unregister_completed(&cell.header, &cell.scheduler);
+    super::unregister_completed(&cell.header, &cell.scheduler, on_lane);
     cell.scheduler.task_completed(&cell.header);
     if cell.header.state.ref_dec() {
         // SAFETY: the decrement released the last reference.
