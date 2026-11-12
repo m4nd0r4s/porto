@@ -86,6 +86,12 @@ pub unsafe trait Schedule: Clone + Send + Sync + 'static {
     fn task_completed(&self, task: &Header) {
         let _ = task;
     }
+
+    /// The runtime this scheduler is a handle to, if it is one: what [`TaskBody::release`]
+    /// hands to a body that must release something on its lane.
+    fn handle(&self) -> Option<&crate::Handle> {
+        None
+    }
 }
 
 /// A run-queue entry: owns one reference to a task in the SCHEDULED state.

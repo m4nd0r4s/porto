@@ -273,6 +273,13 @@ impl Handle {
         Ok(())
     }
 
+    /// Whether this thread runs one of this runtime's lanes (inside its `block_on` or
+    /// `run_until_idle`, so also inside one of its tasks): the thread that may release what
+    /// belongs to the lane directly, instead of through [`Handle::defer`].
+    pub fn is_current_lane(&self) -> bool {
+        context::with_current_handle(|current| current.same_runtime(self)).unwrap_or(false)
+    }
+
     /// A handle to the runtime running on this thread (inside its `block_on` or one of its
     /// tasks), if any.
     pub fn try_current() -> Option<Self> {
@@ -296,6 +303,10 @@ impl Handle {
 unsafe impl Schedule for Handle {
     fn schedule_local(&self, task: Notified) -> Result<(), Notified> {
         context::push_local(self, task)
+    }
+
+    fn handle(&self) -> Option<&Handle> {
+        Some(self)
     }
 
     fn schedule_remote(self, task: Notified) {

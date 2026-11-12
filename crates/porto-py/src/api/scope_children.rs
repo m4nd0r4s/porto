@@ -24,9 +24,13 @@
 //! `lanes > 1`: `unlink` reads `home` and then locks the list it points at, so a scope freed in
 //! that window is a use after free (the list needs a counted owner, or the registry replaces
 //! it); and `PyTask::drop`, which finishes the handle, can run on a thread that is not the
-//! task's lane (a waker dropped after shutdown) — already possible at one lane, where it is
+//! task's lane (a waker dropped on another thread) — already possible at one lane, where it is
 //! safe only because a scope is always closed (its tasks detached) before it can be freed: the
-//! real precondition of the window above is a scope freed unclosed. The orderings below are `SeqCst` so that the
+//! real precondition of the window above is a scope freed unclosed. Routing a freed PyTask's
+//! Python references to its lane (`TaskBody::release`, porto-szb.15) does *not* make
+//! `finish` run there: the handle must forget the pointer to the body before the allocation
+//! goes, so `finish` (and with it the unlink) stays on the thread that dropped the last
+//! reference; only the coroutine, the context and the outcome are released on the lane. The orderings below are `SeqCst` so that the
 //! one store-load pattern (`register` publishes `home` then reads `ended`, `finish` publishes
 //! `ended` then reads `home`) cannot miss on both sides.
 

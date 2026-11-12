@@ -11,6 +11,7 @@ use std::any::Any;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -23,6 +24,7 @@ use super::state::IdleAction;
 use super::task_ref::TaskRef;
 use super::waker::WakerRef;
 use super::{Notified, Schedule};
+use crate::sched::Handle;
 use crate::scope::{TaskEnd, TaskScope};
 
 /// The body of a task that is not a Rust future: it keeps its outcome and its joiners itself.
@@ -51,6 +53,19 @@ pub trait TaskBody: Send + 'static {
     fn take_failure(self: Pin<&mut Self>) -> Option<Box<dyn Any + Send>> {
         None
     }
+
+    /// The last reference to the task was dropped, on the thread that dropped it (any thread:
+    /// a waker is dropped wherever its owner is), and the body is about to be dropped.
+    ///
+    /// The place to move what must be released on the task's own lane out of the body and hand
+    /// it to [`Handle::defer`] (`25-cpython-integration-and-memory.md` P1): a body that owns
+    /// Python references does, when `home` is not the lane running on this thread. `home` is
+    /// the runtime the task was spawned onto, `None` for a scheduler that is not a [`Handle`].
+    /// Runs inside the same panic guard as the drop; the body is dropped right after, so what
+    /// is left in it must be fit for that.
+    fn release(self: Pin<&mut Self>, home: Option<&Handle>) {
+        let _ = home;
+    }
 }
 
 /// Header + scheduler handle + body, in one allocation. `repr(C)` keeps the header first and
@@ -60,8 +75,10 @@ struct BodyCell<B, S> {
     header: Header,
     scheduler: S,
     /// Only the lane holding RUNNING creates a `&mut` to it; anything else reaches it through
-    /// [`TaskBodyRef::body`], under the body's own synchronization rules.
-    body: UnsafeCell<B>,
+    /// [`TaskBodyRef::body`], under the body's own synchronization rules. Dropped by `dealloc`
+    /// (after [`TaskBody::release`], while the scheduler handle is still alive), not with the
+    /// cell.
+    body: UnsafeCell<ManuallyDrop<B>>,
 }
 
 /// An owned, counted reference to a task with body `B`: a [`TaskRef`] that knows where the
@@ -196,7 +213,7 @@ where
     let cell = Box::new(BodyCell {
         header: Header::new(vtable::<B, S>(), flags, false, scope),
         scheduler,
-        body: UnsafeCell::new(body),
+        body: UnsafeCell::new(ManuallyDrop::new(body)),
     });
     let ptr = NonNull::from(Box::leak(cell)).cast::<Header>();
     // SAFETY: freshly allocated and live until its last reference goes.
@@ -246,7 +263,7 @@ unsafe fn cell<'a, B, S>(ptr: NonNull<Header>) -> &'a BodyCell<B, S> {
 )]
 unsafe fn body_mut<B, S>(cell: &BodyCell<B, S>) -> Pin<&mut B> {
     // SAFETY: RUNNING excludes other `&mut` (the caller's contract); the body never moves.
-    unsafe { Pin::new_unchecked(&mut *cell.body.get()) }
+    unsafe { Pin::new_unchecked(&mut **cell.body.get()) }
 }
 
 /// # Safety
@@ -382,7 +399,16 @@ unsafe fn dealloc<B: TaskBody, S: Schedule>(ptr: NonNull<Header>) {
     // the unwind (a second panic there would abort).
     // SAFETY: we hold the last reference.
     let scope = unsafe { cell.header.take_scope() };
-    let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(cell))) else {
+    let dropped = panic::catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the last reference is ours, so nothing else reaches the body, and the body
+        // never moves.
+        let mut body = unsafe { Pin::new_unchecked(&mut **cell.body.get()) };
+        body.as_mut().release(cell.scheduler.handle());
+        // SAFETY: dropped once, here: the field is `ManuallyDrop`, so the cell does not.
+        unsafe { ManuallyDrop::drop(&mut *cell.body.get()) };
+    }));
+    drop(cell);
+    let Err(payload) = dropped else {
         drop(scope);
         return;
     };

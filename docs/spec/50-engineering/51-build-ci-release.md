@@ -10,7 +10,7 @@
 ## 2. CI (GitHub Actions)
 | Job | Content |
 |---|---|
-| lint | `cargo fmt --check`, `clippy -D warnings`, `ruff`, `pyright --strict` on python/ and tests/typing |
+| lint | `cargo fmt --check`, `clippy -D warnings`, `ruff`, `pyright --strict` on python/ and tests/typing, `scripts/check_borrowed_refs.py` (§3 of 25), `scripts/check_lock_across_python.py` (P3 of 25) |
 | rust-test | `cargo nextest` (Linux/macOS/Windows), `--exclude porto-py douro-py` + with them via `pyo3` test harness |
 | loom | `RUSTFLAGS="--cfg loom" cargo test -p porto-core --release` (no cargo feature; `52` item 2 lists the models), through `scripts/run_loom.py`, one process per model. Pull requests that touch `crates/porto-core` or `crates/porto-io` run it with `LOOM_MAX_PREEMPTIONS=2`; a nightly workflow runs every model at its full bound with `LOOM_CHECKPOINT_FILE`, resuming searches the run's time budget cut short. A failure uploads the model's log and a rerun with loom's trace (`LOOM_LOG=trace`) |
 | sanitizers | TSAN/ASAN builds of porto-core + Python free-threaded TSAN build of CPython for the porto-py tests (nightly) |

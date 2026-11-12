@@ -18,6 +18,8 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::ffi;
 use pyo3::prelude::*;
 
+use crate::pyref::thread_is_attached;
+
 /// Owns one filled `Py_buffer` and releases it when the object is deallocated (attached).
 #[pyclass(frozen, module = "porto._core", name = "_BufferView")]
 pub(crate) struct ExportedView(NonNull<ffi::Py_buffer>);
@@ -100,12 +102,6 @@ impl View {
             len,
         })
     }
-}
-
-/// Whether this thread has an attached Python thread state (it holds the GIL on a GIL build).
-pub(crate) fn thread_is_attached() -> bool {
-    // SAFETY: a plain query of this thread's state, callable detached.
-    unsafe { ffi::PyGILState_Check() == 1 }
 }
 
 /// A read-only view: what a send writes out.

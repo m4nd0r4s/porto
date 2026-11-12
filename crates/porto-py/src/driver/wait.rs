@@ -177,6 +177,12 @@ impl PyTask {
     /// linked entry holds the task's waker, so the wheel unlinks it before the task can be
     /// freed, and a stale firing finds the task cancelled.
     pub(super) fn release_wait(&mut self) {
+        drop(self.release_wait_keeping_payload());
+    }
+
+    /// [`PyTask::release_wait`], handing the payload back instead of dropping it: what a task
+    /// freed off its lane routes to the lane (`TaskBody::release`).
+    pub(super) fn release_wait_keeping_payload(&mut self) -> Pending {
         match self.pending_kind {
             Kind::Notified | Kind::NotifiedShielded => {
                 // SAFETY: as in `poll_pending`.
@@ -192,10 +198,10 @@ impl PyTask {
                 // SAFETY: `scope` is the live field of a ScopeExit payload.
                 cancel_scope_exit(unsafe { &*self.pending_payload.scope });
             }
-            // Dropping the payload below undoes the rest (a future's drop unregisters it).
+            // Dropping the payload undoes the rest (a future's drop unregisters it).
             _ => {}
         }
-        drop(self.take_pending());
+        self.take_pending()
     }
 
     /// `Pending` for a wait whose target now holds `waker` (the task's), which the lane then

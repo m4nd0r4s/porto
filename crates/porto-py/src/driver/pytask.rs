@@ -35,12 +35,13 @@ use pyo3::exceptions::{PyBaseException, PyException, PyRuntimeError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use super::pending::{Kind, Payload};
+use super::pending::{Kind, Payload, Pending};
 use super::{lane, step};
 use crate::api::run::close_coroutine;
 use crate::api::task::Task;
 use crate::errors::{Cancelled, RuntimeClosed};
 use crate::py_compat::take_exception;
+use crate::pyref::{PyObj, release_to};
 
 /// The scope type of the cancel stack: scopes collect Python exceptions.
 pub(crate) type PyScopeRef = ScopeRef<Py<PyBaseException>>;
@@ -134,12 +135,13 @@ fn shield_in(innermost: Option<&PyScopeNode>, depth: u8) -> bool {
 /// The body of a Python task.
 pub(crate) struct PyTask {
     /// The coroutine; `None` once it finished.
-    pub(super) coro: Option<Py<PyAny>>,
-    /// The `contextvars.Context` every step runs in.
-    pub(super) context: Py<PyAny>,
+    pub(super) coro: Option<PyObj>,
+    /// The `contextvars.Context` every step runs in. `None` only once [`TaskBody::release`]
+    /// moved it to the lane to be released there.
+    context: Option<PyObj>,
     /// The payload of [`Resume`] (while running) or [`TaskOutcome`] (once finished), by
     /// `slot_kind`. Written by the lane only; joiners read it once `join` is closed.
-    slot: Option<Py<PyAny>>,
+    slot: Option<PyObj>,
     /// The payload of [`Pending`](super::pending::Pending), by `pending_kind`. Owned: released
     /// by `wait.rs`.
     pub(super) pending_payload: Payload,
@@ -345,8 +347,8 @@ pub(crate) fn spawn_in_context(
         }
     };
     let mut body = PyTask {
-        coro: Some(coro.unbind()),
-        context,
+        coro: Some(coro.unbind().into()),
+        context: Some(context.into()),
         slot: None,
         pending_payload: Payload::EMPTY,
         cancel_scope: None,
@@ -378,15 +380,32 @@ pub(crate) fn spawn_in_context(
 }
 
 impl PyTask {
+    /// The task's `contextvars.Context`, as a pointer the step enters (it stays alive as long as
+    /// the task does).
+    #[inline]
+    pub(super) fn context_ptr(&self) -> *mut ffi::PyObject {
+        // SAFETY: `context` is `None` only after `TaskBody::release` moved it out, which runs
+        // as the last reference goes, when no step can be running.
+        unsafe { self.context.as_ref().unwrap_unchecked() }.as_ptr()
+    }
+
     /// The resume value for the next step; leaves `Resume::None` in its place.
     pub(super) fn take_resume(&mut self, py: Python<'_>) -> Resume {
         debug_assert!(self.slot_kind.is_resume(), "resumed a finished task");
         let kind = std::mem::replace(&mut self.slot_kind, SlotKind::ResumeNone);
         match (kind, self.slot.take()) {
-            (SlotKind::ResumeValue, Some(value)) => Resume::Value(value),
+            (SlotKind::ResumeValue, Some(value)) => Resume::Value(value.into_inner(py)),
             (SlotKind::ResumeThrow, Some(exception)) => {
                 // SAFETY: only `set_resume` stores `ResumeThrow`, with an exception.
-                Resume::Throw(unsafe { exception.into_bound(py).cast_into_unchecked() }.unbind())
+                Resume::Throw(
+                    unsafe {
+                        exception
+                            .into_inner(py)
+                            .into_bound(py)
+                            .cast_into_unchecked()
+                    }
+                    .unbind(),
+                )
             }
             _ => Resume::None,
         }
@@ -399,7 +418,7 @@ impl PyTask {
             Resume::Throw(exception) => (SlotKind::ResumeThrow, Some(exception.into_any())),
         };
         self.slot_kind = kind;
-        self.slot = payload;
+        self.slot = payload.map(PyObj::new);
     }
 
     /// The embedded timer, for a `Sleep` wait.
@@ -520,7 +539,7 @@ impl PyTask {
             TaskOutcome::Cancelled(exception) => (SlotKind::Cancelled, exception.map(Py::into_any)),
         };
         self.slot_kind = kind;
-        self.slot = payload;
+        self.slot = payload.map(PyObj::new);
         self.join.close();
     }
 }
@@ -569,18 +588,62 @@ impl TaskBody for PyTask {
         // SAFETY: nothing is moved out; the timer and the wait node stay in place.
         let this = unsafe { self.get_unchecked_mut() };
         // Unregisters the wait (T3) with what works off the lane (see `release_wait`).
-        // Dropping the coroutine closes it; off a Python thread (a wake after shutdown), pyo3
-        // defers that to the next attached one.
+        // Dropping the coroutine closes it. This is the lane (a cancelled poll, a queue entry
+        // dropped by the runtime) or a wake after the runtime ended, with no lane left to
+        // route to: off a Python thread pyo3 defers the release to the next attached one.
         this.release_wait();
-        drop(this.coro.take());
+        drop(this.coro.take().map(PyObj::into_unchecked));
         if let Some(task) = this.py_handle.take() {
             // Its scope's exit, or whoever holds the `porto.Task`, learns how it ended.
             task.get().finish(TaskOutcome::Cancelled(None));
         }
         this.slot_kind = SlotKind::Cancelled;
-        this.slot = None;
+        drop(this.slot.take().map(PyObj::into_unchecked));
         this.join.close();
     }
+
+    /// The task is freed with its last reference, on whichever thread dropped it: a waker can
+    /// be dropped anywhere. Off the lane, what the task owns that is Python's moves to the
+    /// lane's deferred queue (P1, ST-21): the coroutine would otherwise be closed by whichever
+    /// thread attaches next, not by the lane. On the lane, nothing changes: the fields drop
+    /// right here, attached.
+    fn release(self: Pin<&mut Self>, home: Option<&Handle>) {
+        let Some(home) = home else { return };
+        if home.is_current_lane() {
+            return;
+        }
+        // SAFETY: nothing is moved out of the pinned body that something points at: the wait is
+        // unlinked first, and the rest are owned references.
+        let this = unsafe { self.get_unchecked_mut() };
+        // Unlinks the wait from wherever it is registered (any thread may), and keeps what the
+        // payload owns for the lane.
+        let pending = this.release_wait_keeping_payload();
+        // Its handle must forget the pointer to this body, which is about to go, now.
+        let handle = this.py_handle.take();
+        if let Some(task) = &handle {
+            task.get().finish(TaskOutcome::Cancelled(None));
+        }
+        release_to(
+            home,
+            LaneOwned {
+                coro: this.coro.take().map(PyObj::into_unchecked),
+                context: this.context.take().map(PyObj::into_unchecked),
+                slot: this.slot.take().map(PyObj::into_unchecked),
+                handle,
+                pending,
+            },
+        );
+    }
+}
+
+/// What a task freed off its lane owns that is Python's: dropped on the lane, never read.
+#[allow(dead_code, reason = "held only to be dropped on the lane")]
+struct LaneOwned {
+    coro: Option<Py<PyAny>>,
+    context: Option<Py<PyAny>>,
+    slot: Option<Py<PyAny>>,
+    handle: Option<Py<Task>>,
+    pending: Pending,
 }
 
 impl Drop for PyTask {

@@ -533,10 +533,10 @@ pub(super) fn poll(
         // porto-core never polls a completed body; nothing to do if it did.
         return Poll::Ready(());
     };
-    let coro = coro.into_bound(py);
+    let coro = coro.into_inner(py).into_bound(py);
     // SAFETY: `task` owns the context and keeps it until it is freed (`complete` releases only
     // the coroutine), so it outlives the guard.
-    let _context = match unsafe { EnteredContext::enter(py, task.context.as_ptr()) } {
+    let _context = match unsafe { EnteredContext::enter(py, task.context_ptr()) } {
         Ok(entered) => entered,
         Err(exception) => {
             // The coroutine never runs again: close it, or a coroutine that never started
@@ -544,7 +544,7 @@ pub(super) fn poll(
             if let Err(error) = coro.call_method0(intern!(py, "close")) {
                 error.write_unraisable(py, Some(&coro));
             }
-            task.coro = Some(coro.unbind());
+            task.coro = Some(coro.unbind().into());
             task.complete(py, header, TaskOutcome::Err(exception));
             return Poll::Ready(());
         }
@@ -575,7 +575,7 @@ pub(super) fn poll(
         let _running = RunningTask::set(&running);
         step_until_wait(task, &coro, &running, cx)
     };
-    task.coro = Some(coro.unbind());
+    task.coro = Some(coro.unbind().into());
     if let Some(handle) = running.made_handle.take() {
         task.py_handle = Some(handle);
     }

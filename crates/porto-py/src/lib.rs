@@ -11,6 +11,9 @@ pub mod driver;
 pub mod errors;
 mod io;
 mod py_compat;
+mod pyref;
+#[cfg(test)]
+mod pyref_tests;
 mod raw_methods;
 pub mod testing;
 mod throw_args;
