@@ -515,3 +515,21 @@ mod waiters {
         root.unregister_waiter(1);
     }
 }
+
+#[test]
+fn a_task_cancel_is_a_reason_of_its_own() {
+    let parent = ScopeNode::<()>::new_root(1);
+    let implicit = ScopeNode::new_child(&parent, 2, false);
+    let nested = ScopeNode::new_child(&implicit, 2, false);
+    assert!(implicit.cancel(CancelReason::TaskCancelled));
+    assert_eq!(implicit.cancel_called(), Some(CancelReason::TaskCancelled));
+    assert!(
+        nested.is_cancelled(),
+        "what the task entered is inside the cancel"
+    );
+    assert!(!parent.is_cancelled(), "its siblings' scope is not");
+    assert_eq!(
+        nested.effective_cancellation().map(|found| found.reason),
+        Some(CancelReason::TaskCancelled)
+    );
+}

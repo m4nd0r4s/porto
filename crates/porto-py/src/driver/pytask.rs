@@ -78,6 +78,28 @@ impl CancelStack {
         Ok(())
     }
 
+    /// Whether the task entered no scope: its innermost one is its base.
+    pub(crate) fn is_at_base(&self) -> bool {
+        self.depth == 0
+    }
+
+    /// Makes `base` the base scope of a task that entered no scope (`is_at_base`): its implicit
+    /// scope, a child of the scope it was spawned into (spec 15 §4), which the scopes it enters
+    /// from now on are nested in.
+    pub(crate) fn install_base(&mut self, base: PyScopeRef) {
+        debug_assert!(
+            self.depth == 0,
+            "a base is installed below no entered scope"
+        );
+        self.innermost = Some(base);
+    }
+
+    /// Whether one of the scopes the task entered (not its base) is shielded: a shield stops
+    /// the cancellation of its task's implicit scope too (spec 15 §4, C8).
+    pub(crate) fn has_shield(&self) -> bool {
+        shield_in(self.innermost.as_deref(), self.depth)
+    }
+
     /// Records that the task exited `scope`: its parent is the innermost one again (the base
     /// scope once it exited every scope it entered). Returns `false`, changing nothing, if
     /// `scope` is not its innermost entered one (scopes exit in the reverse order they were
@@ -92,6 +114,21 @@ impl CancelStack {
         self.innermost = innermost.parent().cloned();
         true
     }
+}
+
+/// Whether one of the `depth` scopes from `innermost` outward is shielded.
+fn shield_in(innermost: Option<&PyScopeNode>, depth: u8) -> bool {
+    let mut node = innermost;
+    for _ in 0..depth {
+        let Some(scope) = node else {
+            return false;
+        };
+        if scope.is_shielded() {
+            return true;
+        }
+        node = scope.parent().map(|parent| &**parent);
+    }
+    false
 }
 
 /// The body of a Python task.
@@ -379,6 +416,11 @@ impl PyTask {
         unsafe { Pin::new_unchecked(&self.wait_node) }
     }
 
+    /// Whether one of the scopes the task entered is shielded, see [`CancelStack::has_shield`].
+    pub(super) fn has_shield(&self) -> bool {
+        shield_in(self.cancel_scope.as_deref(), self.cancel_depth)
+    }
+
     /// The innermost scope the task is in, if any: where its effective cancellation is walked
     /// from (spec 15 §1.2).
     pub(super) fn innermost_scope(&self) -> Option<&PyScopeNode> {
@@ -620,6 +662,32 @@ mod tests {
         assert!(stack.exit(&outer));
         assert_eq!(stack.innermost().unwrap().id(), base.id());
         assert_eq!(stack.depth, 0);
+    }
+
+    #[test]
+    fn an_implicit_scope_becomes_the_base_and_only_entered_scopes_count_for_shields() {
+        let spawned_into = PyScopeNode::new_root(1);
+        let mut stack = CancelStack {
+            innermost: Some(spawned_into.clone()),
+            depth: 0,
+        };
+        assert!(stack.is_at_base());
+        // A shielded scope the task was spawned into is not one it entered.
+        spawned_into.set_shield(true);
+        assert!(!stack.has_shield());
+        let implicit = PyScopeNode::new_child(&spawned_into, 2, false);
+        stack.install_base(implicit.clone());
+        assert!(
+            stack.is_at_base(),
+            "the implicit scope is the base: nothing entered"
+        );
+        let entered = PyScopeNode::new_child(&implicit, 2, true);
+        stack.enter(entered.clone()).unwrap();
+        assert!(!stack.is_at_base());
+        assert!(stack.has_shield(), "a shield the task entered");
+        assert!(stack.exit(&entered));
+        assert!(!stack.has_shield());
+        assert_eq!(stack.innermost().unwrap().id(), implicit.id());
     }
 
     #[test]

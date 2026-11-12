@@ -82,6 +82,8 @@ struct Running {
     /// The task's `porto.Task`, borrowed from the body's `py_handle` (which holds it for the
     /// whole poll): null if it has none. See [`current_task`].
     handle: Cell<*mut ffi::PyObject>,
+    /// The task's `Task` struct behind `handle`, null with it: what `Task.cancel()` sets.
+    task_state: Cell<*const Task>,
     /// The handle [`current_task`] made for a task that had none: the poll hands it to the
     /// body when it ends.
     made_handle: Cell<Option<Py<Task>>>,
@@ -147,6 +149,7 @@ pub(crate) fn current_task(py: Python<'_>) -> PyResult<Option<Py<Task>>> {
     let handle = Py::new(py, Task::new(None, header.flags().contains(TaskFlags::PIN)))?;
     handle.get().bind_header(header);
     running.handle.set(handle.as_ptr());
+    running.task_state.set(ptr::from_ref(handle.get()));
     running.made_handle.set(Some(handle.clone_ref(py)));
     Ok(Some(handle))
 }
@@ -279,13 +282,31 @@ pub(crate) fn spend_budget() -> bool {
     })
 }
 
-/// The `Cancelled` to raise in the running task, if its effective scope is cancelled.
+/// Whether `Task.cancel()` was called on the task `running` polls. While the task has no
+/// implicit scope (it entered no scope), this flag is its cancellation (spec 15 §4).
+#[inline]
+fn task_cancel_requested(running: &Running) -> bool {
+    let task = running.task_state.get();
+    // SAFETY: non-null only while the body (or `made_handle`) holds the `Task` it points into,
+    // which is the whole poll (see `Running::task_state`).
+    !task.is_null() && unsafe { &*task }.cancel_requested()
+}
+
+/// The `Cancelled` to raise in the running task, if it is effectively cancelled: its innermost
+/// scope is, or `Task.cancel()` was called and no shield the task entered stands in between.
 fn running_cancellation(py: Python<'_>, running: &Running) -> Option<Py<PyBaseException>> {
-    let cancelled = running.with_stack(|stack| {
-        let scope = stack.innermost()?;
-        scope.is_cancelled().then(|| scope.clone())
+    let found = running.with_stack(|stack| {
+        if let Some(scope) = stack.innermost()
+            && scope.is_cancelled()
+        {
+            return Some(Some(scope.clone()));
+        }
+        (task_cancel_requested(running) && !stack.has_shield()).then_some(None)
     })?;
-    Some(cancelled_exception(py, &cancelled))
+    Some(match found {
+        Some(scope) => cancelled_exception(py, &scope),
+        None => task_cancelled_exception(py),
+    })
 }
 
 /// Enters a new cancel scope in the task running on this thread: `make(parent, owner)` builds
@@ -299,6 +320,16 @@ pub(crate) fn enter_cancel_scope(
         return Ok(None);
     };
     running.with_stack(|stack| {
+        // The first scope a task with a handle enters: its implicit scope goes below it, so
+        // `Task.cancel()` reaches everything the task runs in scopes (spec 15 §4).
+        let task = running.task_state.get();
+        if stack.is_at_base()
+            && !task.is_null()
+            // SAFETY: as in `task_cancel_requested`.
+            && let Some(implicit) = unsafe { &*task }.install_implicit(stack.innermost(), running.task_id)
+        {
+            stack.install_base(implicit);
+        }
         let scope = make(stack.innermost(), running.task_id);
         stack.enter(scope.clone())?;
         Ok(Some(scope))
@@ -322,8 +353,21 @@ fn cancelled_exception(py: Python<'_>, scope: &PyScopeNode) -> Py<PyBaseExceptio
             "a task of its scope, or of one it is nested in, failed, which cancels the scope (C4)"
         }
         Some(CancelReason::Shutdown) => "the runtime is shutting down",
+        Some(CancelReason::TaskCancelled) => TASK_CANCELLED,
         _ => "Scope.cancel() was called on its scope or on one it is nested in",
     };
+    cancelled_with(py, why)
+}
+
+const TASK_CANCELLED: &str = "Task.cancel() was called on it";
+
+/// The `Cancelled` delivered to a task that `Task.cancel()` reached while it has no implicit
+/// scope to carry it.
+fn task_cancelled_exception(py: Python<'_>) -> Py<PyBaseException> {
+    cancelled_with(py, TASK_CANCELLED)
+}
+
+fn cancelled_with(py: Python<'_>, why: &str) -> Py<PyBaseException> {
     Cancelled::new_err(format!(
         "porto: the task was cancelled: {why}; let the Cancelled propagate (the cancelled scope \
          absorbs it at its `async with` exit): a task that catches it gets it again at its next \
@@ -369,6 +413,11 @@ pub(super) fn poll(
                 .as_ref()
                 .map_or(ptr::null_mut(), |handle| handle.as_ptr()),
         ),
+        task_state: Cell::new(
+            task.py_handle
+                .as_ref()
+                .map_or(ptr::null(), |handle| ptr::from_ref(handle.get())),
+        ),
         made_handle: Cell::new(None),
         // The lane's budget for this poll (`coop_budget`), kept here so a step does not touch a
         // thread local. Rust futures the task awaits draw on the lane's own count.
@@ -390,7 +439,7 @@ pub(super) fn poll(
     release_spare_value(py);
     match outcome {
         Some(outcome) => {
-            let outcome = cancelled_by_its_scope(py, task, outcome);
+            let outcome = cancelled_by_its_scope(py, task, &running, outcome);
             task.complete(py, header, outcome);
             Poll::Ready(())
         }
@@ -402,8 +451,22 @@ pub(super) fn poll(
 /// cancelling: the cancellation ended the task, which did not fail (spec 11 §4). The scope
 /// whose cancel that was learns it absorbed one (C3, `cancelled_caught`): the one the walk
 /// reaches first, so an enclosing scope's cancel counts for the enclosing scope, as in Trio.
-fn cancelled_by_its_scope(py: Python<'_>, task: &PyTask, outcome: TaskOutcome) -> TaskOutcome {
+fn cancelled_by_its_scope(
+    py: Python<'_>,
+    task: &PyTask,
+    running: &Running,
+    outcome: TaskOutcome,
+) -> TaskOutcome {
     match outcome {
+        // `Task.cancel()` with no implicit scope: the task's own scope is the first the walk
+        // reaches, so no scope absorbed anything.
+        TaskOutcome::Err(exception)
+            if exception.bind(py).is_instance_of::<Cancelled>()
+                && task_cancel_requested(running)
+                && !task.has_shield() =>
+        {
+            TaskOutcome::Cancelled(Some(exception))
+        }
         TaskOutcome::Err(exception) if exception.bind(py).is_instance_of::<Cancelled>() => {
             let cause = task
                 .innermost_scope()
@@ -446,7 +509,7 @@ fn step_until_wait(
                 Poll::Pending => {
                     let exception = match lane::take_interrupt(cx.waker()) {
                         Some(exception) => exception,
-                        None => cancelled_wait(py, task, cx.waker())?,
+                        None => cancelled_wait(py, task, running, cx.waker())?,
                     };
                     task.abandon_wait();
                     task.set_resume(Resume::Throw(exception));
@@ -475,7 +538,7 @@ fn step_until_wait(
         match dispatch(task, &yielded) {
             // The hot path of a switch: no payload to pack.
             Next::Wait(Pending::Yield) => {
-                if let Some(cancelled) = cancellation(py, task) {
+                if let Some(cancelled) = cancellation(py, task, running) {
                     task.set_resume(Resume::Throw(cancelled));
                     continue;
                 }
@@ -485,7 +548,7 @@ fn step_until_wait(
             Next::Wait(pending) => {
                 let kind = pending.kind();
                 if kind.is_cancellable()
-                    && let Some(cancelled) = cancellation(py, task)
+                    && let Some(cancelled) = cancellation(py, task, running)
                 {
                     // Not waited on: nothing is linked yet, the payload is just dropped.
                     drop(pending);
@@ -509,7 +572,7 @@ fn step_until_wait(
                             return None;
                         }
                         // Still waiting, unless the task is cancelled (`None`: it waits).
-                        let cancelled = cancelled_wait(py, task, cx.waker())?;
+                        let cancelled = cancelled_wait(py, task, running, cx.waker())?;
                         task.abandon_wait();
                         task.set_resume(Resume::Throw(cancelled));
                     }
@@ -525,23 +588,28 @@ fn step_until_wait(
 
 /// The `Cancelled` to throw into `task` if it is effectively cancelled.
 #[inline]
-fn cancellation(py: Python<'_>, task: &PyTask) -> Option<Py<PyBaseException>> {
+fn cancellation(py: Python<'_>, task: &PyTask, running: &Running) -> Option<Py<PyBaseException>> {
     let scope = task.innermost_scope();
-    if !is_cancelled(scope) {
-        return None;
+    if is_cancelled(scope) {
+        return scope.map(|scope| cancelled_exception(py, scope));
     }
-    scope.map(|scope| cancelled_exception(py, scope))
+    (task_cancel_requested(running) && !task.has_shield()).then(|| task_cancelled_exception(py))
 }
 
 /// For a wait that is not over: the `Cancelled` to throw in if the wait is cancellable and the
 /// task is effectively cancelled, else `None`, with the wait filed with the task's scope so a
 /// cancel wakes it (`PyTask::watch_cancel`, whose own check closes the race with a cancel from
 /// another thread).
-fn cancelled_wait(py: Python<'_>, task: &mut PyTask, waker: &Waker) -> Option<Py<PyBaseException>> {
+fn cancelled_wait(
+    py: Python<'_>,
+    task: &mut PyTask,
+    running: &Running,
+    waker: &Waker,
+) -> Option<Py<PyBaseException>> {
     if !task.pending_kind.is_cancellable() {
         return None;
     }
-    if let Some(cancelled) = cancellation(py, task) {
+    if let Some(cancelled) = cancellation(py, task, running) {
         return Some(cancelled);
     }
     if !task.watch_cancel(waker) {

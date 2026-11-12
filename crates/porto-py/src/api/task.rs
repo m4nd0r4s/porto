@@ -14,9 +14,10 @@
 //! none. [`handles_created`] counts them, for the test that proves it.
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
+use porto_core::scope::CancelReason;
 use porto_core::task::{Header, TaskBodyRef};
 use pyo3::exceptions::PyBaseException;
 use pyo3::prelude::*;
@@ -24,7 +25,7 @@ use pyo3::types::{PyString, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
 use super::time::require_lane;
-use crate::driver::pytask::{PyTask, TaskOutcome, shut_down_error};
+use crate::driver::pytask::{PyScopeNode, PyScopeRef, PyTask, TaskOutcome, shut_down_error};
 use crate::driver::step;
 use crate::driver::trap::{Trap, TrapKind};
 use crate::errors::{InvalidStateError, NoRuntimeError};
@@ -81,6 +82,10 @@ struct Inner {
     /// `None` until the task finishes. A parking_lot lock guards it: std's allocates a pthread
     /// mutex per task on macOS (porto-itr.7).
     outcome: Option<TaskOutcome>,
+    /// The task's implicit scope (spec 15 §4), made when the task first enters a scope: the
+    /// base scope of everything it enters, which `Task.cancel()` cancels. Dropped once the
+    /// task ended.
+    implicit: Option<PyScopeRef>,
 }
 
 /// A task: the child of a scope, or the one running now. Its outcome is readable once it
@@ -94,6 +99,10 @@ pub struct Task {
     label: Option<Py<PyAny>>,
     /// Spawned with `pin=True`, or by a pinned task (the header's `PIN` flag).
     pinned: bool,
+    /// `Task.cancel()` was called. The task reads it at every checkpoint while it has no
+    /// implicit scope yet (a task that entered no scope): then it is the task's own cancel
+    /// scope, and one the task makes once it first enters a scope is cancelled at once.
+    cancel_requested: AtomicBool,
 }
 
 impl Task {
@@ -106,10 +115,47 @@ impl Task {
                 id: 0,
                 body: None,
                 outcome: None,
+                implicit: None,
             }),
             label,
             pinned,
+            cancel_requested: AtomicBool::new(false),
         }
+    }
+
+    /// Whether `Task.cancel()` was called.
+    #[inline]
+    pub(crate) fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::Relaxed)
+    }
+
+    /// Makes the task's implicit scope when the task, which runs on this thread and has not
+    /// entered a scope, is about to enter its first: a child of `base`, the scope it was
+    /// spawned into (a root for a task spawned into none), which the caller installs as the
+    /// task's base so that the scopes it enters are nested in it. `None` if the task has one
+    /// already (or ended). Cancelled at once if `Task.cancel()` was called before.
+    pub(crate) fn install_implicit(
+        &self,
+        base: Option<&PyScopeRef>,
+        owner: u64,
+    ) -> Option<PyScopeRef> {
+        let mut inner = self.lock();
+        if inner.implicit.is_some() || inner.outcome.is_some() {
+            return None;
+        }
+        let scope = match base {
+            Some(base) => PyScopeNode::new_child(base, owner, false),
+            None => PyScopeNode::new_root(owner),
+        };
+        inner.implicit = Some(scope.clone());
+        // Read under the lock `cancel` stores under: it either sees the scope and cancels it,
+        // or stored first and is seen here.
+        let requested = self.cancel_requested.load(Ordering::SeqCst);
+        drop(inner);
+        if requested {
+            scope.cancel(CancelReason::TaskCancelled);
+        }
+        Some(scope)
     }
 
     /// Points the handle at its task, which was just spawned.
@@ -154,9 +200,11 @@ impl Task {
     pub(crate) fn finish(&self, outcome: TaskOutcome) {
         let mut inner = self.lock();
         inner.body = None;
+        let implicit = inner.implicit.take();
         let previous = inner.outcome.replace(outcome);
         drop(inner);
         drop(previous);
+        drop(implicit);
     }
 
     /// A counted reference to the task, if it still runs.
@@ -230,6 +278,34 @@ impl Task {
             Some(TaskOutcome::Ok(_)) => Ok(None),
             Some(cancelled) => cancelled.into_result(py).map(|_| None),
             None => Err(not_finished("exception")),
+        }
+    }
+
+    /// Cancels the task, and only it: it is cancelled as if it ran inside a scope of its own
+    /// that `Scope.cancel()` was called on (spec 15 §4). The task gets `porto.Cancelled` at its
+    /// next checkpoint (a waiting task is woken), again at every one while it goes on, and so
+    /// do the tasks spawned into scopes it entered. The siblings and the scope it was spawned
+    /// into are not cancelled, and the `Cancelled` that ends the task is not a failure: the
+    /// scope's exit raises nothing for it. A shield the task entered holds the cancellation
+    /// off until it is left. Cancelling a task that finished does nothing; cancelling again
+    /// does nothing more. Safe from any thread.
+    fn cancel(&self) {
+        let (implicit, task) = {
+            let inner = self.lock();
+            if inner.outcome.is_some() {
+                return;
+            }
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            (inner.implicit.clone(), Self::upgrade(&inner))
+        };
+        // The scope's cancel wakes the tasks waiting in it, this one included...
+        if let Some(scope) = implicit {
+            scope.cancel(CancelReason::TaskCancelled);
+        }
+        // ... and a task with no scope yet (or running, or queued) is woken here, which
+        // makes it look at its flag at its next checkpoint.
+        if let Some(task) = task {
+            task.task_ref().clone().into_waker().wake();
         }
     }
 

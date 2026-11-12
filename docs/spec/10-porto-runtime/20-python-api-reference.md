@@ -83,7 +83,7 @@ class Task[T]:     # awaitable
     def done(self) -> bool; def cancelled(self) -> bool
     def result(self) -> T                    # raises InvalidStateError if not done; re-raises failure
     def exception(self) -> BaseException | None   # InvalidStateError if not done; raises Cancelled like result() if cancelled
-    def cancel(self) -> None
+    def cancel(self) -> None                 # 15 §4: cancels this task only; no-op once done
     def __await__(self) -> Generator[Any, None, T]
     @property lane(self) -> int | None; @property pinned(self) -> bool   # lane: the lane it last ran on, None once finished
 def current_task() -> Task[Any]          # NoRuntimeError outside a task; the object spawn returned

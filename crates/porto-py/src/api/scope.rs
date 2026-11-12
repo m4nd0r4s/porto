@@ -480,6 +480,7 @@ impl Scope {
             (Some(CancelReason::Parent), _) => ", cancelled: parent".to_owned(),
             (Some(CancelReason::ChildFailed), _) => ", cancelled: a child failed".to_owned(),
             (Some(CancelReason::Shutdown), _) => ", cancelled: shutdown".to_owned(),
+            (Some(CancelReason::TaskCancelled), _) => ", cancelled: its task".to_owned(),
         };
         let state = node.lock_state();
         let exit = if state.exit_waiter.is_some() {

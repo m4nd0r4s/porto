@@ -275,8 +275,8 @@ class Task(Generic[_T_co]):
         """Whether the task finished: it returned, raised, or was cancelled."""
 
     def cancelled(self) -> bool:
-        """Whether the task ended cancelled: a cancellation reached it (``Scope.cancel()``, a
-        deadline, a failing sibling), or its runtime shut down first."""
+        """Whether the task ended cancelled: a cancellation reached it (``Task.cancel()``,
+        ``Scope.cancel()``, a deadline, a failing sibling), or its runtime shut down first."""
 
     def result(self) -> _T_co:
         """What the task returned, or raises what it raised (``porto.Cancelled`` if it was
@@ -286,6 +286,16 @@ class Task(Generic[_T_co]):
     def exception(self) -> BaseException | None:
         """What the task raised, or ``None`` if it returned. Raises like ``result()`` for a
         task that was cancelled; ``porto.InvalidStateError`` if it has not finished yet."""
+
+    def cancel(self) -> None:
+        """Cancels this task and only it, as if it ran inside a scope of its own that
+        ``Scope.cancel()`` was called on (15 §4): it gets ``porto.Cancelled`` at its next
+        checkpoint (a waiting task is woken) and at every one after, and so do the tasks
+        spawned into scopes it entered. Its siblings and the scope it was spawned into are not
+        cancelled, and the ``Cancelled`` that ends it is not a failure: nothing is raised for
+        it by the scope's exit, and ``cancelled()`` turns true. A shield the task entered holds
+        the cancel off until it is left. Does nothing for a task that finished. Safe from any
+        thread."""
 
     def __await__(self) -> Generator[Any, Any, _T_co]:
         """Waits for the task, then evaluates to its result or raises its exception. A task that

@@ -30,6 +30,8 @@ pub enum CancelReason {
     ChildFailed = 4,
     /// The runtime is shutting down.
     Shutdown = 5,
+    /// `Task.cancel()` was called: the implicit scope of one task (15 §4) was cancelled.
+    TaskCancelled = 6,
 }
 
 impl CancelReason {
@@ -40,6 +42,7 @@ impl CancelReason {
             2 => Some(Self::Deadline),
             3 => Some(Self::Parent),
             4 => Some(Self::ChildFailed),
+            6 => Some(Self::TaskCancelled),
             _ => Some(Self::Shutdown),
         }
     }

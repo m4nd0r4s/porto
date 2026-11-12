@@ -256,6 +256,7 @@ async def task_handles() -> int:
         assert_type(task.lane, int | None)
         assert_type(task.done(), bool)
         assert_type(task.cancelled(), bool)
+        assert_type(task.cancel(), None)
         assert_type(task.exception(), BaseException | None)
         assert_type(await task, bytes)
     assert_type(kept[0].result(), bytes)
