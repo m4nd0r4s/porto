@@ -29,6 +29,9 @@ pub(crate) enum Armed {
     Linked(Option<Waker>),
     /// No waker was given and the entry was not linked: nothing changed.
     Unlinked,
+    /// The wheel was shut down ([`Timers::drop_all`], the runtime is being dropped): nothing was
+    /// linked. Holds the waker that was given, for the caller to drop outside any lock.
+    Closed(Option<Waker>),
 }
 
 pub(crate) struct Timers {
@@ -43,6 +46,10 @@ pub(crate) struct Timers {
 
 struct Shard {
     wheel: Wheel,
+    /// Set by [`Timers::drop_all`]: the runtime is going away, so nothing is linked any more
+    /// (an entry linked now would never be fired or released, and its waker would keep
+    /// whatever it owns alive).
+    closed: bool,
     /// Nanoseconds per tick.
     resolution: u64,
 }
@@ -58,6 +65,7 @@ impl Timers {
         Self {
             shard: Mutex::new(Shard {
                 wheel: Wheel::new(),
+                closed: false,
                 // The builder keeps it within 100 µs..=10 ms.
                 resolution: u64::try_from(resolution.as_nanos()).unwrap_or(1_000_000),
             }),
@@ -88,6 +96,9 @@ impl Timers {
         waker: Option<Waker>,
     ) -> Armed {
         let mut shard = self.lock();
+        if shard.closed {
+            return Armed::Closed(waker);
+        }
         let tick = shard.deadline_tick(deadline);
         // SAFETY: the entry is live, and linked here or nowhere: holding the lock gives
         // exclusive access to its state either way (its owner only touches it through us).
@@ -192,6 +203,7 @@ impl Timers {
         let mut any = false;
         {
             let mut shard = self.lock();
+            shard.closed = true;
             while let Some(entry) = shard.wheel.pop_any() {
                 any = true;
                 // SAFETY: as in `fire_expired`.

@@ -356,8 +356,9 @@ mod deadline {
     }
 
     /// The lane fires the due timer while the owner closes the scope: either the scope was
-    /// cancelled by its deadline before it closed, or the fire found it closed; the timer is
-    /// unlinked and the wheel holds no reference to the scope either way.
+    /// cancelled by its deadline before it closed, or the fire found it closed. A closed scope
+    /// is never cancelled afterwards (the check and the cancel are one step under its lock), and
+    /// the wheel holds no reference to it either way.
     #[test]
     fn deadline_fire_vs_close() {
         loom::model(|| {
@@ -369,14 +370,61 @@ mod deadline {
                 thread::spawn(move || handle.shared.timers.fire_expired(|| handle.now()))
             };
             drop(scope.close());
+            let at_close = scope.cancel_called();
             let fired = lane.join().unwrap();
             assert!(fired <= 1);
+            assert_eq!(scope.cancel_called(), at_close, "cancelled after it closed");
+            assert!(matches!(at_close, None | Some(CancelReason::Deadline)));
             assert_eq!(handle.armed_timers(), 0);
             assert_eq!(Arc::strong_count(&scope), 1, "the wheel kept a reference");
-            assert!(matches!(
+        });
+    }
+
+    /// The lane fires the due timer while another thread removes the deadline: once
+    /// `set_deadline(NEVER)` returned, the scope is never cancelled by it any more.
+    #[test]
+    fn deadline_fire_vs_removed_deadline() {
+        loom::model(|| {
+            let handle = handle();
+            let scope = Scope::new_root(0);
+            arm_due(&scope, &handle);
+            let lane = {
+                let handle = handle.clone();
+                thread::spawn(move || handle.shared.timers.fire_expired(|| handle.now()))
+            };
+            Scope::set_deadline(&scope, &handle, Deadline::NEVER);
+            let after_removal = scope.cancel_called();
+            lane.join().unwrap();
+            assert_eq!(
                 scope.cancel_called(),
-                None | Some(CancelReason::Deadline)
-            ));
+                after_removal,
+                "cancelled after removal"
+            );
+            assert_eq!(handle.armed_timers(), 0);
+            drop(scope.close());
+            assert_eq!(Arc::strong_count(&scope), 1);
+        });
+    }
+
+    /// The lane fires the due timer while another thread sets an earlier deadline that is due
+    /// too (the scope is cancelled by whichever comes first, exactly once, and nothing stays
+    /// linked).
+    #[test]
+    fn deadline_fire_vs_earlier_rearm() {
+        loom::model(|| {
+            let handle = handle();
+            let scope = Scope::new_root(0);
+            arm_due(&scope, &handle);
+            let lane = {
+                let handle = handle.clone();
+                thread::spawn(move || handle.shared.timers.fire_expired(|| handle.now()))
+            };
+            Scope::set_deadline(&scope, &handle, at(5));
+            lane.join().unwrap();
+            assert_eq!(scope.cancel_called(), Some(CancelReason::Deadline));
+            assert_eq!(handle.armed_timers(), 0);
+            drop(scope.close());
+            assert_eq!(Arc::strong_count(&scope), 1);
         });
     }
 

@@ -22,4 +22,4 @@ pub mod sync;
 pub mod task;
 pub mod time;
 
-pub use sched::{Builder, Handle, ParkHook, Runtime, spawn};
+pub use sched::{Builder, Handle, ParkHook, Runtime, WeakHandle, spawn};

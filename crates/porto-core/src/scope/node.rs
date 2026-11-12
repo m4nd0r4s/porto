@@ -11,7 +11,7 @@ use std::task::Waker;
 
 use super::child::{ChildVTableRef, child_vtable};
 use super::sync::{Arc, AtomicU8, AtomicU64, CANCEL_GENERATION, Mutex, MutexGuard, UnsafeCell};
-use crate::sched::Handle;
+use crate::sched::WeakHandle;
 use crate::time::Deadline;
 use crate::time::wheel::TimerEntry;
 
@@ -118,8 +118,10 @@ pub struct ScopeState<E> {
     /// When the scope cancels itself with [`CancelReason::Deadline`] (C9);
     /// [`Deadline::NEVER`] for none. See [`ScopeNode::set_deadline`].
     pub(super) deadline: Deadline,
-    /// The runtime whose wheel links `deadline_timer`, `None` while it is linked nowhere.
-    pub(super) deadline_on: Option<Handle>,
+    /// The runtime whose wheel links `deadline_timer`, `None` while it is linked nowhere. Weak:
+    /// the linked entry's waker holds this node, so a strong handle would make a cycle through
+    /// the runtime's wheel, and would keep the runtime's state alive after the run.
+    pub(super) deadline_on: Option<WeakHandle>,
     /// Nested scopes, for propagating a cancel down the tree.
     child_scopes: ChildList<E>,
     /// The tasks whose innermost scope this is and that wait in a cancellable wait, by task
@@ -324,10 +326,21 @@ impl<E> ScopeNode<E> {
     /// cancelled at its next check, and the waiters registered in the subtree the cancel
     /// reaches ([`ScopeNode::register_waiter`]) are woken, after every lock is released.
     pub fn cancel(&self, reason: CancelReason) -> bool {
+        self.cancel_if(reason, |_| true)
+    }
+
+    /// [`ScopeNode::cancel`], if `allowed` says so about the state, checked under the same lock
+    /// that the cancel takes: what a closing scope or a moved deadline cannot slip between.
+    /// Returns whether it cancelled.
+    pub(super) fn cancel_if(
+        &self,
+        reason: CancelReason,
+        allowed: impl FnOnce(&ScopeState<E>) -> bool,
+    ) -> bool {
         let mut wake = Vec::new();
         let state = self.lock_state();
         let status = self.status.load(Ordering::Relaxed);
-        if status & REASON_MASK != 0 {
+        if status & REASON_MASK != 0 || !allowed(&state) {
             return false;
         }
         self.status.store(status | reason as u8, Ordering::Release);

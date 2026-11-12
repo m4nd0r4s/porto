@@ -31,7 +31,7 @@ use crate::task::JoinHandle;
 pub(crate) use context::{current_handle, current_time, with_current_handle};
 pub use park::ParkHook;
 pub use runtime::{Builder, Runtime};
-pub use shared::{DeferredWork, Handle};
+pub use shared::{DeferredWork, Handle, WeakHandle};
 pub(crate) use timers::Armed;
 
 /// Spawns `future` onto the runtime running on this thread. Await the [`JoinHandle`] for the

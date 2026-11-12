@@ -25,7 +25,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 
 use super::node::{CancelReason, ScopeNode, ScopeState};
 use super::sync::Arc;
-use crate::sched::{Armed, Handle, with_current_handle};
+use crate::sched::{Armed, Handle, WeakHandle, with_current_handle};
 use crate::time::Deadline;
 
 impl<E> ScopeNode<E> {
@@ -38,6 +38,8 @@ impl<E> ScopeNode<E> {
     /// node), for the caller to drop after the lock.
     pub(super) fn disarm_deadline(&self, state: &mut ScopeState<E>) -> Option<Waker> {
         let handle = state.deadline_on.take()?;
+        // A runtime that is gone unlinked every entry when it shut its wheel down.
+        let handle = handle.upgrade()?;
         let entry = NonNull::from(&self.deadline_timer);
         // SAFETY: the entry is live (it is in `self`), and `deadline_on` names the only
         // runtime whose wheel can link it; arms and disarms are serialized by the scope's lock,
@@ -69,13 +71,17 @@ impl<E: Send + 'static> ScopeNode<E> {
             // A reference to this node, which `this` keeps alive: never the last one.
             drop(timer);
             if due {
-                this.cancel(CancelReason::Deadline);
+                // Re-checked under the cancel's own lock: a close, or another deadline set in
+                // the gap since the lock above, wins over this one.
+                this.cancel_if(CancelReason::Deadline, |state| {
+                    !state.closed && state.deadline == deadline
+                });
             }
             return;
         }
         let stale = match &state.deadline_on {
             // Linked on another runtime's wheel: moved to this one.
-            Some(armed_on) if !armed_on.same_runtime(handle) => this.disarm_deadline(&mut state),
+            Some(armed_on) if !armed_on.is(handle) => this.disarm_deadline(&mut state),
             _ => None,
         };
         let waker = DeadlineWaker::waker(Arc::clone(this));
@@ -86,11 +92,18 @@ impl<E: Send + 'static> ScopeNode<E> {
         // runtime's was disarmed above), and every arm and disarm runs under the scope's lock,
         // held here.
         let armed = unsafe { handle.shared.timers.arm(entry, deadline, Some(waker)) };
-        state.deadline_on = Some(handle.clone());
+        // A shut-down wheel (the runtime is dropped) linked nothing: no timer, no deadline_on.
+        let (linked, replaced) = match armed {
+            Armed::Linked(replaced) => (true, replaced),
+            Armed::Closed(waker) => (false, waker),
+            Armed::Unlinked => (false, None),
+        };
+        state.deadline_on = linked.then(|| handle.downgrade());
         drop(state);
         drop(stale);
-        if let Armed::Linked(replaced) = armed {
-            drop(replaced);
+        drop(replaced);
+        if !linked {
+            return;
         }
         if with_current_handle(|current| current.same_runtime(handle)) != Some(true) {
             // The lane may be parked past the new deadline: let it look again.
@@ -100,18 +113,17 @@ impl<E: Send + 'static> ScopeNode<E> {
 
     /// The deadline timer fired: cancels the scope if its deadline really passed. A deadline
     /// moved later while the fired entry was on its way here was linked again by that move,
-    /// and fires later; one removed, or a scope closed meanwhile, ends here.
+    /// and fires later; one removed, or a scope closed meanwhile, ends here. The check and the
+    /// cancel are one step under the scope's lock, so none of those can slip in between.
     fn deadline_fired(&self) {
-        let state = self.lock_state();
-        let due = !state.closed
-            && state
-                .deadline_on
-                .as_ref()
-                .is_some_and(|handle| handle.now() >= state.deadline);
-        drop(state);
-        if due {
-            self.cancel(CancelReason::Deadline);
-        }
+        self.cancel_if(CancelReason::Deadline, |state| {
+            !state.closed
+                && state
+                    .deadline_on
+                    .as_ref()
+                    .and_then(WeakHandle::upgrade)
+                    .is_some_and(|handle| handle.now() >= state.deadline)
+        });
     }
 }
 

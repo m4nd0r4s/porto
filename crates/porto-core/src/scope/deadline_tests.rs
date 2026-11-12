@@ -185,3 +185,36 @@ fn a_scope_with_a_linked_deadline_is_freed_with_the_wheel() {
     assert!(handle.shared.timers.drop_all());
     assert!(weak.upgrade().is_none());
 }
+
+#[test]
+fn a_deadline_set_on_a_dropped_runtimes_wheel_links_nothing_and_leaks_nothing() {
+    let clock = HandClock::default();
+    let handle = handle(&clock);
+    let scope = Scope::new_root(0);
+    // What `Runtime::drop` does.
+    handle.shared.timers.drop_all();
+    Scope::set_deadline(&scope, &handle, at(10));
+    assert_eq!(handle.armed_timers(), 0);
+    assert_eq!(scope.deadline(), at(10), "the deadline is still recorded");
+    assert_eq!(Arc::strong_count(&scope), 1, "the waker kept a reference");
+    // And once the runtime is gone, the scope holds no state of it.
+    let weak = handle.downgrade();
+    drop(handle);
+    assert!(weak.upgrade().is_none(), "the scope kept the runtime alive");
+    drop(scope.close());
+}
+
+#[test]
+fn an_armed_scope_does_not_keep_its_runtime_alive_once_the_runtime_dropped_its_timers() {
+    let clock = HandClock::default();
+    let handle = handle(&clock);
+    let scope = Scope::new_root(0);
+    Scope::set_deadline(&scope, &handle, at(10));
+    let weak = handle.downgrade();
+    // What `Runtime::drop` does first, then its last handle goes.
+    assert!(handle.shared.timers.drop_all());
+    drop(handle);
+    assert!(weak.upgrade().is_none(), "the scope kept the runtime alive");
+    assert_eq!(Arc::strong_count(&scope), 1);
+    drop(scope.close());
+}

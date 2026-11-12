@@ -8,8 +8,8 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use porto_io::Driver;
@@ -116,7 +116,40 @@ impl Shared {
     }
 }
 
+/// A handle that does not keep its runtime alive: what an object that outlives the run (a
+/// Python `Scope`, a scope's deadline link) keeps, so it neither holds the runtime's state
+/// and I/O driver after `porto.run` returned nor forms a cycle with a timer it armed.
+#[derive(Clone)]
+pub struct WeakHandle {
+    shared: Weak<Shared>,
+}
+
+impl WeakHandle {
+    /// The runtime's handle, or `None` once the runtime was dropped.
+    pub fn upgrade(&self) -> Option<Handle> {
+        self.shared.upgrade().map(|shared| Handle { shared })
+    }
+
+    /// Whether this is a handle to the runtime `handle` is a handle to.
+    pub(crate) fn is(&self, handle: &Handle) -> bool {
+        std::ptr::eq(self.shared.as_ptr(), Arc::as_ptr(&handle.shared))
+    }
+}
+
+impl fmt::Debug for WeakHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WeakHandle")
+    }
+}
+
 impl Handle {
+    /// A handle that does not keep the runtime alive.
+    pub fn downgrade(&self) -> WeakHandle {
+        WeakHandle {
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+
     pub(crate) fn new(
         clock: RuntimeClock,
         timer_resolution: Duration,
