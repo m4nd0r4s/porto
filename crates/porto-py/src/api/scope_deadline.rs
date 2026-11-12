@@ -13,9 +13,9 @@
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use porto_core::Handle;
 use porto_core::scope::ScopeNode;
 use porto_core::time::Deadline;
+use porto_core::{Handle, WeakHandle};
 use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 
@@ -33,8 +33,10 @@ struct Pending {
     /// `timeout=`: seconds from the entry.
     timeout: Option<f64>,
     /// The runtime the block was entered on: the node's deadline is set on its clock from
-    /// then on. `None` before the entry, and for the root scope, which has no deadline.
-    entered_on: Option<Handle>,
+    /// then on. `None` before the entry, and for the root scope, which has no deadline. Weak: a
+    /// scope that outlives its run must not keep the runtime's state alive, and a deadline set
+    /// after the run ended has nothing to arm on (it is recorded, inert).
+    entered_on: Option<WeakHandle>,
 }
 
 impl ScopeDeadline {
@@ -64,7 +66,7 @@ impl ScopeDeadline {
         if let Some(timeout) = pending.timeout {
             deadline = deadline.min(after(now, timeout));
         }
-        pending.entered_on = Some(handle.clone());
+        pending.entered_on = Some(handle.downgrade());
         // Under the lock, so a `deadline` set meanwhile from another thread comes after it.
         ScopeNode::set_deadline(node, handle, deadline);
     }
@@ -73,7 +75,10 @@ impl ScopeDeadline {
     /// not counted until the entry).
     pub(super) fn get(&self, node: Option<&PyScopeNode>) -> f64 {
         let pending = self.lock();
-        match (node, &pending.entered_on) {
+        match (
+            node,
+            pending.entered_on.as_ref().and_then(WeakHandle::upgrade),
+        ) {
             (Some(node), Some(_)) => seconds_of(node.deadline()),
             _ => pending.deadline,
         }
@@ -83,11 +88,15 @@ impl ScopeDeadline {
     /// entry it replaces both `deadline=` and `timeout=`.
     pub(super) fn set(&self, node: Option<&PyScopeRef>, seconds: f64) {
         let mut pending = self.lock();
-        match (node, &pending.entered_on) {
-            (Some(node), Some(handle)) => {
+        let handle = pending.entered_on.as_ref().map(WeakHandle::upgrade);
+        match (node, handle) {
+            (Some(node), Some(Some(handle))) => {
                 let deadline = absolute(handle.now(), seconds);
-                ScopeNode::set_deadline(node, handle, deadline);
+                ScopeNode::set_deadline(node, &handle, deadline);
             }
+            // Entered, but its runtime is gone: no clock and no wheel, so the deadline is only
+            // recorded (and reads back), and nothing is armed or kept alive.
+            (Some(_), Some(None)) => pending.deadline = seconds,
             _ => {
                 pending.deadline = seconds;
                 pending.timeout = None;

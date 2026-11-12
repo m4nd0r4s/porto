@@ -383,3 +383,113 @@ def test_a_scope_whose_owner_never_exits_it_is_freed_with_the_runtime() -> None:
 
     with pytest.warns(RuntimeWarning, match="abandoned"):
         porto.run(main, cancel_timeout=0.01)
+
+
+class Interrupt(BaseException):
+    """Stands in for ``KeyboardInterrupt`` / ``SystemExit`` leaving a block."""
+
+
+@pytest.mark.parametrize("with_child", [False, True], ids=["no child", "child cut short"])
+@pytest.mark.parametrize("error", [RuntimeError, Interrupt], ids=["Exception", "BaseException"])
+@pytest.mark.parametrize("raises", [True, False], ids=["timeout", "move_on_after"])
+def test_C4_a_body_failure_after_the_deadline_wins_over_the_timeout(
+    raises: bool, error: type[BaseException], with_child: bool
+) -> None:
+    """A cleanup bug raised after the deadline's ``Cancelled`` is the body's own exception: it
+    propagates as is, and the scope did not time its block out, with or without a child the
+    deadline also cut short (which only makes ``cancelled_caught`` true)."""
+    made: list[porto.Scope] = []
+
+    async def main() -> None:
+        s = porto.timeout(0.01) if raises else porto.move_on_after(0.01)
+        made.append(s)
+        async with s:
+            if with_child:
+                s.spawn(porto.sleep_forever)
+            try:
+                await porto.sleep_forever()
+            except porto.Cancelled:
+                raise error("cleanup bug") from None
+
+    with pytest.raises(error, match="cleanup bug"):
+        porto.run(main)
+    assert not made[0].timed_out
+    assert made[0].cancelled_caught == with_child
+
+
+def test_C4_a_body_failure_and_a_failing_child_after_the_deadline_are_grouped() -> None:
+    async def stubborn() -> None:
+        try:
+            await porto.sleep_forever()
+        finally:
+            raise ValueError("child cleanup")
+
+    async def main() -> None:
+        async with porto.timeout(0.01) as s:
+            s.spawn(stubborn)
+            try:
+                await porto.sleep_forever()
+            except porto.Cancelled:
+                raise RuntimeError("body cleanup") from None
+
+    with pytest.raises(ExceptionGroup) as raised:
+        porto.run(main)
+    assert raised.group_contains(RuntimeError, match="body cleanup")
+    assert raised.group_contains(ValueError, match="child cleanup")
+
+
+def test_C3_two_deadlines_expiring_together_the_innermost_scope_catches_the_cancel() -> None:
+    """Spec C3 today: the Cancelled counts for the first cancelled scope the walk reaches, the
+    innermost one, so its TimeoutError escapes the outer ``move_on_after`` (Trio has the
+    outermost cancelled scope catch it: porto-vw8 decides). Both deadlines are due when the
+    first checkpoint runs, so they cancel in one batch."""
+
+    async def main() -> tuple[porto.Scope, porto.Scope, bool]:
+        outer = porto.move_on_after(0.02)
+        inner = porto.timeout(0.02)
+        escaped = False
+        async with outer:
+            try:
+                async with inner:
+                    await porto.sleep(0.2)
+            except TimeoutError:
+                escaped = True
+                # Let both timers be due, then reach a checkpoint of the outer scope.
+            await porto.sleep(0.05)
+        return outer, inner, escaped
+
+    outer, inner, escaped = porto.run(main)
+    assert inner.timed_out
+    assert escaped, "the inner scope raised its TimeoutError"
+    assert outer.cancel_called
+
+
+def test_a_deadline_set_after_its_run_ended_is_recorded_and_arms_nothing() -> None:
+    """A scope that outlives ``porto.run`` (still open: its owner was abandoned) has no runtime
+    to arm on: setting its deadline, here or from another thread, is accepted and inert, and
+    neither keeps the runtime alive nor links a timer on the dead wheel (which would hold the
+    scope for ever; porto-core's tests check that it does not)."""
+    kept: list[porto.Scope] = []
+
+    async def stuck() -> None:
+        s = porto.timeout(3600)
+        kept.append(s)
+        async with s:
+            while True:
+                with contextlib.suppress(porto.Cancelled):
+                    await porto.sleep_forever()
+
+    async def main() -> None:
+        _core._root_scope().spawn(stuck)
+        await porto.checkpoint()
+
+    with pytest.warns(RuntimeWarning, match="abandoned"):
+        porto.run(main, cancel_timeout=0.01)
+    (s,) = kept
+    kept.clear()
+    s.deadline = 123.0
+    assert s.deadline == 123.0
+    worker = threading.Thread(target=lambda: setattr(s, "deadline", 456.0))
+    worker.start()
+    worker.join()
+    assert s.deadline == 456.0

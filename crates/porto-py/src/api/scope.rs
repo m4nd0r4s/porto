@@ -33,8 +33,8 @@
 //! Not yet: names, `start()` (§3), `Task.cancel()` and awaiting a task (§4), and
 //! spawning from other lanes or threads (C10).
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use porto_core::Handle;
 use porto_core::scope::{CancelReason, ScopeNode};
@@ -134,6 +134,9 @@ pub struct Scope {
     flags: AtomicU8,
     /// The reason the first `cancel()` gave, if any, for the repr.
     cancel_reason: OnceLock<String>,
+    /// Orders the writers of `Scope.shield`, so the flag here and the node's bit end up in
+    /// step (each writer sets both under it). No Python code runs under it.
+    shield_lock: Mutex<()>,
     /// The deadline given, armed on the node once the block is entered (C9).
     deadline: ScopeDeadline,
     /// Whether the exit raises `TimeoutError` when the deadline cut the block short (C3).
@@ -422,6 +425,10 @@ impl Scope {
                  scope inside main: `with porto.shield():`",
             ));
         }
+        let _ordered = self
+            .shield_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let flags = if shield {
             self.flags.fetch_or(ScopeFlags::SHIELD, Ordering::AcqRel)
         } else {
@@ -512,6 +519,7 @@ impl Scope {
             node: SetOnce::new(),
             flags: AtomicU8::new(0),
             cancel_reason: OnceLock::new(),
+            shield_lock: Mutex::new(()),
             deadline: ScopeDeadline::new(timeout, deadline),
             raise_on_timeout,
         }
@@ -611,14 +619,19 @@ impl Scope {
             step::exit_cancel_scope(&node);
             return Err(entered_twice());
         }
+        let ordered = self
+            .shield_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let flags = self.flags.fetch_or(entered, Ordering::AcqRel);
-        if flags & ScopeFlags::CANCEL_REQUESTED != 0 {
-            // Cancelled before it was entered.
-            node.cancel(CancelReason::Explicit);
-        }
         if (flags & ScopeFlags::SHIELD != 0) != shield {
             // The shield changed between the node's making and its publication.
             node.set_shield(!shield);
+        }
+        drop(ordered);
+        if flags & ScopeFlags::CANCEL_REQUESTED != 0 {
+            // Cancelled before it was entered.
+            node.cancel(CancelReason::Explicit);
         }
         if let Some(handle) = Handle::try_current() {
             self.deadline.enter(&node, &handle);
@@ -648,15 +661,23 @@ impl Scope {
     /// absorbs it. Returns whether it absorbs `exc`: a `Cancelled` while this scope itself is
     /// cancelled (C3; one from an enclosing scope's cancellation goes on). `cancelled_caught`
     /// turns true then, or when a child ended by this scope's cancel was dropped here; if the
-    /// scope's deadline was the cancel, `timed_out` does too, and with `raise_on_timeout` the
-    /// exit raises `TimeoutError` (unless children failed: their group goes on instead).
+    /// scope's deadline was the cancel, `timed_out` does too (when the block's exception, if
+    /// any, is that `Cancelled`), and with `raise_on_timeout` the exit raises `TimeoutError`
+    /// (unless children failed: their group goes on instead; and a body exception that is not
+    /// the `Cancelled` always goes on).
     pub(super) fn finish(&self, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
         let py = exc.py();
         let node = self.node.get();
         let reason = node.and_then(|node| node.cancel_called());
         let absorbed = !exc.is_none() && exc.is_instance_of::<Cancelled>() && reason.is_some();
-        let caught = absorbed || node.is_some_and(|node| node.lock_state().cancel_absorbed);
-        let timed_out = caught && reason == Some(CancelReason::Deadline);
+        let child_absorbed = node.is_some_and(|node| node.lock_state().cancel_absorbed);
+        let caught = absorbed || child_absorbed;
+        // The deadline timed the block out only if it cut it short: nothing came out of it, or
+        // the `Cancelled` it caused did. Any other exception leaving the block (a cleanup bug
+        // after the `Cancelled`, `KeyboardInterrupt`) is the body's own and goes on, as C4 says,
+        // however many children the deadline also ended.
+        let timed_out = reason == Some(CancelReason::Deadline)
+            && (absorbed || (child_absorbed && exc.is_none()));
         if caught {
             let flags = if timed_out {
                 ScopeFlags::CANCELLED_CAUGHT | ScopeFlags::TIMED_OUT
