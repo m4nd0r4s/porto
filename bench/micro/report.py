@@ -76,6 +76,7 @@ ROWS = [
     Row("sleep_100k", "`sleep(0.001)` x 100k tasks, spawned and joined", "100k tasks"),
     Row("sleep_cancel_churn", "spawn, arm a sleep, cancel (1000 per batch)", "sleep"),
     Row("worker_pool", "worker pool: jobs channel → 8 workers + Lock → results", "job"),
+    Row("tcp_echo", "TCP echo, 100 connections, 1 KiB (vs uvloop streams)", "round trip"),
 ]
 
 #: The speedups the spec asks of porto over asyncio+uvloop (3.14, GIL).
@@ -93,6 +94,7 @@ GATES = [
     Gate("mutex_value", "Mutex read+set", 1.8, "53 §2"),
     Gate("sleep_100k", "sleep(0.001) x 100k tasks", 2.0, "53 §2"),
     Gate("sleep_cancel_churn", "sleep arm + cancel churn", 2.0, "53 §2 timers"),
+    Gate("tcp_echo", "TCP echo 1 KiB, 100 conns (vs uvloop streams)", 1.5, "53 §2 (M1 exit)"),
 ]
 
 #: The §11 absolute targets (M1 must meet them, ADR-034).

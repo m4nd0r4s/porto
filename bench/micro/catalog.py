@@ -1,9 +1,11 @@
 """Every pyperf benchmark of the suite, in report order: the task rows of ``programs`` (M0),
-then channels, sync primitives, scopes and cancellation, timers and the worker pool."""
+then channels, sync primitives, scopes and cancellation, timers, the worker pool and the TCP
+echo."""
 
 from __future__ import annotations
 
 import channel_programs
+import net_programs
 import programs
 import scope_programs
 import sync_programs
@@ -18,4 +20,5 @@ BENCHMARKS: list[Benchmark] = [
     *scope_programs.BENCHMARKS,
     *timer_programs.BENCHMARKS,
     *workload_programs.BENCHMARKS,
+    *net_programs.BENCHMARKS,
 ]

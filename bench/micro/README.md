@@ -27,7 +27,14 @@ task counts and yields), run on the same loops as above. The modules say what ea
 | `scope_programs.py` | `scope_enter_exit`, `scope_nested_10`, `cancel_fanout_10k`, `fail_fast_10k` | `asyncio.TaskGroup`, `task.cancel()`; trio and anyio (on uvloop) as informative rows | none |
 | `timer_programs.py` | `sleep_100k` (`sleep(0.001)` x 100k tasks), `sleep_cancel_churn` | `asyncio.sleep` | ≥ 2× |
 | `workload_programs.py` | `worker_pool` (jobs channel → 8 workers + a Lock → results channel) | Queues + Lock | none |
+| `net_programs.py` | `tcp_echo`: 100 connections, 1 KiB messages echoed (one op = one round trip); the `uvloop-protocol` variant is informative | `asyncio.start_server` streams (`readexactly` + `write` + `drain`) | ≥ 1.5× |
 | `memory.py` | `idle_tasks_memory`: RSS per idle task, 100k tasks, one process per backend | the same tasks on asyncio and uvloop | ST-11: ≤ 2.5 KB per task |
+
+`tcp_echo` measures the server, in the benchmark's process, and nothing else: the load comes from
+`echo_client.py`, run as a subprocess (4 processes of uvloop `asyncio.Protocol` clients, the same
+generator for every server), which times itself from the moment all 100 connections are open to
+the last echo. See the docstring of `net_programs.py` for why the clients are not porto's or
+asyncio's own streams, and `bench/results/` for the generator's headroom.
 
 `catalog.py` lists every row in report order. The report's gate table shows each speedup both
 against the fastest uvloop baseline (the spec's comparator) and against `uvloop-readyfd`
