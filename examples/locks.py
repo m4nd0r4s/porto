@@ -5,7 +5,8 @@
 A ``Lock`` keeps a read-modify-write that awaits in the middle from interleaving with
 another task's. It is fair (waiters get it in arrival order) and not reentrant. A ``Mutex[T]``
 is a lock that owns its value: the value is reachable only through the guard ``async with``
-gives, so it cannot be touched without holding the lock.
+gives, so it cannot be touched without holding the lock. For several holders at once see
+``semaphores.py``; for readers and writers, ``coordination.py``.
 """
 
 import porto

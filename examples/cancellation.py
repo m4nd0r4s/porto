@@ -1,11 +1,14 @@
-"""Cancellation: a failing child stops its siblings, ``Scope.cancel``, and cancelling from a thread.
+"""Cancellation: a failing child stops its siblings, ``Scope.cancel``, ``Task.cancel``, deadlines.
 
     uv run python examples/cancellation.py
 
 Every scope is a cancel scope. Once cancelled, each task in it gets ``porto.Cancelled`` at its
 awaits (all of them, not only the next one: cancellation is level-triggered) until it leaves the
 scope, whose exit absorbs the ``Cancelled``. ``Cancelled`` is an ``asyncio.CancelledError``:
-clean up in ``finally`` and let it propagate.
+clean up in ``finally`` and let it propagate. A deadline is a cancellation on a timer,
+``Task.cancel`` one aimed at a single task, and a shield keeps it away from a section that must
+finish; the last three are shown briefly here and in full in ``deadlines_and_shields.py`` and
+``tasks.py``.
 """
 
 import threading
@@ -117,6 +120,53 @@ async def nested_scopes_inherit() -> None:
     assert outer.cancelled_caught and not inner.cancelled_caught
 
 
+async def deadline_is_a_cancel_on_a_timer() -> None:
+    """``move_on_after`` cancels its scope when the time is up; ``timeout`` also raises."""
+    async with porto.move_on_after(0.02) as s:
+        await porto.sleep(10)
+    assert s.cancel_called and s.cancelled_caught and s.timed_out
+
+    try:
+        async with porto.timeout(0.02):
+            await porto.sleep(10)
+    except TimeoutError:  # the builtin; the Cancelled itself never leaves the block
+        pass
+    else:
+        raise AssertionError("porto.timeout did not raise TimeoutError")
+
+
+async def cancel_one_task() -> None:
+    """``Task.cancel()`` ends that task and leaves its siblings and its scope alone."""
+    bystander: porto.Task[None] | None = None
+    async with porto.scope() as s:
+        victim = s.spawn(porto.sleep_forever)
+        bystander = s.spawn(porto.sleep, 0.01)
+        await porto.checkpoint()
+        victim.cancel()
+        await porto.sleep(0.002)
+        assert victim.cancelled() and not bystander.done()
+    assert not s.cancel_called  # the scope was never cancelled
+    assert (
+        bystander is not None and bystander.result() is None
+    )  # and the sibling finished its sleep
+
+
+async def shielded_section() -> None:
+    """A shield holds a cancel off until the section is left: only then does it arrive."""
+    steps: list[str] = []
+    async with porto.scope() as s:
+        s.cancel()
+        with porto.shield():
+            await porto.sleep(0.001)  # not cancelled in here
+            steps.append("shielded cleanup done")
+        try:
+            await porto.checkpoint()  # the first await outside the shield
+        except porto.Cancelled:
+            steps.append("cancelled after the shield")
+            raise
+    assert steps == ["shielded cleanup done", "cancelled after the shield"]
+
+
 async def cancel_from_another_thread() -> None:
     """cancel() is thread-safe; it wakes a task sleeping in the scope at once."""
     s = porto.scope()
@@ -137,6 +187,9 @@ async def main() -> None:
     await cancel_from_body()
     await level_triggered()
     await nested_scopes_inherit()
+    await deadline_is_a_cancel_on_a_timer()
+    await cancel_one_task()
+    await shielded_section()
     await cancel_from_another_thread()
     print("cancellation: ok")
 

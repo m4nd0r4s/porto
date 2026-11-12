@@ -5,9 +5,17 @@
 A setting comes from, highest priority first: a keyword override to ``porto.run``, the
 ``config=`` object, the ``PORTO_<FIELD>`` variable, the default. Every value is checked before
 ``main`` runs, and an invalid one raises an error that names a valid value.
+
+``main`` is the first task of the runtime's root scope. When it ends, ``porto.run`` cancels what
+is left in that scope and waits up to ``cancel_timeout`` seconds (default 5) for it; a task that
+ignores the cancel is abandoned, with a ``RuntimeWarning`` that counts them. Spawning into the
+root scope needs ``Runtime.root_scope``, which is not public yet (porto-szb.20): until then
+nothing a program does leaves tasks there, and this example shows the setting and what ``run``
+raises (porto-szb.136 tracks showing the drain itself).
 """
 
 import os
+import warnings
 from collections.abc import Generator
 from contextlib import contextmanager
 
@@ -56,9 +64,53 @@ def config_precedence() -> None:
         assert porto.RuntimeConfig(coop_budget=64).coop_budget == 64
     assert porto.RuntimeConfig().coop_budget == 128  # the default
 
+    # cancel_timeout bounds how long run waits for the root scope's tasks after main ended.
+    assert porto.RuntimeConfig().cancel_timeout == 5.0
+    with environment("PORTO_CANCEL_TIMEOUT", "0.5"):
+        assert porto.RuntimeConfig().cancel_timeout == 0.5
+    assert porto.RuntimeConfig(cancel_timeout=1).cancel_timeout == 1
+
     config = porto.RuntimeConfig(coop_budget=64, timer_resolution=0.0005)
     # Keyword overrides to run win over config=, which wins over the environment.
     assert porto.run(greet, "config", 1, config=config, coop_budget=16) == "hello config"
+
+
+def run_raises_what_main_raises() -> None:
+    """``porto.run`` raises what ``main`` raised, as it is: no wrapper, no group."""
+
+    async def failing() -> None:
+        await porto.sleep(0.001)
+        raise KeyError("no such user")
+
+    try:
+        porto.run(failing)
+    except KeyError as error:
+        assert error.args == ("no such user",)
+    else:
+        raise AssertionError("porto.run swallowed main's exception")
+
+    # A scope inside main reports its children's failures as a group; run passes it through.
+    async def group() -> None:
+        async with porto.scope() as s:
+            s.spawn(failing)
+
+    try:
+        porto.run(group)
+    except ExceptionGroup as error:
+        assert [type(e) for e in error.exceptions] == [KeyError]
+    else:
+        raise AssertionError("porto.run swallowed the group")
+
+
+def warnings_do_not_stop_the_run() -> None:
+    """An unknown ``PORTO_*`` variable is ignored, with a RuntimeWarning listing the valid ones."""
+    with environment("PORTO_COOP_BUGDET", "64"), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")  # record it here, so it does not reach stderr
+        assert porto.run(greet, "typo", 1) == "hello typo"
+    messages = [str(warning.message) for warning in caught]
+    assert any(
+        "PORTO_COOP_BUGDET" in message and "PORTO_COOP_BUDGET" in message for message in messages
+    )
 
 
 def invalid_settings_fail_early() -> None:
@@ -84,6 +136,14 @@ def invalid_settings_fail_early() -> None:
     else:
         raise AssertionError("lanes=4 was accepted")
     assert calls == [], "main must not run with an unsupported config"
+
+    # A negative cancel_timeout cannot work either; the message says what to pass.
+    try:
+        porto.RuntimeConfig(cancel_timeout=-1)
+    except ValueError as error:
+        assert "pass cancel_timeout=5" in str(error), error
+    else:
+        raise AssertionError("cancel_timeout=-1 was accepted")
 
     with environment("PORTO_COOP_BUDGET", "lots"):
         try:
@@ -121,6 +181,8 @@ def runtime_only_apis() -> None:
 def main() -> None:
     run_with_arguments()
     config_precedence()
+    run_raises_what_main_raises()
+    warnings_do_not_stop_the_run()
     invalid_settings_fail_early()
     runtime_only_apis()
     print("run_and_config: ok")

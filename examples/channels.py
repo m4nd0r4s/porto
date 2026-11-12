@@ -6,6 +6,7 @@ A channel is a queue between tasks with a sending end and a receiving end; clone
 more producers or consumers (each value goes to exactly one receiver). A bounded channel makes a
 fast producer wait for a slow consumer (backpressure). Closing is per handle: once every sender
 is closed, receivers drain what is buffered and then see the end (``async for`` stops).
+``more_channels.py`` has the other shapes: one reply, the latest value, and fan-out to everyone.
 """
 
 import porto

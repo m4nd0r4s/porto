@@ -22,8 +22,10 @@ def check_hierarchy() -> None:
     assert issubclass(porto.Cancelled, asyncio.CancelledError)
     assert not issubclass(porto.Cancelled, porto.PortoError)  # nor an Exception
     assert issubclass(porto.Terminated, SystemExit)
-    for error in (porto.WouldBlock, porto.EndOfChannel, porto.BrokenResourceError):
+    for error in (porto.WouldBlock, porto.EndOfChannel, porto.BrokenResourceError, porto.Lagged):
         assert issubclass(error, porto.PortoError)
+    # Deadlines raise the builtin TimeoutError, not a porto type (see deadlines_and_shields.py).
+    assert not issubclass(TimeoutError, porto.PortoError)
 
 
 def check_message(error: BaseException) -> None:
@@ -70,6 +72,38 @@ async def channel_errors() -> list[str]:
     return seen
 
 
+async def more_channel_errors() -> list[str]:
+    """A broadcast receiver that fell behind is told, with the exact count (``Lagged``)."""
+    seen: list[str] = []
+    tx, rx = porto.broadcast[int](2)
+    for message in range(5):
+        tx.send(message)  # the channel keeps two: 0, 1 and 2 are overwritten
+    try:
+        await rx.recv()
+    except porto.Lagged as lag:
+        seen.append("Lagged")
+        check_message(lag)
+        assert lag.skipped == 3
+    assert [await rx.recv(), await rx.recv()] == [3, 4]  # then it carries on
+
+    # A oneshot sender closed without a value ends the channel for the receiver.
+    reply_tx, reply_rx = porto.oneshot[int]()
+    reply_tx.close()
+    try:
+        await reply_rx.recv()
+    except porto.EndOfChannel:
+        seen.append("EndOfChannel")
+
+    # Sync primitives raise WouldBlock from their *_nowait forms, too.
+    limiter = porto.CapacityLimiter(1)
+    limiter.acquire_on_behalf_of_nowait("a")
+    try:
+        limiter.acquire_on_behalf_of_nowait("b")
+    except porto.WouldBlock:
+        seen.append("WouldBlock")
+    return seen
+
+
 async def task_errors() -> list[str]:
     seen: list[str] = []
     async with porto.scope() as s:
@@ -79,6 +113,16 @@ async def task_errors() -> list[str]:
         except porto.InvalidStateError as error:
             seen.append("InvalidStateError")
             check_message(error)
+
+        # Reading the result of a cancelled task raises Cancelled, as asyncio does.
+        victim = s.spawn(porto.sleep_forever)
+        await porto.checkpoint()
+        victim.cancel()
+        await porto.checkpoint()
+        try:
+            victim.result()
+        except porto.Cancelled:
+            seen.append("Cancelled")
     return seen
 
 
@@ -102,7 +146,8 @@ async def main() -> None:
         "EndOfChannel",
         "BrokenResourceError",
     ]
-    assert await task_errors() == ["InvalidStateError"]
+    assert await more_channel_errors() == ["Lagged", "EndOfChannel", "WouldBlock"]
+    assert await task_errors() == ["InvalidStateError", "Cancelled"]
 
 
 if __name__ == "__main__":

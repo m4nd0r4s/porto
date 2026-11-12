@@ -80,6 +80,39 @@ async def thread_waits_for_task() -> str:
     return " ".join(trace)
 
 
+async def thread_uses_the_other_primitives() -> list[str]:
+    """Every primitive with a waiting side has a ``blocking_*`` twin for plain threads."""
+    reply_tx, reply_rx = porto.oneshot[str]()
+    status_tx, status_rx = porto.watch[str]("starting")
+    slots = porto.Semaphore(1)
+    seen: list[str] = []
+    finished = porto.Event()
+
+    def helper() -> None:
+        seen.append(f"reply: {reply_rx.blocking_recv()}")  # blocks until the task replies
+        status_rx.blocking_changed()  # blocks until a newer value than "starting" exists
+        seen.append(f"status: {status_rx.borrow()}")
+        slots.blocking_acquire()  # blocks while a task holds the only permit
+        seen.append("got the permit")
+        slots.release()
+        finished.set()
+
+    await slots.acquire()  # held while the thread starts, released below
+    thread = threading.Thread(target=helper)
+    thread.start()
+    await porto.sleep(0.005)
+    assert seen == [], "the thread must wait for the reply"
+    reply_tx.send("pong")
+    await porto.sleep(0.005)
+    status_tx.send("ready")
+    await porto.sleep(0.005)
+    assert seen == ["reply: pong", "status: ready"], seen  # now blocked on the permit
+    slots.release()
+    await finished.wait()
+    thread.join()
+    return seen
+
+
 async def blocking_calls_refused_on_lane() -> None:
     tx, _rx = porto.channel[int](1)
     try:
@@ -95,6 +128,11 @@ async def main() -> None:
     assert readings == [20.0 + index / 10 for index in range(10)], readings
     assert await async_to_thread() == [f"line {index}" for index in range(20)]
     assert await thread_waits_for_task() == "ready go"
+    assert await thread_uses_the_other_primitives() == [
+        "reply: pong",
+        "status: ready",
+        "got the permit",
+    ]
     await blocking_calls_refused_on_lane()
     print("threads: ok")
 

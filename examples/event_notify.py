@@ -5,6 +5,8 @@
 ``Event`` is a one-shot flag: once set it stays set, and every waiter, current or future, goes
 through. ``Notify`` is a wake-up call: ``notify_one()`` wakes the longest waiting task or stores
 one permit for the next waiter, ``notify_all()`` wakes the tasks waiting now and stores nothing.
+An ``Event`` cannot be cleared; for a flag that goes up and down use ``porto.watch[bool](False)``
+(``more_channels.py``).
 """
 
 from collections import deque

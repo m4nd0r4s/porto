@@ -4,7 +4,8 @@
 
 A scope is a nursery: every task spawned into it finishes before its ``async with`` block
 exits, so no task outlives the code that started it. Failures come out of the block as an
-``ExceptionGroup``; handle them with ``except*``.
+``ExceptionGroup``; handle them with ``except*``. An exception raised by the block itself
+cancels the scope too, so its children stop instead of being waited for.
 """
 
 import porto
@@ -80,7 +81,34 @@ async def validate_all(records: list[dict[str, object]]) -> list[str]:
     return sorted(problems)
 
 
+async def body_exception_cancels_the_scope() -> None:
+    """An exception leaving the block cancels the scope (rule C4): no waiting for the children."""
+    cleaned_up: list[str] = []
+
+    async def long_job() -> None:
+        try:
+            await porto.sleep(10)
+        finally:
+            cleaned_up.append("long job")
+
+    started = porto.current_time()
+    s = porto.scope()
+    try:
+        async with s:
+            s.spawn(long_job)
+            await porto.checkpoint()  # let it start
+            raise ValueError("the block itself failed")
+    except ValueError as error:  # as is, not in a group: nothing else failed
+        assert str(error) == "the block itself failed"
+    else:
+        raise AssertionError("the block's exception was swallowed")
+    # Without the cancel, the exit would wait the 10 s out before the ValueError came through.
+    assert porto.current_time() - started < 1.0
+    assert cleaned_up == ["long job"] and s.cancel_called
+
+
 async def task_lifecycle() -> None:
+    """A ``Task`` is readable once it finished; see ``tasks.py`` for awaiting and cancelling it."""
     task: porto.Task[str] | None = None
     async with porto.scope() as s:
         task = s.spawn(fetch, "/blog")
@@ -123,6 +151,7 @@ async def main() -> None:
     )
     assert problems == ["age must be an int, got 'forty'", "missing 'id'"], problems
 
+    await body_exception_cancels_the_scope()
     await task_lifecycle()
     print("scopes: ok")
 
