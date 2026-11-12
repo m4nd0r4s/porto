@@ -11,7 +11,7 @@ porto/
 │   ├── porto-core/                # scheduler, task, scope, time, sync, coop, registry
 │   │   └── src/{lib.rs,task/{header.rs,harness.rs,state.rs,waker.rs},sched/{lane.rs,shared.rs,idle.rs,inbox.rs},
 │   │            scope/{node.rs,cancel.rs},time/{wheel.rs,entry.rs,clock.rs},sync/{mutex.rs,rwlock.rs,semaphore.rs,
-│   │            notify.rs,event.rs,barrier.rs,mpsc.rs,oneshot.rs,broadcast.rs,watch.rs},coop.rs,metrics.rs,registry.rs}
+│   │            notify.rs,event.rs,barrier.rs,mpsc.rs,oneshot.rs,broadcast.rs,watch.rs},coop.rs,metrics.rs,registry/{mod.rs,node.rs,snapshot.rs}}
 │   ├── porto-io/                  # driver trait, mio backend, uring backend, sim backend, scheduled_io.rs
 │   ├── porto-net/                 # tcp.rs (done), udp.rs, unix.rs, tls/, dns/, happy_eyeballs.rs, buffer_pool.rs
 │   │                              # Python-free sockets and options; the Python types and the IoOps that hold
