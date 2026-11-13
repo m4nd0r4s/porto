@@ -5,6 +5,8 @@ Timing assertions have generous limits: CI machines are slow and loaded."""
 
 import contextvars
 import ctypes
+import functools
+import math
 import subprocess
 import sys
 import textwrap
@@ -137,8 +139,11 @@ def test_one_thread_state_serves_every_job_of_its_thread() -> None:
 def test_the_pool_grows_under_100_concurrent_jobs_and_shrinks_after_the_keepalive() -> None:
     barrier = threading.Barrier(100, timeout=60)
 
+    # More than the default limiter's 40 tokens: this test is about the pool, not the limiter.
+    unbounded = porto.CapacityLimiter(math.inf)
+
     async def job() -> int:
-        return await porto.to_thread(barrier.wait)
+        return await porto.to_thread(barrier.wait, limiter=unbounded)
 
     async def main() -> tuple[int, int, int]:
         assert stats() == (0, 0, 0), "a thread exists before the first job"
@@ -351,12 +356,21 @@ def test_to_thread_says_what_to_do_for_its_mistakes() -> None:
         with pytest.raises(TypeError, match=r"needs a callable.*not int"):
             await porto.to_thread(cast(Any, 3))
 
-    async def with_limiter() -> None:
-        with pytest.raises(NotImplementedError, match="limiter"):
-            await porto.to_thread(len, "x", limiter=porto.CapacityLimiter(1))
+    async def with_a_limiter_that_is_not_one() -> None:
+        for wrong in (3, porto.Semaphore(1), "x"):
+            with pytest.raises(
+                TypeError, match=r"needs a porto\.CapacityLimiter.*CapacityLimiter\(n\)"
+            ):
+                await porto.to_thread(len, "x", limiter=cast(Any, wrong))
 
-    porto.run(not_callable)
-    porto.run(with_limiter)
+    async def a_mistake_borrows_nothing() -> None:
+        limiter = porto.CapacityLimiter(1)
+        with pytest.raises(TypeError, match="needs a callable"):
+            await porto.to_thread(cast(Any, 3), limiter=limiter)
+        assert limiter.borrowed_tokens == 0
+
+    porto.run(with_a_limiter_that_is_not_one)
+    porto.run(a_mistake_borrows_nothing)
     with pytest.raises(porto.NoRuntimeError, match=r"outside porto\.run"):
         _ = _core._run_in_thread(len, ("abc",), None, contextvars.copy_context())  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(porto.NoRuntimeError, match=r"outside porto\.run"):
@@ -406,3 +420,197 @@ def test_a_warning_free_run_with_many_short_jobs() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert porto.run(main) == sum(2**number for number in range(200)) & 0xFF
+
+
+# --- the limiter (spec 19 §2; porto-szb.26) ---
+
+
+def test_the_default_limiter_has_40_tokens_and_is_shared() -> None:
+    limiter = porto.to_thread.default_limiter()
+    assert isinstance(limiter, porto.CapacityLimiter)
+    assert limiter.total_tokens == 40
+    assert porto.to_thread.default_limiter() is limiter
+    assert limiter.borrowed_tokens == 0
+
+
+def test_the_41st_concurrent_call_waits_on_the_default_limiter() -> None:
+    release = threading.Event()
+    started = threading.Semaphore(0)
+    running = 0
+    lock = threading.Lock()
+
+    def job() -> None:
+        nonlocal running
+        with lock:
+            running += 1
+        started.release()
+        release.wait(30)
+
+    async def main() -> None:
+        limiter = porto.to_thread.default_limiter()
+        async with porto.scope() as s:
+            tasks = [s.spawn(porto.to_thread, job) for _ in range(41)]
+            await eventually(lambda: limiter.borrowed_tokens == 40, "40 tokens to be borrowed")
+            await porto.sleep(0.1)
+            assert running == 40, "the 41st call started while all 40 tokens were borrowed"
+            assert limiter.available_tokens == 0
+            release.set()
+        assert running == 41, "the 41st call never ran"
+        assert all(task.result() is None for task in tasks)
+        assert limiter.borrowed_tokens == 0
+
+    porto.run(main)
+
+
+def test_a_custom_limiter_is_honored_and_leaves_the_default_alone() -> None:
+    lock = threading.Lock()
+    running = 0
+    most = 0
+
+    def job() -> None:
+        nonlocal running, most
+        with lock:
+            running += 1
+            most = max(most, running)
+        time.sleep(0.02)
+        with lock:
+            running -= 1
+
+    async def main() -> None:
+        limiter = porto.CapacityLimiter(2)
+        async with porto.scope() as s:
+            for _ in range(8):
+                s.spawn(functools.partial(porto.to_thread, job, limiter=limiter))
+            await eventually(lambda: limiter.borrowed_tokens == 2, "two tokens to be borrowed")
+            assert porto.to_thread.default_limiter().borrowed_tokens == 0
+        assert limiter.borrowed_tokens == 0
+
+    porto.run(main)
+    assert most == 2
+
+
+def test_a_limiter_can_be_shared_with_the_caller_and_raised_while_calls_wait() -> None:
+    release = threading.Event()
+
+    async def main() -> None:
+        limiter = porto.CapacityLimiter(1)
+        async with porto.scope() as s:
+            first = s.spawn(functools.partial(porto.to_thread, release.wait, 30, limiter=limiter))
+            second = s.spawn(functools.partial(porto.to_thread, release.wait, 30, limiter=limiter))
+            await eventually(lambda: limiter.borrowed_tokens == 1, "the first call to start")
+            await porto.sleep(0.05)
+            assert limiter.borrowed_tokens == 1
+            assert stats()[0] == 1, "the second call started without a token"
+            limiter.total_tokens = 2  # grants the waiting call
+            await eventually(lambda: stats()[0] == 2, "the second call to start")
+            release.set()
+        assert first.result() is True
+        assert second.result() is True
+
+    porto.run(main)
+
+
+class Boom(Exception):
+    pass
+
+
+def raise_boom() -> None:
+    raise Boom
+
+
+@pytest.mark.parametrize("cancellable", [False, True])
+def test_the_token_is_released_when_the_function_raises(cancellable: bool) -> None:
+    async def main() -> None:
+        limiter = porto.CapacityLimiter(1)
+        for _ in range(3):  # a leak would block the second call forever
+            with pytest.raises(Boom):
+                await porto.to_thread(raise_boom, cancellable=cancellable, limiter=limiter)
+            await eventually(lambda: limiter.borrowed_tokens == 0, "the token to be released")
+
+    porto.run(main)
+
+
+def test_the_token_is_released_after_a_cancel_that_waited_for_the_job() -> None:
+    async def main() -> None:
+        limiter = porto.CapacityLimiter(1)
+        with porto.move_on_after(0.05) as scope:
+            await porto.to_thread(time.sleep, 0.3, limiter=limiter)
+            assert limiter.borrowed_tokens == 0, "the token is still borrowed after the job"
+            await porto.sleep(0)  # the deferred deadline takes effect here
+        assert scope.timed_out
+        assert limiter.borrowed_tokens == 0
+
+    porto.run(main)
+
+
+def test_a_cancelled_abandoned_job_keeps_its_token_until_the_thread_is_done() -> None:
+    release = threading.Event()
+
+    async def main() -> None:
+        limiter = porto.CapacityLimiter(1)
+        with porto.move_on_after(0.05) as scope:
+            await porto.to_thread(release.wait, 30, cancellable=True, limiter=limiter)
+        assert scope.timed_out
+        # The await is gone, the thread is not: its token is still borrowed, so the next call
+        # waits (a limiter that counted only awaiting tasks would let it start).
+        assert limiter.borrowed_tokens == 1
+        with porto.move_on_after(0.1) as waiting:
+            await porto.to_thread(len, "x", limiter=limiter)
+        assert waiting.timed_out, "a call started on the token of a thread that still runs"
+        release.set()
+        await eventually(lambda: limiter.borrowed_tokens == 0, "the token to come back")
+        assert await porto.to_thread(len, "abc", limiter=limiter) == 3
+
+    porto.run(main)
+
+
+@pytest.mark.parametrize("cancellable", [False, True])
+def test_a_cancel_while_waiting_for_a_token_takes_effect_at_once(cancellable: bool) -> None:
+    release = threading.Event()
+    ran = threading.Event()
+
+    async def main() -> None:
+        limiter = porto.CapacityLimiter(1)
+        async with porto.scope() as s:
+            s.spawn(functools.partial(porto.to_thread, release.wait, 30, limiter=limiter))
+            await eventually(lambda: limiter.borrowed_tokens == 1, "the first call to start")
+            started = porto.current_time()
+            with porto.move_on_after(0.05) as scope:
+                # No thread runs for this call yet: even the shielded mode lets the cancel in.
+                await porto.to_thread(ran.set, cancellable=cancellable, limiter=limiter)
+            assert scope.timed_out
+            assert porto.current_time() - started < 2.0
+            assert limiter.borrowed_tokens == 1, "the cancelled call took or lost a token"
+            release.set()
+        assert limiter.borrowed_tokens == 0
+        assert not ran.is_set()
+
+    porto.run(main)
+
+
+def test_the_token_of_an_abandoned_job_comes_back_after_the_run_ended() -> None:
+    release = threading.Event()
+    limiter = porto.CapacityLimiter(2)
+
+    def stuck() -> None:
+        release.wait(30)
+
+    async def main() -> None:
+        async with porto.scope() as s:
+            # One worker: the second job waits in the queue behind the first and is dropped,
+            # unrun, when the run ends.
+            for _ in range(2):
+                s.spawn(
+                    functools.partial(porto.to_thread, stuck, cancellable=True, limiter=limiter)
+                )
+            await eventually(lambda: limiter.borrowed_tokens == 2, "both tokens to be borrowed")
+            s.cancel()
+
+    porto.run(main, blocking_threads=1)
+    # The running job's token waits for its thread; the dropped job's token is already back.
+    assert limiter.borrowed_tokens == 1
+    release.set()
+    deadline = time.monotonic() + 20
+    while limiter.borrowed_tokens and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert limiter.borrowed_tokens == 0

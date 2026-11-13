@@ -15,6 +15,7 @@ with a positive cache and the coalescing of concurrent identical lookups.
 
 from __future__ import annotations
 
+import math
 import socket
 import time
 from collections.abc import Callable
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import TypeAlias
 
 from porto import _core
-from porto._core import Event
+from porto._core import CapacityLimiter, Event
 from porto._threads import to_thread
 
 __all__ = ["POSITIVE_TTL", "SockAddr", "resolve"]
@@ -36,6 +37,11 @@ POSITIVE_TTL = 30.0
 
 _MAX_CACHED = 1024
 """Entries a cache holds: when it is full, the expired ones go, then the oldest."""
+
+_LOOKUP_LIMITER = CapacityLimiter(math.inf)
+"""Lookups are bounded by the pool alone, as before ``to_thread`` had a limiter: a lookup that
+hangs on a slow nameserver keeps its token while its thread runs, and must not use up the
+default limiter's 40 tokens, which belong to the application's own ``to_thread`` calls."""
 
 _FAMILIES = (0, socket.AF_INET, socket.AF_INET6)
 
@@ -151,7 +157,7 @@ class _Resolver:
                 self.finish(key, flight, addresses, None)
 
         try:
-            await to_thread(job, cancellable=True)
+            await to_thread(job, cancellable=True, limiter=_LOOKUP_LIMITER)
         except BaseException:
             if not flight.started and not flight.finished:
                 # Cancelled before the job was queued: nothing will finish this flight, so

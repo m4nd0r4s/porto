@@ -21,6 +21,8 @@ async def check_to_thread() -> None:
     assert_type(await porto.to_thread(square, 3), int)
     assert_type(await porto.to_thread(square, 3, cancellable=True), int)
     assert_type(await porto.to_thread(sum, [1, 2], start=0), int)
+    assert_type(await porto.to_thread(square, 3, limiter=porto.CapacityLimiter(2)), int)
+    assert_type(porto.to_thread.default_limiter(), porto.CapacityLimiter)
 
 
 async def fetch(host: str, port: int) -> bytes:
