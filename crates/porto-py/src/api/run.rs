@@ -28,10 +28,11 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 
 use super::config;
+use super::runtime::{self, RunClaim, Runtime};
 use super::scope::{Scope, exception_group};
 use super::task::Task;
-use crate::driver::lane;
 use crate::driver::pytask::{self, PyScopeNode, Spawned, TaskOutcome};
+use crate::driver::{lane, startup};
 use crate::errors::NoRuntimeError;
 
 /// Adds the functions to `module`.
@@ -60,35 +61,52 @@ fn run(
     config: Option<Bound<'_, PyAny>>,
     overrides: Option<Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    let (config, coro) = closing_on_error(&main, || {
-        if Handle::try_current().is_some() {
-            return Err(PyRuntimeError::new_err(
-                "porto: porto.run() cannot be called from inside a running porto runtime; \
-                 `await` the coroutine instead, or run it as a task with `async with \
-                 porto.scope() as s: s.spawn(...)`",
-            ));
-        }
-        let config = config::resolve(main.py(), config.as_ref(), overrides.as_ref())?;
-        Ok((config, coroutine_from(&main, &args, "porto.run")?))
+    let py = main.py();
+    let (runtime, coro, claim) = closing_on_error(&main, || {
+        // Before `main` is called: a refused start must not run any of the program.
+        runtime::refuse_nested_start()?;
+        let config = config::resolve(py, config.as_ref(), overrides.as_ref())?;
+        let runtime = Bound::new(py, Runtime::with_config(config))?;
+        let coro = coroutine_from(&main, &args, "porto.run")?;
+        let claim = Runtime::claim(&runtime)?;
+        Ok((runtime, coro, claim))
     })?;
-    run_in_root_scope(&config, &main, coro)
+    run_claimed(&runtime, claim, &main, coro)
 }
 
-/// Runs `coro` as the main task of a fresh runtime, in its root scope (C12, see the module
-/// docs). `main` names the task.
+/// Runs `coro` as the main task of `runtime`, which `claim` made `RUNNING`, in a fresh lane
+/// 0 on this thread and in the runtime's root scope (C12, see the module docs). `main` names the
+/// task. The runtime is `STOPPED` when this returns.
+pub(crate) fn run_claimed(
+    runtime: &Bound<'_, Runtime>,
+    claim: RunClaim,
+    main: &Bound<'_, PyAny>,
+    coro: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let result = run_in_root_scope(runtime, main, coro);
+    // `STOPPED` only once the runtime is gone: its lane, its pool and its driver.
+    drop(claim);
+    result
+}
+
+/// See [`run_claimed`].
 fn run_in_root_scope(
-    config: &RuntimeConfig,
+    runtime_object: &Bound<'_, Runtime>,
     main: &Bound<'_, PyAny>,
     coro: Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
     let py = coro.py();
+    let config = runtime_object.get().config();
     let cancel_timeout = config.cancel_timeout();
     let unstarted = coro.clone();
     let (outcome, errors) = lane::run(py, config, |runtime| {
+        // The steps other features fill in (26 §2 step 1), undone when this block ends.
+        let _installed = startup::install(py, config, startup::on_main_thread(py))?;
         // Owned by no task: nobody enters or exits it.
         let node = PyScopeNode::new_root(0);
         let root = Py::new(py, Scope::root(py, node.clone()))?;
         let _published = RootScope::publish(root.clone_ref(py));
+        let _runtime_published = Runtime::publish(runtime_object, root.clone_ref(py));
         let task = Py::new(py, Task::new(Some(main.clone().unbind()), false))?;
         let spawned = Spawned::Child {
             task: task.clone_ref(py),

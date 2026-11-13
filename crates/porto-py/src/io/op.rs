@@ -40,7 +40,7 @@ use crate::driver::pytask::Resume;
 use crate::driver::ready::ready;
 use crate::driver::trap::{self, Trap, TrapKind};
 use crate::driver::{lane, step};
-use crate::errors::ClosedResourceError;
+use crate::errors::{ClosedResourceError, RuntimeClosed};
 
 /// A registered socket that operations run on.
 pub(crate) type IoRegistration = Registration<Socket>;
@@ -618,6 +618,11 @@ pub(crate) fn ensure_same_run(registration: &IoRegistration) -> PyResult<()> {
     let driver = lane::current().and_then(|handle| handle.driver().cloned());
     match driver {
         Some(driver) if registration.is_driven_by(&driver) => Ok(()),
+        _ if lane::registration_run_has_ended(registration) => Err(RuntimeClosed::new_err(
+            "porto: this socket belongs to a runtime that stopped (porto.run() returned), so it \
+             is closed and can never become ready; open sockets inside the run that uses them \
+             and use them before it ends",
+        )),
         Some(_) => Err(PyRuntimeError::new_err(
             "porto: this socket was opened in another run (another thread's porto.run, or an \
              earlier one) than the one using it, so it can never become ready here; open the \

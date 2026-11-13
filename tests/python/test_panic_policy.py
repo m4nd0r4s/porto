@@ -72,7 +72,7 @@ def test_a_joiner_of_the_panicked_task_gets_rust_panic_and_main_goes_on() -> Non
 
     # The failed child cancels its scope and the scope re-raises it on exit, but the lane lives
     # on: the joiner above already saw the panic.
-    with pytest.raises(BaseException) as raised:
+    with pytest.raises(ExceptionGroup) as raised:
         porto.run(main)
     assert _panic_of(raised.value).message == "boom"
 
@@ -85,7 +85,7 @@ def test_a_panic_in_a_pyfunction_called_by_a_task_fails_the_task_with_rust_panic
         async with porto.scope() as scope:
             scope.spawn(victim)
 
-    with pytest.raises(BaseException) as raised:
+    with pytest.raises(ExceptionGroup) as raised:
         porto.run(main)
     panic = _panic_of(raised.value)
     assert panic.message == "inside a pyfunction"
@@ -113,7 +113,7 @@ def test_a_panic_leaves_the_runtime_usable_for_the_next_run() -> None:
         async with porto.scope() as scope:
             scope.spawn(victim)
 
-    with pytest.raises(BaseException):
+    with pytest.raises(ExceptionGroup):
         porto.run(main)
 
     async def fine() -> int:

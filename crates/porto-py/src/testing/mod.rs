@@ -38,9 +38,17 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(count_allocations, module)?)?;
     module.add_function(wrap_pyfunction!(buffer_pool_stats, module)?)?;
     module.add_function(wrap_pyfunction!(gil_stats, module)?)?;
+    module.add_function(wrap_pyfunction!(startup_trace, module)?)?;
     module.add_class::<crate::io::handle::IoHandle>()?;
     errors::register(module)?;
     traps::register(module)
+}
+
+/// `_startup_trace()`: the start steps the last run installed and removed, in order
+/// (`install:asyncgen_hooks`, ..., `uninstall:asyncgen_hooks`): 26 §2 step 1.
+#[pyfunction(name = "_startup_trace")]
+fn startup_trace() -> Vec<String> {
+    crate::driver::startup::last_trace()
 }
 
 /// `(park detaches, periodic releases)`: how often a lane in this process gave the GIL up to

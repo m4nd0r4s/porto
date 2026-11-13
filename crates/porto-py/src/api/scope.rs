@@ -69,7 +69,7 @@ use crate::driver::ready::{Ready, ready, ready_none};
 use crate::driver::step::{self, checkpoint_if_needed, checkpoint_if_needed_none};
 use crate::driver::trap::{Trap, TrapKind};
 use crate::driver::{freelist, lane};
-use crate::errors::{Cancelled, NoRuntimeError};
+use crate::errors::{Cancelled, NoRuntimeError, RuntimeClosed};
 
 /// Adds the classes and functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -326,7 +326,7 @@ impl Scope {
     fn new_started(slf: &Bound<'_, Self>) -> PyResult<Started> {
         let this = slf.get();
         if !lane::is_active() {
-            return Err(NoRuntimeError::new_err(
+            return Err(this.without_runtime(
                 "porto: Scope.start() must be called from a task running under porto.run(); \
                  start the program with porto.run(main) and open the scope inside main",
             ));
@@ -335,13 +335,13 @@ impl Scope {
     }
 
     fn __aenter__(slf: &Bound<'_, Self>) -> PyResult<Py<PyAny>> {
+        let this = slf.get();
         if !lane::is_active() {
-            return Err(NoRuntimeError::new_err(
+            return Err(this.without_runtime(
                 "porto: `async with porto.scope()` only works in tasks of a porto runtime; \
                  start the program with porto.run(main) and open the scope inside main",
             ));
         }
-        let this = slf.get();
         if this.node.get().is_some() {
             return Err(entered_twice());
         }
@@ -369,13 +369,13 @@ impl Scope {
     /// `with porto.shield():` (C8): the scope as a cancel scope only, entered and exited
     /// without awaiting, for a `finally:` block that must await cleanup. It cannot spawn.
     fn __enter__(slf: &Bound<'_, Self>) -> PyResult<Py<Self>> {
+        let this = slf.get();
         if !lane::is_active() {
-            return Err(NoRuntimeError::new_err(
+            return Err(this.without_runtime(
                 "porto: `with porto.shield()` only works in tasks of a porto runtime; start the \
                  program with porto.run(main) and open the scope inside main",
             ));
         }
-        let this = slf.get();
         if this.node.get().is_some() {
             return Err(entered_twice());
         }
@@ -704,7 +704,7 @@ impl Scope {
     ) -> PyResult<Py<Task>> {
         let py = coro_or_fn.py();
         let Some(handle) = lane::current() else {
-            return Err(NoRuntimeError::new_err(
+            return Err(self.without_runtime(
                 "porto: Scope.spawn() must be called from a task running under porto.run(); \
                  start the program with porto.run(main) and open the scope inside main",
             ));
@@ -725,6 +725,21 @@ impl Scope {
         };
         task.get().bind(&body);
         Ok(task)
+    }
+
+    /// What a scope raises when it is used where no runtime runs: `RuntimeClosed` if it was
+    /// entered in a run that stopped (I4: it belongs to that runtime), else `NoRuntimeError`
+    /// with `message`.
+    fn without_runtime(&self, message: &'static str) -> PyErr {
+        let run = self.run.load(Ordering::Relaxed);
+        if lane::run_has_ended(run) {
+            return RuntimeClosed::new_err(
+                "porto: this scope belongs to a runtime that stopped (porto.run() returned), \
+                 so nothing can be spawned into it or entered again; open a new scope in the \
+                 run that needs one",
+            );
+        }
+        NoRuntimeError::new_err(message)
     }
 
     /// The node of a scope that tasks can be spawned into: entered with `async with` and not

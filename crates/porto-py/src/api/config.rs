@@ -26,8 +26,9 @@ static RESOLVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 ///
 /// The M1 single-lane runtime uses `io_backend`, `io_backend_strict`, `timer_resolution`,
 /// `coop_budget`, `blocking_threads`, `blocking_keepalive` (the blocking pool, spec 19 §1),
-/// `cancel_timeout` (how long `porto.run` waits for the root scope's tasks, C12) and `debug`
-/// (the swallowed-`Cancelled` warning, C11) only; the other fields are checked (in Python) and
+/// `cancel_timeout` (how long `porto.run` waits for the root scope's tasks, C12), `debug`
+/// (the swallowed-`Cancelled` warning, C11) and `handle_signals` (whether the signal receiver
+/// start step applies, 26 §2) only; the other fields are checked (in Python) and
 /// not carried yet.
 pub(crate) fn resolve(
     py: Python<'_>,
@@ -73,6 +74,9 @@ pub(crate) fn resolve(
         .getattr(pyo3::intern!(py, "io_backend_strict"))?
         .extract()?;
     let debug: bool = resolved.getattr(pyo3::intern!(py, "debug"))?.extract()?;
+    let handle_signals: bool = resolved
+        .getattr(pyo3::intern!(py, "handle_signals"))?
+        .extract()?;
     // Checked in Python: at least 1. One too large for the platform's `usize` is no limit.
     let blocking_threads: usize = resolved
         .getattr(pyo3::intern!(py, "blocking_threads"))?
@@ -87,6 +91,7 @@ pub(crate) fn resolve(
         Duration::try_from_secs_f64(blocking_keepalive).unwrap_or(Duration::MAX);
     RuntimeConfig::builder()
         .debug(debug)
+        .handle_signals(handle_signals)
         .io_backend(io_backend)
         .io_backend_strict(io_backend_strict)
         .timer_resolution(Duration::from_secs_f64(timer_resolution))

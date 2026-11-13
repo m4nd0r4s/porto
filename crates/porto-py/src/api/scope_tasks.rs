@@ -22,7 +22,7 @@ use pyo3::types::PyTuple;
 
 use crate::driver::pytask::{PyScopeRef, PyTask};
 use crate::driver::{lane, step};
-use crate::errors::NoRuntimeError;
+use crate::errors::{NoRuntimeError, RuntimeClosed};
 use porto_core::task::TaskFlags;
 
 /// The `porto.Task` of every live task spawned into `scope` (or moved into it), oldest first.
@@ -45,6 +45,12 @@ pub(super) fn scope_tasks<'py>(
     run: usize,
 ) -> PyResult<Bound<'py, PyTuple>> {
     let current = lane::run_id();
+    if lane::run_has_ended(run) {
+        return Err(RuntimeClosed::new_err(
+            "porto: this scope belongs to a runtime that stopped (porto.run() returned), so its \
+             tasks are gone; read Scope.tasks inside the run that entered the scope",
+        ));
+    }
     if current == 0 {
         return Err(not_on_the_lane());
     }

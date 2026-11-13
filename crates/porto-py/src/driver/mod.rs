@@ -16,6 +16,7 @@ pub(crate) mod lane;
 pub(crate) mod pending;
 pub(crate) mod pytask;
 pub mod ready;
+pub(crate) mod startup;
 pub(crate) mod step;
 pub(crate) mod thin;
 pub mod trap;

@@ -24,8 +24,8 @@ use std::future::{Future, poll_fn};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use porto_core::config::RuntimeConfig;
 use porto_core::task::Header;
 use porto_core::time::{Deadline, sleep_until};
 use porto_core::{Handle, ParkHook, Runtime};
-use porto_io::MioDriver;
+use porto_io::{Driver, MioDriver};
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyRuntimeWarning};
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -54,6 +54,30 @@ static INTROSPECTION_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 /// The id of the next run: a scope remembers the run it was entered in.
 static NEXT_RUN: AtomicUsize = AtomicUsize::new(1);
+
+/// The runs in progress in the process, each with its I/O driver: what tells an object that
+/// belongs to a run whether that run stopped (I4, 10 §5).
+static ACTIVE_RUNS: Mutex<Vec<(usize, Arc<dyn Driver>)>> = Mutex::new(Vec::new());
+
+fn active_runs() -> std::sync::MutexGuard<'static, Vec<(usize, Arc<dyn Driver>)>> {
+    ACTIVE_RUNS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether the run with this id (nonzero) stopped. Runs end for good: an id is never reused.
+pub(crate) fn run_has_ended(run: usize) -> bool {
+    run != 0 && !active_runs().iter().any(|(active, _)| *active == run)
+}
+
+/// Whether the run that `registration` was opened in stopped.
+pub(crate) fn registration_run_has_ended<S: porto_io::IoSource>(
+    registration: &porto_io::Registration<S>,
+) -> bool {
+    !active_runs()
+        .iter()
+        .any(|(_, driver)| registration.is_driven_by(driver))
+}
 
 thread_local! {
     /// The id of the run on this thread, 0 outside one (from [`run`] until it returns, teardown
@@ -136,6 +160,7 @@ pub(crate) fn run<T>(
     config: &RuntimeConfig,
     body: impl FnOnce(&Runtime) -> T,
 ) -> PyResult<T> {
+    let driver = open_driver(py, config)?;
     let runtime = Runtime::builder()
         .park_hook(DetachWhileParked::new(py))
         .timer_resolution(config.timer_resolution())
@@ -143,11 +168,14 @@ pub(crate) fn run<T>(
         .blocking_threads(config.blocking_threads())
         .blocking_keepalive(config.blocking_keepalive())
         .blocking_hooks(PythonWorkers::of_current_interpreter(py))
-        .driver(open_driver(py, config)?)
+        .driver(driver.clone())
         .introspection(config.introspection())
         .build();
-    RUN.set(NEXT_RUN.fetch_add(1, Ordering::Relaxed));
-    let _run = RunScope;
+    let id = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
+    RUN.set(id);
+    let as_driver: Arc<dyn Driver> = driver;
+    active_runs().push((id, as_driver));
+    let _run = RunScope(id);
     let output = {
         let _lane = OnPythonLane::enter(config.debug(), config.introspection());
         body(&runtime)
@@ -368,12 +396,20 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
 }
 
 /// Ends the run id of [`run`] when it returns, unwinding included.
-struct RunScope;
+struct RunScope(usize);
 
 impl Drop for RunScope {
     fn drop(&mut self) {
         RUN.set(0);
         drop(TEARDOWN.take());
+        let driver = {
+            let mut active = active_runs();
+            active
+                .iter()
+                .position(|(id, _)| *id == self.0)
+                .map(|at| active.swap_remove(at))
+        };
+        drop(driver);
     }
 }
 

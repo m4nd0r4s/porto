@@ -186,6 +186,8 @@ impl PythonWorkers {
 
 impl WorkerHooks for PythonWorkers {
     fn thread_start(&self) -> Box<dyn Any> {
+        // A worker can never start a runtime (I1).
+        super::runtime::mark_blocking_worker();
         if interpreter_is_finalizing() {
             return Box::new(WorkerThreadState(std::ptr::null_mut()));
         }

@@ -69,6 +69,43 @@ def run(
     "never awaited" warning follows the error.
     """
 
+@final
+class Runtime:
+    """An asynchronous runtime. ``Runtime().block_on(main)`` runs ``main`` on the calling
+    thread, which becomes lane 0, like ``porto.run(main)`` (which makes a ``Runtime`` itself).
+
+    A ``Runtime`` runs once: ``NEW`` until ``block_on`` starts it, ``RUNNING`` while main runs
+    and the root scope drains, ``STOPPED`` for good after. Only one runtime runs per process at
+    a time: a second ``block_on`` or ``porto.run`` while one runs (from a task, from another
+    thread, or from a ``to_thread`` worker) raises ``RuntimeError``. A runtime that stopped
+    raises ``RuntimeClosed`` when asked to run again.
+    """
+
+    def __init__(self, config: RuntimeConfig | None = None, **overrides: Any) -> None:
+        """The settings are resolved now (``overrides`` over ``config`` over ``PORTO_*`` over the
+        defaults), so an invalid one raises here."""
+
+    def block_on(self, main: Callable[[], Awaitable[_T]] | Awaitable[_T], /) -> _T:
+        """Runs ``main`` to completion and returns its result or raises its exception."""
+
+    @property
+    def root_scope(self) -> Scope:
+        """The root scope, a nursery that outlives the scopes ``main`` opens. Only valid while
+        the runtime runs: ``NoRuntimeError`` before, ``RuntimeClosed`` after."""
+
+    def shutdown(self, *, timeout: float = 10.0) -> None:
+        """Stops a runtime that never started or already stopped (it cannot start afterwards).
+        Shutting down a runtime that runs is not supported yet: ``RuntimeError``."""
+
+    def __enter__(self) -> Runtime: ...
+    def __exit__(self, *exception: object) -> None: ...
+
+def runtime() -> Runtime:
+    """The runtime this code runs in; ``NoRuntimeError`` outside a task of a running runtime."""
+
+def in_runtime() -> bool:
+    """Whether this code runs on the lane of a running runtime."""
+
 # Time
 
 def current_time() -> float:
