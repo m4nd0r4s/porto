@@ -8,7 +8,10 @@ a pool thread instead and goes on when it returns. This example shows:
 - an exception raised in `fn` arriving with the traceback of the worker's frames;
 - `fn` running in a *copy* of the caller's `contextvars` context;
 - what a cancel or a deadline does to the await: by default it waits for `fn` (a thread cannot
-  be stopped), and `cancellable=True` gives the caller back at once and discards the result.
+  be stopped), and `cancellable=True` gives the caller back at once and discards the result;
+- the limiter: at most 40 calls run at once by default (`porto.to_thread.default_limiter()`),
+  or as many as the `porto.CapacityLimiter` passed as `limiter=` allows; a call waits for a
+  token, and the token goes back when its thread is done.
 
 The pool is elastic: no thread exists until the first job, a thread is added for each job
 that no idle thread can take up to `blocking_threads` (default 512), and a thread idle for
@@ -98,11 +101,36 @@ async def cancellation() -> None:
     assert porto.current_time() - started < 0.12, "the caller did not wait for the thread"
 
 
+async def limiting() -> None:
+    default = porto.to_thread.default_limiter()
+    # (A thread abandoned by `cancellable=True` above may still hold one: its token comes back
+    # when the thread is done, not when the caller stops waiting.)
+    assert default.total_tokens == 40 and default.borrowed_tokens <= 1
+
+    # A limiter of its own: three jobs, two tokens, so the third waits for one to come back.
+    limiter = porto.CapacityLimiter(2)
+    release = threading.Event()
+
+    async def limited_wait() -> bool:
+        return await porto.to_thread(release.wait, limiter=limiter)
+
+    async with porto.scope() as s:
+        for _ in range(3):
+            s.spawn(limited_wait)
+        while limiter.borrowed_tokens < 2:
+            await porto.sleep(0.001)
+        await porto.sleep(0.02)
+        assert limiter.available_tokens == 0, "two calls run, the third waits"
+        release.set()
+    assert limiter.borrowed_tokens == 0, "every token is back"
+
+
 async def main() -> None:
     await result_and_threads()
     await errors()
     await context()
     await cancellation()
+    await limiting()
 
 
 if __name__ == "__main__":

@@ -104,9 +104,9 @@ def current_task() -> Task[Any]          # NoRuntimeError outside a task; the ob
 `porto.Buffer(size=0)`: a growable, pooled byte buffer with the read/write buffer protocol; `capacity`, `resize(size)`, `extend(data)`; `bytes(buf)` copies (13 §6).
 
 ### Threads
-`async to_thread(fn, *args, cancellable=False, limiter=None, **kw)`, `from_thread.run`, `from_thread.run_sync`, `class Portal` (`submit(fn, *args) -> concurrent.futures.Future`, `close()`).
+`async to_thread(fn, *args, cancellable=False, limiter=None, **kw)` (a callable object: it also has `to_thread.default_limiter() -> CapacityLimiter`), `from_thread.run`, `from_thread.run_sync`, `class Portal` (`submit(fn, *args) -> concurrent.futures.Future`, `close()`).
 
-Implemented so far: `porto.to_thread` as §19 §2 describes it (a copied context, the shielded await by default, `cancellable=True`, the exception with the worker's traceback) over the blocking pool of §19 §1 sized by `blocking_threads` and `blocking_keepalive`; `limiter` other than `None` raises `NotImplementedError` until `porto.to_thread.default_limiter()` lands (porto-szb.26), and `from_thread` and `Portal` are not there yet (porto-szb.27).
+Implemented so far: `porto.to_thread` as §19 §2 describes it (a copied context, the shielded await by default, `cancellable=True`, the exception with the worker's traceback) over the blocking pool of §19 §1 sized by `blocking_threads` and `blocking_keepalive`, bounded by `limiter=` or `porto.to_thread.default_limiter()` (40 tokens, §19 §2); `from_thread` and `Portal` are not there yet (porto-szb.27).
 
 ### Exceptions (`porto.errors`, re-exported at top level)
 ```
