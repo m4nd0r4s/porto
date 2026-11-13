@@ -83,7 +83,21 @@ async def connect_tcp(
             f"(0 starts every attempt at once), got {happy_eyeballs_delay!r}"
         )
     local_addresses = await _local_addresses(local_addr)
-    addresses = _interleave(await resolve(host, port))
+    addresses = await resolve(host, port)
+    if local_addresses:
+        # Only the families local_addr can bind are tried: an address of another family could
+        # only fail, and its error would hide the real outcome of the others.
+        families = {_is_ipv6(a) for a in local_addresses}
+        usable = [a for a in addresses if _is_ipv6(a) in families]
+        if not usable:
+            raise OSError(
+                errno.EAFNOSUPPORT,
+                f"porto: connect_tcp's local_addr has no address of the family of any address of "
+                f"{host!r} (local_addr={local_addr!r}); use a local_addr of the host's family, or "
+                "a host name resolving to both families",
+            )
+        addresses = usable
+    addresses = _interleave(addresses)
     stream = await _race(addresses, local_addresses, float(happy_eyeballs_delay))
     if nodelay:
         try:

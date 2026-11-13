@@ -272,3 +272,34 @@ def test_a_wrong_argument_says_what_to_pass(
     with pytest.raises(error, match="porto: resolve's"):
         run(main())
     assert lookups.calls == []
+
+
+@pytest.mark.parametrize("host", ["example..com", "a" * 64 + ".test"])
+def test_a_malformed_host_name_is_a_gaierror(host: str) -> None:
+    async def main() -> None:
+        with pytest.raises(socket.gaierror, match="not a valid host name"):
+            await net.resolve(host, 80)
+
+    run(main())
+
+
+def test_a_failure_while_storing_the_answer_still_wakes_every_waiter(
+    lookups: Lookups, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_store(self: Any, key: Any, addresses: Any) -> None:
+        raise RuntimeError("dictionary changed size during iteration")
+
+    monkeypatch.setattr(_dns._Resolver, "store", broken_store)  # pyright: ignore[reportPrivateUsage]
+
+    async def main() -> list[list[net.SockAddr]]:
+        results: list[list[net.SockAddr]] = []
+
+        async def one() -> None:
+            results.append(await net.resolve("host.test", 80))
+
+        async with porto.move_on_after(5), porto.scope() as s:
+            for _ in range(3):
+                s.spawn(one)
+        return results
+
+    assert len(run(main())) == 3

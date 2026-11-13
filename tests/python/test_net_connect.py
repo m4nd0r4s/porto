@@ -285,6 +285,21 @@ def test_a_local_addr_of_another_family_fails_the_attempt_and_says_what_to_do() 
     run(main())
 
 
+def test_a_local_addr_of_one_family_skips_the_other_family_and_reports_the_real_failure(
+    setup: Setup,
+) -> None:
+    # The host resolves to ::1 then 127.0.0.1 and nothing listens: with an IPv4 local_addr the
+    # IPv6 address is not tried, so the error is the refusal, not "no address of that family".
+    async def main() -> None:
+        port = await refused_port()
+        setup.answers = [("::1", port, 0, 0), (LOOPBACK, port)]
+        with pytest.raises(ConnectionRefusedError):
+            await net.connect_tcp("both.test", port, local_addr=(LOOPBACK, 0))
+        assert [p for p, _ in setup.started] == [port]
+
+    run(main())
+
+
 def test_tls_is_not_implemented_yet() -> None:
     async def main() -> None:
         await net.connect_tcp(LOOPBACK, 9, tls=True)

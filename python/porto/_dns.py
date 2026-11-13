@@ -109,11 +109,15 @@ class _Resolver:
         flight.finished = True
         flight.addresses = addresses
         flight.error = error
-        if error is None:
-            self.store(key, addresses)
-        if self.flights.get(key) is flight:
-            del self.flights[key]
-        flight.done.set()
+        try:
+            if error is None:
+                self.store(key, addresses)
+            if self.flights.get(key) is flight:
+                del self.flights[key]
+        except Exception:  # the cache is an optimisation: the waiters must still wake
+            pass
+        finally:
+            flight.done.set()
 
     async def resolve(self, key: _Key) -> tuple[SockAddr, ...]:
         while True:
@@ -192,6 +196,12 @@ def _literal(host: str, port: int, family: int) -> list[SockAddr] | None:
     ``family`` raises ``socket.gaierror``."""
     try:
         info = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, 0, socket.AI_NUMERICHOST)
+    except UnicodeError as error:  # an empty label ("a..b") or one too long for IDNA
+        raise socket.gaierror(
+            socket.EAI_NONAME,
+            f"porto: {host!r} is not a valid host name ({error}); check it for empty or too long "
+            "labels",
+        ) from error
     except socket.gaierror as error:
         if error.errno in _NOT_A_LITERAL:
             return None
