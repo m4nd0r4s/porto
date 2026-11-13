@@ -11,13 +11,23 @@
 //! which puts the previous one back. Several subscriptions to one signal share the handler, the
 //! last one dropped restores.
 //!
-//! A pipe that is full drops the signal number, as the kernel coalesces a signal that is
-//! already pending: a burst of one signal may be delivered once.
+//! The pipe byte is only a wakeup. What is delivered is a per-signal *pending* count the handler
+//! raises and [`Signals::next`] takes, so a full pipe cannot lose the only SIGINT, and signals
+//! that arrive close together are delivered once (as the kernel coalesces a pending signal).
+//!
+//! **Repeated signals chain.** A subscription made with [`Signals::subscribe_chained`] also
+//! calls the disposition it replaced (Python's C handler for SIGINT) when the signal arrives
+//! again while the previous one is still pending, that is, while the lane has not run its
+//! reader: a lane stuck in synchronous code cannot act on the first Ctrl-C, and Python's handler
+//! then trips the interpreter's eval breaker, so the second Ctrl-C raises `KeyboardInterrupt`
+//! in that code.
 
 use std::io::{self, Read};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
 
 use mio::unix::pipe;
 
@@ -31,10 +41,22 @@ const SIGNAL_SLOTS: usize = 65;
 /// Read by the signal handler, so atomics and nothing else.
 static WRITE_FDS: [AtomicI32; SIGNAL_SLOTS] = [const { AtomicI32::new(-1) }; SIGNAL_SLOTS];
 
+/// How many times each signal arrived since [`Signals::next`] last took it.
+static PENDING: [AtomicU32; SIGNAL_SLOTS] = [const { AtomicU32::new(0) }; SIGNAL_SLOTS];
+
+/// The handler each signal's handler chains to on a repeat, as a function address; 0 for none
+/// (the default or ignore disposition, or a handler that takes `siginfo`).
+static PREVIOUS: [AtomicUsize; SIGNAL_SLOTS] = [const { AtomicUsize::new(0) }; SIGNAL_SLOTS];
+
+/// Whether a subscription asked for chaining on a repeat.
+static CHAIN: [AtomicBool; SIGNAL_SLOTS] = [const { AtomicBool::new(false) }; SIGNAL_SLOTS];
+
 /// What is installed for one signal.
 struct Slot {
     /// How many subscriptions use the handler.
     subscribers: usize,
+    /// How many of them chain on a repeat.
+    chained: usize,
     /// The disposition before the first subscription, put back by the last.
     previous: Option<libc::sigaction>,
 }
@@ -43,15 +65,14 @@ static SLOTS: Mutex<[Slot; SIGNAL_SLOTS]> = Mutex::new(
     [const {
         Slot {
             subscribers: 0,
+            chained: 0,
             previous: None,
         }
     }; SIGNAL_SLOTS],
 );
 
-fn lock_slots() -> std::sync::MutexGuard<'static, [Slot; SIGNAL_SLOTS]> {
-    SLOTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn lock_slots() -> parking_lot::MutexGuard<'static, [Slot; SIGNAL_SLOTS]> {
+    SLOTS.lock()
 }
 
 /// The handler: writes the signal number to its pipe. Nothing else is async-signal-safe to do
@@ -64,12 +85,25 @@ extern "C" fn on_signal(signum: libc::c_int) {
     {
         let fd = slot.load(Ordering::Relaxed);
         if fd >= 0 {
+            let pending = PENDING[index].fetch_add(1, Ordering::AcqRel);
             // Signal numbers are below 256.
             let byte = u8::try_from(signum).unwrap_or(u8::MAX);
             // SAFETY: `write` is async-signal-safe; `fd` is the write end of a pipe that stays
             // open while a subscription to this signal exists, and the buffer is one live byte.
-            // A failed write (full pipe) drops the notification, see the module docs.
+            // A failed write (full pipe) loses only the wakeup: the pending count stays.
             let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+            if pending > 0 && CHAIN[index].load(Ordering::Relaxed) {
+                let previous = PREVIOUS[index].load(Ordering::Relaxed);
+                if previous != 0 {
+                    // SAFETY: `previous` was stored by `install` from a `sigaction` whose
+                    // handler is a plain `void (*)(int)` (no `SA_SIGINFO`), neither default nor
+                    // ignore: calling it is what the kernel would have done.
+                    let handler: extern "C" fn(libc::c_int) = unsafe {
+                        std::mem::transmute::<usize, extern "C" fn(libc::c_int)>(previous)
+                    };
+                    handler(signum);
+                }
+            }
         }
     }
     // SAFETY: as above.
@@ -134,6 +168,21 @@ impl Signals {
     /// `SIGSTOP` cannot be caught), `AlreadyExists` if another [`Signals`] has the signal, or
     /// the OS error of `sigaction`.
     pub fn subscribe(&self, signum: i32) -> io::Result<Subscription> {
+        self.subscribe_with(signum, false)
+    }
+
+    /// Like [`subscribe`](Self::subscribe), and when the signal arrives again before the first
+    /// was taken by [`next`](Self::next), the disposition it replaced is called too (see the
+    /// module docs). For SIGINT, that is Python's handler.
+    ///
+    /// # Errors
+    ///
+    /// As [`subscribe`](Self::subscribe).
+    pub fn subscribe_chained(&self, signum: i32) -> io::Result<Subscription> {
+        self.subscribe_with(signum, true)
+    }
+
+    fn subscribe_with(&self, signum: i32, chained: bool) -> io::Result<Subscription> {
         let index = usize::try_from(signum)
             .ok()
             .filter(|index| (1..SIGNAL_SLOTS).contains(index))
@@ -148,6 +197,15 @@ impl Signals {
         let slot = &mut slots[index];
         if slot.subscribers == 0 {
             let previous = install(signum)?;
+            let callable = previous.sa_flags & libc::SA_SIGINFO == 0
+                && previous.sa_sigaction != libc::SIG_DFL
+                && previous.sa_sigaction != libc::SIG_IGN
+                && previous.sa_sigaction != libc::SIG_ERR;
+            PREVIOUS[index].store(
+                if callable { previous.sa_sigaction } else { 0 },
+                Ordering::Release,
+            );
+            PENDING[index].store(0, Ordering::Release);
             slot.previous = Some(previous);
             WRITE_FDS[index].store(fd, Ordering::Release);
         } else if WRITE_FDS[index].load(Ordering::Acquire) != fd {
@@ -157,34 +215,57 @@ impl Signals {
             ));
         }
         slot.subscribers += 1;
+        if chained {
+            slot.chained += 1;
+            CHAIN[index].store(true, Ordering::Release);
+        }
         drop(slots);
         Ok(Subscription {
             signum,
             index,
+            chained,
             _signals: self.clone(),
         })
     }
 
-    /// The next signal number that arrived, waiting for one.
+    /// The next signal that arrived, waiting for one. A signal that arrived several times
+    /// since the last call is returned once.
     ///
     /// # Errors
     ///
     /// A [`ClosedResource`](crate::ClosedResource) error once the driver shut down.
     pub async fn next(&self) -> io::Result<i32> {
-        self.inner
-            .receiver
-            .async_io(Interest::READABLE, |receiver| {
-                let mut byte = [0_u8; 1];
-                loop {
-                    match (&*receiver).read(&mut byte) {
-                        Ok(1) => return Ok(i32::from(byte[0])),
-                        Ok(_) => return Err(io::ErrorKind::UnexpectedEof.into()),
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                        Err(error) => return Err(error),
+        loop {
+            if let Some(signum) = self.take_pending() {
+                return Ok(signum);
+            }
+            // Only a wakeup: what arrived is in the pending counts.
+            self.inner
+                .receiver
+                .async_io(Interest::READABLE, |receiver| {
+                    let mut bytes = [0_u8; 64];
+                    loop {
+                        match (&*receiver).read(&mut bytes) {
+                            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                            Ok(count) => return Ok(count),
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                            Err(error) => return Err(error),
+                        }
                     }
-                }
-            })
-            .await
+                })
+                .await?;
+        }
+    }
+
+    /// Takes one signal of this pipe that is pending, if any.
+    fn take_pending(&self) -> Option<i32> {
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&self.inner.sender);
+        (1..SIGNAL_SLOTS).find_map(|index| {
+            (WRITE_FDS[index].load(Ordering::Acquire) == fd
+                && PENDING[index].swap(0, Ordering::AcqRel) > 0)
+                .then(|| i32::try_from(index).ok())
+                .flatten()
+        })
     }
 }
 
@@ -211,6 +292,7 @@ fn install(signum: i32) -> io::Result<libc::sigaction> {
 pub struct Subscription {
     signum: i32,
     index: usize,
+    chained: bool,
     // Keeps the pipe (the handler's descriptor) open for as long as the handler is installed.
     _signals: Signals,
 }
@@ -229,6 +311,10 @@ impl Drop for Subscription {
         let slot = &mut slots[self.index];
         // Zero already in a forked child, which let go of every signal ([`forget_in_child`]).
         slot.subscribers = slot.subscribers.saturating_sub(1);
+        if self.chained {
+            slot.chained = slot.chained.saturating_sub(1);
+            CHAIN[self.index].store(slot.chained > 0, Ordering::Release);
+        }
         if slot.subscribers == 0
             && let Some(previous) = slot.previous.take()
         {
@@ -237,24 +323,54 @@ impl Drop for Subscription {
             // writes to a pipe that stays open until `WRITE_FDS` is cleared below.
             unsafe { libc::sigaction(self.signum, &raw const previous, std::ptr::null_mut()) };
             WRITE_FDS[self.index].store(-1, Ordering::Release);
+            PREVIOUS[self.index].store(0, Ordering::Release);
+            PENDING[self.index].store(0, Ordering::Release);
         }
     }
 }
 
+/// Whether [`prepare_fork`] holds the slots' lock, until the fork's parent or child hook.
+static FORK_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Before `fork()` (`os.register_at_fork(before=...)`): holds the slots' lock across the fork, so
+/// the child never inherits it locked by a thread it does not have, in the middle of a
+/// subscription. Pair it with [`after_fork_in_parent`] and [`forget_in_child`].
+pub fn prepare_fork() {
+    std::mem::forget(SLOTS.lock());
+    FORK_LOCKED.store(true, Ordering::Release);
+}
+
+/// After `fork()` in the parent: lets the slots go.
+pub fn after_fork_in_parent() {
+    if FORK_LOCKED.swap(false, Ordering::AcqRel) {
+        // SAFETY: `prepare_fork` took the lock on this thread and forgot its guard.
+        unsafe { SLOTS.force_unlock() };
+    }
+}
+
 /// In a forked child: lets go of every signal the parent's runtime received. The child shares
-/// the parent's pipe, so its handlers would write signal numbers to the *parent's* runtime;
-/// instead each signal gets its previous disposition back (Python's, usually) and nothing is
-/// delivered to any pipe. Call it from `os.register_at_fork(after_in_child=...)`.
+/// the parent's pipe, so its handlers would write to the *parent's* runtime; instead each signal
+/// gets its previous disposition back (Python's, usually) and nothing is delivered to any pipe.
+/// Call it from `os.register_at_fork(after_in_child=...)`, after [`prepare_fork`] ran.
 pub fn forget_in_child() {
-    // The thread that held the lock may not exist in the child: never wait for it. Without the
-    // lock only the handlers' targets can be cleared, which silences them.
-    let mut slots = SLOTS.try_lock();
+    // Normally this thread holds the lock since `prepare_fork`. Without it (a fork that skipped
+    // the `before` hook) never wait for a thread the child does not have: only the handlers'
+    // targets can be cleared, which silences them.
+    let held = FORK_LOCKED.swap(false, Ordering::AcqRel);
+    let guard = if held { None } else { SLOTS.try_lock() };
     for (index, target) in WRITE_FDS.iter().enumerate() {
         target.store(-1, Ordering::Release);
-        if let Ok(slots) = &mut slots
-            && let Some(slot) = slots.get_mut(index)
-        {
+        PENDING[index].store(0, Ordering::Release);
+        PREVIOUS[index].store(0, Ordering::Release);
+        CHAIN[index].store(false, Ordering::Release);
+    }
+    if held || guard.is_some() {
+        // SAFETY: held: `prepare_fork`'s forgotten guard lives on in this thread, the only one
+        // in the child; otherwise the guard is alive.
+        let slots = unsafe { &mut *SLOTS.data_ptr() };
+        for (index, slot) in slots.iter_mut().enumerate() {
             slot.subscribers = 0;
+            slot.chained = 0;
             if let Some(previous) = slot.previous.take()
                 && let Ok(signum) = i32::try_from(index)
             {
@@ -262,6 +378,11 @@ pub fn forget_in_child() {
                 unsafe { libc::sigaction(signum, &raw const previous, std::ptr::null_mut()) };
             }
         }
+    }
+    drop(guard);
+    if held {
+        // SAFETY: see above: this thread holds the forgotten guard.
+        unsafe { SLOTS.force_unlock() };
     }
 }
 
@@ -297,6 +418,25 @@ mod tests {
         );
         drop(second);
         assert_eq!(current_handler(signum), before);
+    }
+
+    #[test]
+    fn signals_that_arrive_close_together_are_taken_once_and_a_repeat_is_not_lost() {
+        let driver = Arc::new(MioDriver::new().unwrap());
+        let signals = Signals::new(driver).unwrap();
+        let subscription = signals.subscribe_chained(libc::SIGURG).unwrap();
+        assert_eq!(signals.take_pending(), None);
+        // SAFETY: raising a signal with our handler installed; SIGURG's default is ignore.
+        unsafe {
+            libc::raise(libc::SIGURG);
+            libc::raise(libc::SIGURG);
+        }
+        assert_eq!(signals.take_pending(), Some(libc::SIGURG));
+        assert_eq!(signals.take_pending(), None);
+        // SAFETY: as above.
+        unsafe { libc::raise(libc::SIGURG) };
+        assert_eq!(signals.take_pending(), Some(libc::SIGURG));
+        drop(subscription);
     }
 
     #[test]

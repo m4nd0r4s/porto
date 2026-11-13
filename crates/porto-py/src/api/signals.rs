@@ -134,16 +134,27 @@ mod unix {
 
     /// Starts calling `callback` with each of `signums` that arrives, on the lane of the run
     /// `handle` belongs to, until [`unsubscribe`] or the end of the run. Returns the
-    /// subscription's id.
+    /// subscription's id. With `chained`, a repeat of a signal the lane has not taken yet also
+    /// reaches the disposition this replaced (`porto_io::signal`).
     ///
     /// # Errors
     /// `ValueError` for a number that cannot be received, `OSError` if the OS refuses.
-    pub(crate) fn subscribe(handle: &Handle, signums: &[i32], callback: Callback) -> PyResult<u64> {
+    pub(crate) fn subscribe(
+        handle: &Handle,
+        signums: &[i32],
+        callback: Callback,
+        chained: bool,
+    ) -> PyResult<u64> {
         HUB.with_borrow_mut(|hub| {
             let hub = open(hub, handle)?;
             let mut subscriptions = Vec::with_capacity(signums.len());
             for &signum in signums {
-                subscriptions.push(hub.signals.subscribe(signum).map_err(|error| {
+                let subscribed = if chained {
+                    hub.signals.subscribe_chained(signum)
+                } else {
+                    hub.signals.subscribe(signum)
+                };
+                subscriptions.push(subscribed.map_err(|error| {
                     if error.kind() == io::ErrorKind::InvalidInput {
                         PyValueError::new_err(format!(
                             "porto: signal {signum} cannot be received ({error}); SIGKILL and \
@@ -221,7 +232,7 @@ mod unix {
             }
         });
         let handle = lane::current().ok_or_else(not_in_a_run)?;
-        let id = subscribe(&handle, &signums, callback)?;
+        let id = subscribe(&handle, &signums, callback, false)?;
         Ok(SignalSubscription { id })
     }
 

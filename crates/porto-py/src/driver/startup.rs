@@ -45,7 +45,9 @@ fn nothing_to_install(_: &StartContext<'_, '_>) -> PyResult<Option<Uninstall>> {
     Ok(None)
 }
 
-/// The default handling of SIGINT and SIGTERM (18 §3): each asks the runtime to shut down.
+/// The default handling of SIGINT and SIGTERM (18 §3): each asks the runtime to shut down. A
+/// signal whose disposition is not Python's default (an ignored SIGINT, a program's own handler)
+/// is left alone.
 ///
 /// SIGINT is Ctrl-C: the shutdown starts with no graceful period (main is cancelled at once)
 /// and `porto.run` raises `KeyboardInterrupt` after it; a second SIGINT forces it. SIGTERM is
@@ -54,27 +56,52 @@ fn nothing_to_install(_: &StartContext<'_, '_>) -> PyResult<Option<Uninstall>> {
 #[cfg(unix)]
 fn install_signal_receiver(context: &StartContext<'_, '_>) -> PyResult<Option<Uninstall>> {
     use std::rc::Rc;
+    use std::time::Duration;
 
     use crate::api::lifecycle::{Cause, Request};
     use crate::api::signals;
 
-    let lifecycle = context.lifecycle.clone();
-    let callback: signals::Callback = Rc::new(move |_, signum| {
-        let request = if signum == libc::SIGINT {
-            Request {
-                cause: Cause::Interrupt,
-                graceful: Some(std::time::Duration::ZERO),
+    // Like `asyncio.Runner`: only a signal that has Python's default handling is taken. An
+    // ignored SIGINT (`nohup`, `cmd &`) or a handler the program installed stays as it is.
+    let py = context.py;
+    let signal = py.import("signal")?;
+    let current = |signum: i32| signal.call_method1("getsignal", (signum,));
+    let take_sigint = current(libc::SIGINT)?.is(&signal.getattr("default_int_handler")?);
+    let take_sigterm = current(libc::SIGTERM)?.eq(signal.getattr("SIG_DFL")?)?;
+    let mut ids = Vec::new();
+    for (wanted, signum, cause, graceful) in [
+        (
+            take_sigint,
+            libc::SIGINT,
+            Cause::Interrupt,
+            Some(Duration::ZERO),
+        ),
+        (take_sigterm, libc::SIGTERM, Cause::Terminate, None),
+    ] {
+        if !wanted {
+            continue;
+        }
+        let lifecycle = context.lifecycle.clone();
+        let callback: signals::Callback = Rc::new(move |_, _| {
+            lifecycle.request(Request { cause, graceful });
+        });
+        // SIGINT chains: a lane stuck in synchronous code still gets the second Ctrl-C as a
+        // `KeyboardInterrupt` (18 §3).
+        let chained = signum == libc::SIGINT;
+        match signals::subscribe(context.handle, &[signum], callback, chained) {
+            Ok(id) => ids.push(id),
+            Err(error) => {
+                ids.iter().for_each(|id| signals::unsubscribe(*id));
+                return Err(error);
             }
-        } else {
-            Request {
-                cause: Cause::Terminate,
-                graceful: None,
-            }
-        };
-        lifecycle.request(request);
-    });
-    let id = signals::subscribe(context.handle, &[libc::SIGINT, libc::SIGTERM], callback)?;
-    Ok(Some(Box::new(move |_| signals::unsubscribe(id))))
+        }
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(move |_| {
+        ids.iter().for_each(|id| signals::unsubscribe(*id));
+    })))
 }
 
 /// Windows has no self-pipe for signals yet (18 §3): Python's own handling stays.

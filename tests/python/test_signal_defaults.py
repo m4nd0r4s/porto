@@ -22,9 +22,17 @@ WAIT = 60.0
 class Child:
     """A Python program under test: its stdout lines arrive in order."""
 
-    def __init__(self, program: str) -> None:
+    def __init__(self, program: str, *, reset_signals: bool = True) -> None:
+        # A runner started with `cmd &` or `nohup` has SIGINT ignored, which children inherit.
+        prefix = (
+            "import signal\n"
+            "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+            if reset_signals
+            else ""
+        )
         self.process = subprocess.Popen(
-            [sys.executable, "-c", program],
+            [sys.executable, "-c", prefix + program],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -254,6 +262,8 @@ def test_the_default_handlers_are_gone_after_the_run() -> None:
     async def main() -> None:
         await porto.sleep(0)
 
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
     def interrupt_and_wait() -> None:
         os.kill(os.getpid(), signal.SIGINT)
         time.sleep(5)
@@ -261,3 +271,164 @@ def test_the_default_handlers_are_gone_after_the_run() -> None:
     porto.run(main)
     with pytest.raises(KeyboardInterrupt):
         interrupt_and_wait()
+
+
+def test_a_second_sigint_interrupts_a_main_that_runs_synchronous_code() -> None:
+    child = Child(
+        """
+import time
+import porto
+
+async def main():
+    print("ready", flush=True)
+    started = time.time()
+    while time.time() - started < 60:
+        pass
+
+try:
+    porto.run(main)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt", flush=True)
+"""
+    )
+    child.wait_for("ready")
+    started = time.monotonic()
+    child.signal(signal.SIGINT)
+    time.sleep(0.3)  # the first cannot act: the lane is busy
+    assert child.process.poll() is None
+    child.signal(signal.SIGINT)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen == ["ready", "KeyboardInterrupt"]
+    assert time.monotonic() - started < 30
+
+
+def test_a_second_sigint_interrupts_a_main_blocked_in_time_sleep() -> None:
+    child = Child(
+        """
+import time
+import porto
+
+async def main():
+    print("ready", flush=True)
+    time.sleep(60)
+
+try:
+    porto.run(main)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt", flush=True)
+"""
+    )
+    child.wait_for("ready")
+    started = time.monotonic()
+    child.signal(signal.SIGINT)
+    time.sleep(0.3)
+    assert child.process.poll() is None
+    child.signal(signal.SIGINT)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen == ["ready", "KeyboardInterrupt"]
+    assert time.monotonic() - started < 30
+
+
+def test_a_second_sigint_forces_the_exit_while_the_root_scope_drains_after_main_ended() -> None:
+    child = Child(
+        """
+import porto
+
+async def hang():
+    with porto.shield():
+        await porto.sleep(120)
+
+async def main():
+    porto.runtime().root_scope.spawn(hang)
+    await porto.sleep(0.05)
+    print("ready", flush=True)
+
+try:
+    porto.run(main, cancel_timeout=120)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt", flush=True)
+"""
+    )
+    child.wait_for("ready")
+    time.sleep(0.3)
+    child.signal(signal.SIGINT)
+    time.sleep(0.3)
+    assert child.process.poll() is None, "the first Ctrl-C leaves the shielded task its time"
+    started = time.monotonic()
+    child.signal(signal.SIGINT)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen == ["ready", "KeyboardInterrupt"]
+    assert time.monotonic() - started < 30
+
+
+def test_an_ignored_sigint_stays_ignored() -> None:
+    child = Child(
+        """
+import signal, time
+import porto
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+async def main():
+    print("ready", flush=True)
+    await porto.sleep(1.0)
+    print("finished", flush=True)
+
+porto.run(main)
+print("done", flush=True)
+""",
+        reset_signals=False,
+    )
+    child.wait_for("ready")
+    child.signal(signal.SIGINT)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen[-2:] == ["finished", "done"]
+
+
+def test_a_sigint_handler_the_program_installed_stays() -> None:
+    child = Child(
+        """
+import signal
+import porto
+
+def custom(signum, frame):
+    print("custom handler", flush=True)
+
+signal.signal(signal.SIGINT, custom)
+
+async def main():
+    print("ready", flush=True)
+    await porto.sleep(1.0)
+
+porto.run(main)
+print("done", flush=True)
+""",
+        reset_signals=False,
+    )
+    child.wait_for("ready")
+    child.signal(signal.SIGINT)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen == ["ready", "custom handler", "done"]
+
+
+def test_a_sigterm_handler_the_program_installed_stays() -> None:
+    child = Child(
+        """
+import signal
+import porto
+
+signal.signal(signal.SIGTERM, lambda signum, frame: print("custom term", flush=True))
+
+async def main():
+    print("ready", flush=True)
+    await porto.sleep(1.0)
+
+porto.run(main)
+print("done", flush=True)
+""",
+        reset_signals=False,
+    )
+    child.wait_for("ready")
+    child.signal(signal.SIGTERM)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen == ["ready", "custom term", "done"]
