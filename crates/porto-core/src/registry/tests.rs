@@ -8,7 +8,7 @@ use std::task::{Poll, Waker};
 use std::thread;
 use std::time::Duration;
 
-use crate::registry::{TaskKind, TaskRecord, TaskState};
+use crate::registry::{SnapshotError, TaskKind, TaskRecord, TaskState};
 use crate::scope::ScopeNode;
 use crate::{Handle, Runtime};
 
@@ -186,8 +186,9 @@ fn a_snapshot_requested_from_another_thread_is_taken_by_the_running_lane() {
     let runtime = Runtime::new();
     let gate = Arc::new(Gate::default());
     let handle = runtime.handle().clone();
-    let requester = thread::spawn(move || handle.task_snapshot());
-    runtime.block_on(async {
+    let requester = runtime.block_on(async {
+        // Requested while the lane runs: another thread waits for it.
+        let requester = thread::spawn(move || handle.task_snapshot());
         let joins: Vec<_> = (0..100).map(|_| crate::spawn(gate.wait())).collect();
         settle(&Handle::try_current().unwrap()).await;
         // The lane takes the request at a maintenance tick, or when it parks: let it run on.
@@ -201,9 +202,102 @@ fn a_snapshot_requested_from_another_thread_is_taken_by_the_running_lane() {
         for join in joins {
             join.await.unwrap();
         }
+        requester
     });
     let records = requester.join().unwrap().unwrap();
     assert_eq!(records.len(), 100);
+}
+
+#[test]
+fn a_snapshot_of_a_lane_that_is_not_running_is_an_error_not_a_hang() {
+    let runtime = Runtime::new();
+    // The owner thread outside `block_on`: nothing runs the lane.
+    assert_eq!(
+        runtime.handle().task_snapshot().unwrap_err(),
+        SnapshotError::LaneNotRunning
+    );
+    let handle = runtime.handle().clone();
+    let other = thread::spawn(move || handle.task_snapshot());
+    assert_eq!(
+        other.join().unwrap().unwrap_err(),
+        SnapshotError::LaneNotRunning
+    );
+    // The same request is fine while the lane runs it (from the lane's own thread).
+    runtime.block_on(async {
+        assert!(
+            Handle::try_current()
+                .unwrap()
+                .task_snapshot()
+                .unwrap()
+                .is_empty()
+        );
+    });
+    // And a request made without waiting is taken when it next runs.
+    let request = runtime.handle().request_task_snapshot();
+    assert!(request.try_take().is_none());
+    runtime.run_until_idle();
+    assert!(request.try_take().unwrap().unwrap().is_empty());
+}
+
+#[test]
+fn a_walk_at_shutdown_sees_the_tasks_a_cancelled_task_leaves_behind() {
+    /// Counts the live tasks as it is dropped, which is while the runtime cancels it.
+    struct CountsOnDrop(Handle, Arc<AtomicUsize>);
+    impl Drop for CountsOnDrop {
+        fn drop(&mut self) {
+            let mut live = 0;
+            let walked = self.0.with_live_tasks_at_shutdown(None, |_| {
+                live += 1;
+                true
+            });
+            assert!(walked, "the registry is closed by then");
+            self.1.store(live, Ordering::SeqCst);
+        }
+    }
+    let runtime = Runtime::new();
+    let gate = Arc::new(Gate::default());
+    let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    // The newest task is cancelled first (the registry is walked newest first): the older ones
+    // are still parked when it looks.
+    drop(runtime.spawn(gate.wait()));
+    drop(runtime.spawn(gate.wait()));
+    let counter = CountsOnDrop(runtime.handle().clone(), seen.clone());
+    drop(runtime.spawn(async move {
+        let _counter = counter;
+        gate.wait().await;
+    }));
+    runtime.run_until_idle();
+    assert!(
+        !runtime.handle().with_live_tasks_at_shutdown(None, |_| true),
+        "not closed while the runtime lives"
+    );
+    drop(runtime);
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        2,
+        "the two parked tasks that were left"
+    );
+}
+
+#[test]
+fn with_live_tasks_while_stops_where_the_reader_says() {
+    let runtime = Runtime::new();
+    let gate = Arc::new(Gate::default());
+    runtime.block_on(async {
+        let handle = Handle::try_current().unwrap();
+        let joins: Vec<_> = (0..50).map(|_| crate::spawn(gate.wait())).collect();
+        settle(&handle).await;
+        let mut visited = 0;
+        assert!(handle.with_live_tasks_while(|_| {
+            visited += 1;
+            visited < 3
+        }));
+        assert_eq!(visited, 3);
+        gate.open();
+        for join in joins {
+            join.await.unwrap();
+        }
+    });
 }
 
 #[test]

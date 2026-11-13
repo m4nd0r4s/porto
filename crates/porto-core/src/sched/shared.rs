@@ -66,6 +66,9 @@ pub(crate) struct Remote {
     /// Whether the lane parks in the driver's `turn` rather than on its thread: an unpark then
     /// wakes the driver.
     pub(crate) parks_in_driver: AtomicBool,
+    /// Whether a thread is running the lane's loop now (`block_on` or `run_until_idle`): a
+    /// snapshot request waits for the lane only while it is.
+    pub(crate) entered: AtomicBool,
     /// Work handed to this lane from other threads, run at its next maintenance tick
     /// (`12-scheduler-and-lanes.md` §2 `deferred_decref`).
     pub(crate) deferred: Inject<DeferredWork>,
@@ -77,6 +80,7 @@ impl Remote {
             registry: TaskRegistry::new(introspection),
             parking: Parking::new(),
             parks_in_driver: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
             deferred: Inject::new(),
         }
     }
@@ -299,22 +303,47 @@ impl Handle {
 
     /// Calls `f` on every live task of this runtime's registry, newest first, if this thread is
     /// running its lane; returns whether it did (`false` from any other thread, or once the
-    /// runtime is shutting down). A task is live from its spawn until it completes. `f` must
-    /// not spawn tasks or let any end.
+    /// runtime is shutting down: see [`Handle::with_live_tasks_at_shutdown`]). A task is live from
+    /// its spawn until it completes. `f` must not spawn tasks or let any end.
     ///
     /// This is how `Scope.tasks` lists a scope's tasks (`15-structured-concurrency` §1): the
     /// registry is the one list of tasks, so a scope keeps none of its own.
-    pub fn with_live_tasks(&self, f: impl FnMut(LiveTask<'_>)) -> bool {
+    pub fn with_live_tasks(&self, mut f: impl FnMut(LiveTask<'_>)) -> bool {
+        self.with_live_tasks_while(|task| {
+            f(task);
+            true
+        })
+    }
+
+    /// [`Handle::with_live_tasks`] that stops at the first task `f` returns `false` for: a
+    /// reader that knows how many tasks it wants (a scope's `live_children`) does not walk the
+    /// rest.
+    pub fn with_live_tasks_while(&self, f: impl FnMut(LiveTask<'_>) -> bool) -> bool {
         context::with_lane_of(self, |lane| {
             let registry = &lane.shared().lanes[lane.index()].registry;
             if registry.is_closed() {
                 return false;
             }
             // SAFETY: this thread runs the lane of an open registry (`with_lane_of`).
-            unsafe { registry.for_each_live(f) };
+            unsafe { registry.for_each_live_while(f) };
             true
         })
         .unwrap_or(false)
+    }
+
+    /// The live tasks while the runtime is being dropped, from whichever thread asks: the registry
+    /// is closed and walked under its lock (see [`TaskRegistry::for_each_live_closed`]), which is
+    /// what code that runs as the shutdown cancels a task (a `finally`) sees. `polling` is the
+    /// header of the task running on this thread, if any. Returns whether the runtime is in that
+    /// state (else nothing ran).
+    pub fn with_live_tasks_at_shutdown(
+        &self,
+        polling: Option<&crate::task::Header>,
+        f: impl FnMut(LiveTask<'_>) -> bool,
+    ) -> bool {
+        self.shared.lanes[0]
+            .registry
+            .for_each_live_closed(polling, f)
     }
 
     /// Requests a snapshot of every live task from each lane: copied at the lane's next
@@ -322,22 +351,28 @@ impl Handle {
     /// thread its share is taken right away. See [`TaskSnapshotRequest`].
     pub fn request_task_snapshot(&self) -> TaskSnapshotRequest {
         let lanes = self.shared.lanes.len();
-        let cell = SnapshotCell::new(lanes);
+        let weak = Arc::downgrade(&self.shared);
+        let running = move |lane: usize| {
+            // A dropped runtime has no lane to wait for: its requests are answered as closed.
+            weak.upgrade()
+                .is_none_or(|shared| shared.lanes[lane].entered.load(Ordering::Acquire))
+        };
+        let cell = SnapshotCell::new(lanes, Box::new(running));
         let current = context::with_lane_of(self, |lane| lane.index());
         for index in 0..lanes {
             if current == Some(index) {
-                cell.deliver(self.shared.collect_records(index));
+                cell.deliver(index, self.shared.collect_records(index));
                 continue;
             }
             let handle = self.clone();
             let delivery = Arc::clone(&cell);
-            let work = move || delivery.deliver(handle.shared.collect_records(index));
+            let work = move || delivery.deliver(index, handle.shared.collect_records(index));
             match self.shared.lanes[index].deferred.push(Box::new(work)) {
                 Ok(()) => self.shared.notify_lane(index),
                 Err(work) => {
                     // Closed: the runtime is gone, and the request never runs.
                     drop(work);
-                    cell.deliver(None);
+                    cell.deliver(index, None);
                 }
             }
         }
@@ -346,10 +381,13 @@ impl Handle {
 
     /// A snapshot of every live task: [`Handle::request_task_snapshot`], waited for. From a
     /// lane's own thread (a task, or `block_on`) it returns at once. From another thread it
-    /// waits for the lane to take it, so the runtime must be running.
+    /// waits for the lane to take it, which it does while it runs.
     ///
     /// # Errors
-    /// [`SnapshotError::RuntimeClosed`] if the runtime is dropped first.
+    /// [`SnapshotError::RuntimeClosed`] if the runtime is dropped first, and
+    /// [`SnapshotError::LaneNotRunning`] if a lane is not running (no thread is inside
+    /// `block_on` or `run_until_idle`, the owner thread outside them included) for about a
+    /// quarter of a second, instead of waiting for a run that may never come.
     pub fn task_snapshot(&self) -> Result<Vec<TaskRecord>, SnapshotError> {
         self.request_task_snapshot().wait()
     }

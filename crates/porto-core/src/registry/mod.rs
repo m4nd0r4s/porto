@@ -172,12 +172,28 @@ impl TaskRegistry {
     /// # Safety
     /// As for [`TaskRegistry::push_front`].
     unsafe fn walk(&self, mut f: impl FnMut(NonNull<Header>)) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.walk_while(|task| {
+                f(task);
+                true
+            });
+        }
+    }
+
+    /// [`TaskRegistry::walk`] that stops at the first task `f` returns `false` for.
+    ///
+    /// # Safety
+    /// As for [`TaskRegistry::push_front`].
+    unsafe fn walk_while(&self, mut f: impl FnMut(NonNull<Header>) -> bool) {
         // SAFETY: the caller's contract: the head is ours.
         let mut at = self.head.with(|head| unsafe { *head });
         while let Some(task) = NonNull::new(at) {
             // SAFETY: a linked task is alive; its link is read before `f` can unlink it.
             at = unsafe { task.as_ref() }.registry.neighbours().1;
-            f(task);
+            if !f(task) {
+                return;
+            }
         }
     }
 
@@ -420,22 +436,71 @@ impl TaskRegistry {
     /// Runs `f` on every live task (linked, not complete, with a reference), newest first.
     ///
     /// # Safety
-    /// The caller is the lane thread of an open registry, and `f` neither spawns, completes
-    /// nor frees a task.
+    /// As for [`TaskRegistry::for_each_live_while`].
     pub unsafe fn for_each_live(&self, mut f: impl FnMut(LiveTask<'_>)) {
         // SAFETY: the caller's contract.
         unsafe {
-            self.walk(|task| {
+            self.for_each_live_while(|task| {
+                f(task);
+                true
+            });
+        }
+    }
+
+    /// Runs `f` on every live task (linked, not complete, with a reference), newest first, until
+    /// it returns `false`.
+    ///
+    /// # Safety
+    /// The caller is the lane thread of an open registry, and `f` neither spawns, completes
+    /// nor frees a task.
+    pub unsafe fn for_each_live_while(&self, mut f: impl FnMut(LiveTask<'_>) -> bool) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.walk_while(|task| {
                 let state = task.as_ref().state().load();
-                if is_live(state) {
-                    f(LiveTask {
+                !is_live(state)
+                    || f(LiveTask {
                         task,
                         state,
                         _list: PhantomData,
-                    });
-                }
+                    })
             });
         }
+    }
+
+    /// Runs `f` on every live task of a closed registry (the runtime is being dropped), from
+    /// whichever thread asks, until it returns `false`: what a `finally` of a task the shutdown
+    /// cancels sees when it lists a scope's tasks. The walk holds the registry's lock, so `f`
+    /// must not complete, spawn or free a task. Tasks another thread is polling are left out
+    /// (their scope slot is that thread's to write); `polling`, the header of the task this
+    /// thread is polling, is not.
+    ///
+    /// Returns whether the registry is closed (else nothing ran).
+    pub fn for_each_live_closed(
+        &self,
+        polling: Option<&Header>,
+        mut f: impl FnMut(LiveTask<'_>) -> bool,
+    ) -> bool {
+        if !self.is_closed() {
+            return false;
+        }
+        let _locked = self.lock();
+        // SAFETY: the lock is held on a closed registry.
+        unsafe {
+            self.walk_while(|task| {
+                let state = task.as_ref().state().load();
+                let ours = polling.is_some_and(|polling| ptr::eq(polling, task.as_ptr()));
+                if !is_live(state) || (state.is_running() && !ours) {
+                    return true;
+                }
+                f(LiveTask {
+                    task,
+                    state,
+                    _list: PhantomData,
+                })
+            });
+        }
+        true
     }
 }
 

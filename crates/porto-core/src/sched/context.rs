@@ -1,7 +1,6 @@
 //! Which lane this thread is running, if any: what `spawn`, wakes and timers look up.
 
 use std::cell::Cell;
-use std::marker::PhantomData;
 use std::ptr;
 
 use super::lane::Lane;
@@ -82,7 +81,7 @@ pub(crate) fn current_tick() -> Option<(usize, u32)> {
 
 /// Marks this thread as running a lane until dropped.
 pub(crate) struct Enter<'a> {
-    _lane: PhantomData<&'a Lane>,
+    lane: &'a Lane,
 }
 
 impl<'a> Enter<'a> {
@@ -96,12 +95,20 @@ impl<'a> Enter<'a> {
             );
             current.set(lane);
         });
-        Self { _lane: PhantomData }
+        // For snapshot requests, which a lane that is not running cannot take.
+        lane.remote()
+            .entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self { lane }
     }
 }
 
 impl Drop for Enter<'_> {
     fn drop(&mut self) {
         CURRENT.with(|current| current.set(ptr::null()));
+        self.lane
+            .remote()
+            .entered
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }

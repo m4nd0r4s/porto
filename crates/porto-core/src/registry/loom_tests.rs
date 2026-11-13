@@ -171,6 +171,46 @@ fn a_completion_races_a_waker_dropped_off_the_lane() {
     });
 }
 
+/// Two linked tasks: the lane completes the newer one, which unlinks it and rewrites the older
+/// one's `prev` link, while another thread drops the older one's last waker and asks whether it
+/// is linked (and pushes it as a zombie): the older task is freed once, by the lane, and the list
+/// ends empty.
+#[test]
+fn unlinking_a_neighbour_races_the_last_waker_of_the_adjacent_task() {
+    loom::model(|| {
+        ON_LANE.with(|on| on.set(true));
+        let lane = Lane::new();
+        let (older, stash, dropped_older) = parked_task(&lane);
+        lane.link(&older);
+        older.run();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let counter = DropCounter(finished.clone());
+        let (newer, join) = new_joinable_task(
+            poll_fn(move |_| {
+                let _counter = &counter;
+                Poll::Ready(())
+            }),
+            lane.clone(),
+        );
+        drop(join);
+        lane.link(&newer);
+        let waker = stash.lock().unwrap().take().expect("the older task parked");
+        let other = thread::spawn(move || drop(waker));
+        newer.run();
+        lane.free_zombies();
+        other.join().unwrap();
+        lane.free_zombies();
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dropped_older.load(Ordering::SeqCst),
+            1,
+            "freed exactly once"
+        );
+        assert_eq!(lane.live(), 0);
+        assert!(!lane.registry.has_zombies());
+    });
+}
+
 /// The shutdown (close, cancel-all until nothing is left) races a wake of a parked task from
 /// another thread: the task is cancelled once, however the two interleave, and nothing stays
 /// linked.

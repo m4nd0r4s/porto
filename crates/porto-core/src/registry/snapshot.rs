@@ -98,6 +98,9 @@ pub(crate) fn record_of(task: &super::LiveTask<'_>) -> TaskRecord {
 pub enum SnapshotError {
     /// The runtime was dropped before a lane took the snapshot.
     RuntimeClosed,
+    /// A lane is not running: no thread is inside its `block_on` or `run_until_idle`, so
+    /// nothing would take the snapshot.
+    LaneNotRunning,
 }
 
 impl fmt::Display for SnapshotError {
@@ -107,34 +110,48 @@ impl fmt::Display for SnapshotError {
                 "porto: the runtime was dropped before it took the task snapshot; request it \
                  while the runtime runs",
             ),
+            Self::LaneNotRunning => f.write_str(
+                "porto: a lane of the runtime is not running, so no one can take the task \
+                 snapshot: request it from a task, or from another thread while block_on runs",
+            ),
         }
     }
 }
 
 impl std::error::Error for SnapshotError {}
 
+/// Whether a lane is running (a thread is inside its loop), or its runtime is gone.
+pub(crate) type LaneRunning = Box<dyn Fn(usize) -> bool + Send + Sync>;
+
 /// What each lane delivers into and the requester waits on.
 pub(crate) struct SnapshotCell {
     state: Mutex<Collected>,
     ready: Condvar,
+    lane_running: LaneRunning,
 }
 
 struct Collected {
     /// Lanes that have not delivered yet.
-    pending: usize,
+    pending: Vec<usize>,
     records: Vec<TaskRecord>,
     closed: bool,
 }
 
+/// How long a waiter sleeps before it looks again whether the lanes it waits for run.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
+/// How many looks in a row find a lane not running before the wait gives up.
+const IDLE_LOOKS: u32 = 5;
+
 impl SnapshotCell {
-    pub(crate) fn new(lanes: usize) -> Arc<Self> {
+    pub(crate) fn new(lanes: usize, lane_running: LaneRunning) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Collected {
-                pending: lanes,
+                pending: (0..lanes).collect(),
                 records: Vec::new(),
                 closed: false,
             }),
             ready: Condvar::new(),
+            lane_running,
         })
     }
 
@@ -142,15 +159,15 @@ impl SnapshotCell {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// One lane delivers its records, or `None` if it is closed.
-    pub(crate) fn deliver(&self, records: Option<Vec<TaskRecord>>) {
+    /// Lane `lane` delivers its records, or `None` if it is closed.
+    pub(crate) fn deliver(&self, lane: usize, records: Option<Vec<TaskRecord>>) {
         let mut state = self.lock();
         match records {
             Some(records) => state.records.extend(records),
             None => state.closed = true,
         }
-        state.pending -= 1;
-        if state.pending == 0 {
+        state.pending.retain(|pending| *pending != lane);
+        if state.pending.is_empty() {
             self.ready.notify_all();
         }
     }
@@ -163,16 +180,22 @@ impl SnapshotCell {
         records.sort_unstable_by_key(|record| record.id);
         Ok(records)
     }
+
+    /// Whether every lane that has not delivered is running.
+    fn pending_lanes_run(&self, state: &Collected) -> bool {
+        state.pending.iter().all(|lane| (self.lane_running)(*lane))
+    }
 }
 
 /// A snapshot of the live tasks, requested of every lane and not yet taken: poll it with
 /// [`TaskSnapshotRequest::try_take`] or wait for it.
 ///
 /// A lane copies its tasks at its next maintenance tick (at most `event_interval` tasks from
-/// now), or at once if it is parked: the request wakes it. A lane that is not running (a runtime
-/// whose `block_on` is not called) takes it when it next runs, so waiting on a request from the
-/// only thread that can run the lane never returns: use [`Handle::task_snapshot`], which takes
-/// the snapshot directly on the lane's own thread.
+/// now), or at once if it is parked: the request wakes it. A lane that is not running (no thread
+/// is inside its `block_on` or `run_until_idle`) takes it when it next runs, so
+/// [`TaskSnapshotRequest::try_take`] may stay empty until then, and a wait gives up with
+/// [`SnapshotError::LaneNotRunning`] when a lane it waits for is not running. On a lane's own
+/// thread, [`Handle::task_snapshot`] takes the snapshot directly.
 ///
 /// [`Handle::task_snapshot`]: crate::Handle::task_snapshot
 pub struct TaskSnapshotRequest {
@@ -187,21 +210,40 @@ impl TaskSnapshotRequest {
     /// The records, sorted by task id, if every lane has delivered them.
     pub fn try_take(&self) -> Option<Result<Vec<TaskRecord>, SnapshotError>> {
         let mut state = self.cell.lock();
-        (state.pending == 0).then(|| SnapshotCell::take(&mut state))
+        state
+            .pending
+            .is_empty()
+            .then(|| SnapshotCell::take(&mut state))
     }
 
     /// Waits for every lane to deliver, then returns the records sorted by task id.
     ///
     /// # Errors
-    /// [`SnapshotError::RuntimeClosed`] if the runtime was dropped first.
+    /// [`SnapshotError::RuntimeClosed`] if the runtime was dropped first;
+    /// [`SnapshotError::LaneNotRunning`] if a lane that has not delivered stays not running for
+    /// about a quarter of a second (the owner thread outside `block_on` is such a lane): the wait
+    /// would otherwise never end.
     pub fn wait(self) -> Result<Vec<TaskRecord>, SnapshotError> {
         let mut state = self.cell.lock();
-        while state.pending > 0 {
-            state = self
+        let mut idle = 0;
+        while !state.pending.is_empty() {
+            let (next, _) = self
                 .cell
                 .ready
-                .wait(state)
+                .wait_timeout(state, WAIT_SLICE)
                 .unwrap_or_else(PoisonError::into_inner);
+            state = next;
+            if state.pending.is_empty() {
+                break;
+            }
+            if self.cell.pending_lanes_run(&state) {
+                idle = 0;
+            } else {
+                idle += 1;
+                if idle >= IDLE_LOOKS {
+                    return Err(SnapshotError::LaneNotRunning);
+                }
+            }
         }
         SnapshotCell::take(&mut state)
     }
@@ -213,7 +255,7 @@ impl TaskSnapshotRequest {
     ) -> Option<Result<Vec<TaskRecord>, SnapshotError>> {
         let deadline = Instant::now() + timeout;
         let mut state = self.cell.lock();
-        while state.pending > 0 {
+        while !state.pending.is_empty() {
             let left = deadline.checked_duration_since(Instant::now())?;
             let (next, _) = self
                 .cell
@@ -229,7 +271,7 @@ impl TaskSnapshotRequest {
 impl fmt::Debug for TaskSnapshotRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TaskSnapshotRequest")
-            .field("pending_lanes", &self.cell.lock().pending)
+            .field("pending_lanes", &self.cell.lock().pending.len())
             .finish()
     }
 }
