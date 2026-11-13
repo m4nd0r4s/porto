@@ -1,0 +1,6 @@
+# ThreadSanitizer suppressions for the nightly sanitizers workflow (sanitizers.yml). Kept empty:
+# a data race in porto-core or porto-io is a bug to fix, not to hide. An entry needs a comment
+# above it saying which race it silences, why it is benign or foreign, and the bead that removes
+# it, for example:
+#   # Foreign: <library> reads <x> racily by design (porto-xxx).
+#   race:<library>::<function>

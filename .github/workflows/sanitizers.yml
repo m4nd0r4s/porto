@@ -1,0 +1,61 @@
+name: sanitizers
+
+# ThreadSanitizer and AddressSanitizer over the tests of porto-core and porto-io, on nightly Rust
+# with the standard library rebuilt under the sanitizer (-Zbuild-std), Linux x86_64
+# (51-build-ci-release.md §2, sanitizers; 52-testing-strategy.md). porto-py is left out: the
+# free-threaded CPython TSAN leg is its own job (porto-j62.21). Runs every night and by hand;
+# a pull request starts it only when it changes this workflow or the suppressions. Not a required
+# check. A failure uploads nothing: the sanitizer report is in the job log.
+on:
+  schedule:
+    - cron: "31 3 * * *"
+  pull_request:
+    paths:
+      - .github/workflows/sanitizers.yml
+      - .github/sanitizers/**
+  workflow_dispatch:
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # -Zsanitizer and -Zbuild-std need nightly. Pinned to a date so a failure is reproducible and a
+  # nightly regression cannot fail the job on its own; bump it deliberately in its own commit.
+  NIGHTLY: nightly-2026-11-01
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  sanitizer:
+    name: ${{ matrix.sanitizer }}san (porto-core, porto-io)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, address]
+    env:
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/.github/sanitizers/tsan.supp
+      ASAN_OPTIONS: detect_leaks=1 detect_stack_use_after_return=1 strict_string_checks=1 halt_on_error=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: sanitizer-${{ matrix.sanitizer }}
+      # Newer kernels randomise mmap more than TSAN's shadow memory layout allows
+      # ("unexpected memory mapping"); the usual fix is a lower entropy.
+      - if: matrix.sanitizer == 'thread'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      # Unit and integration tests; nextest and doctests are skipped (doctests build with their
+      # own rustdoc flags and add nothing the tests do not cover). The explicit --target keeps
+      # the sanitizer flags off build scripts and proc macros.
+      - run: >-
+          cargo +"$NIGHTLY" test -Zbuild-std --target "$TARGET"
+          -p porto-core -p porto-io --lib --tests
