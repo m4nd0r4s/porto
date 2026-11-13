@@ -3,7 +3,7 @@
 
 use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Poll, Waker};
 use std::thread;
 use std::time::Duration;
@@ -392,34 +392,44 @@ fn a_task_freed_by_a_waker_dropped_off_the_lane_is_freed_by_the_lane() {
 }
 
 /// Tasks that wait on something that holds their own waker: nothing but the runtime's end can
-/// free them.
+/// free them, and the end frees them for good (no `mem::forget` here: LeakSanitizer, in the
+/// nightly sanitizers job, reports a task, its handle or its runtime that outlives it).
 #[test]
 fn dropping_the_runtime_cancels_tasks_kept_alive_by_a_waker_cycle() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let runtime = Runtime::new();
-    // Each task stores its waker in a cell the task itself owns, and the cell is also reachable
-    // from the future: task -> future -> cell -> waker -> task.
-    for _ in 0..50 {
-        let cell: Arc<Mutex<Option<Waker>>> = Arc::default();
-        let (counter, owned) = (DropCount(Arc::clone(&dropped)), Arc::clone(&cell));
-        drop(runtime.spawn(async move {
-            poll_fn(|cx| {
-                *owned.lock().unwrap() = Some(cx.waker().clone());
-                Poll::<()>::Pending
-            })
-            .await;
-            drop(counter);
-        }));
-        // The cell, with the waker in it, is leaked: no one else can ever wake the task.
-        std::mem::forget(cell);
-    }
+    // Each task stores its waker in a cell the future owns: task -> future -> cell -> waker ->
+    // task. Only a `Weak` stays outside, to see whether the cycle was freed.
+    let cells: Vec<Weak<Mutex<Option<Waker>>>> = (0..50)
+        .map(|_| {
+            let cell: Arc<Mutex<Option<Waker>>> = Arc::default();
+            let (counter, owned) = (DropCount(Arc::clone(&dropped)), Arc::clone(&cell));
+            drop(runtime.spawn(async move {
+                poll_fn(|cx| {
+                    *owned.lock().unwrap() = Some(cx.waker().clone());
+                    Poll::<()>::Pending
+                })
+                .await;
+                drop(counter);
+            }));
+            Arc::downgrade(&cell)
+        })
+        .collect();
     runtime.run_until_idle();
     assert_eq!(dropped.load(Ordering::SeqCst), 0, "all parked");
+    assert!(
+        cells.iter().all(|cell| cell.strong_count() == 1),
+        "every cycle is alive: the future owns its cell"
+    );
     drop(runtime);
     assert_eq!(
         dropped.load(Ordering::SeqCst),
         50,
         "the runtime's end cancelled every task its wakers kept alive"
+    );
+    assert!(
+        cells.iter().all(|cell| cell.strong_count() == 0),
+        "the cancelled futures freed their cells, and with them the wakers and the tasks"
     );
 }
 
