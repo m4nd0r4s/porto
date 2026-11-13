@@ -51,6 +51,9 @@ TESTS = Path(__file__).resolve().parent.parent
 #: How late a timer may fire on a loaded CI machine before a test calls it a hang.
 LATE = 5.0
 
+#: Float rounding between two reads of one clock (not scheduling slack).
+CLOCK_SLACK = 0.001
+
 #: The deeper tests of each rule, in the other files of tests/python: "file::test" (a prefix).
 RULE_INDEX: dict[str, tuple[str, ...]] = {
     "C1": ("test_cancellation.py::test_C1_level_triggered",),
@@ -304,18 +307,20 @@ def test_C8_shield_is_read_write_and_the_root_cannot_be_shielded() -> None:
 
 def test_C9_the_earlier_deadline_wins_and_a_later_one_re_arms() -> None:
     async def main() -> tuple[float, bool]:
-        started = time.monotonic()
+        # The runtime's own clock, the one the deadlines are on: ``time.monotonic()`` ticks in
+        # 15.6 ms steps on Windows, which read a 20 ms deadline as 14.99 ms (porto-41w).
+        started = porto.current_time()
         with pytest.raises(TimeoutError):
             async with porto.timeout(0.02), porto.timeout(30):
                 await porto.sleep(30)  # the outer deadline reaches the inner scope
-        elapsed = time.monotonic() - started
+        elapsed = porto.current_time() - started
         async with porto.move_on_after(30) as s:
             s.deadline = porto.current_time() + 0.01
             await porto.sleep(30)
         return elapsed, s.timed_out
 
     elapsed, timed_out = porto.run(main)
-    assert 0.015 <= elapsed < LATE
+    assert 0.015 - CLOCK_SLACK <= elapsed < LATE
     assert timed_out
 
 
