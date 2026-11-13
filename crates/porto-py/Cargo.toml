@@ -23,6 +23,10 @@ porto-net.workspace = true
 pyo3.workspace = true
 socket2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# The signal numbers of the default handling (18-fs-process-signals.md §3).
+libc.workspace = true
+
 [build-dependencies]
 pyo3-build-config.workspace = true
 

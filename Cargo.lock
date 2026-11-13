@@ -661,6 +661,7 @@ dependencies = [
 name = "porto-py"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "parking_lot",
  "porto-core",
  "porto-io",

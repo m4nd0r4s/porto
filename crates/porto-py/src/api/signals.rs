@@ -14,7 +14,7 @@
 //! (Python's own SIGINT handling stays in charge there).
 
 #[cfg(unix)]
-pub(crate) use unix::end_of_run;
+pub(crate) use unix::{Callback, end_of_run, subscribe, unsubscribe};
 
 #[cfg(not(unix))]
 pub(crate) fn end_of_run() {}
@@ -48,6 +48,7 @@ mod unix {
     use std::io;
     use std::rc::Rc;
 
+    use porto_core::Handle;
     use porto_io::signal::{Signals, Subscription};
     use pyo3::exceptions::{PyOSError, PyValueError};
     use pyo3::prelude::*;
@@ -78,10 +79,9 @@ mod unix {
     }
 
     /// Opens the hub of this run if it is not open yet, and starts the task that delivers.
-    fn open(hub: &mut Option<Hub>) -> PyResult<&mut Hub> {
+    fn open<'a>(hub: &'a mut Option<Hub>, handle: &Handle) -> PyResult<&'a mut Hub> {
         if hub.is_none() {
             let driver = lane::current_driver().ok_or_else(not_in_a_run)?;
-            let handle = lane::current().ok_or_else(not_in_a_run)?;
             let signals = Signals::new(driver).map_err(|error| {
                 PyOSError::new_err(format!(
                     "porto: cannot open the signal pipe ({error}); the process may be out of \
@@ -129,14 +129,15 @@ mod unix {
         }
     }
 
-    /// Starts calling `callback` with each of `signums` that arrives, on the lane, until
-    /// [`unsubscribe`] or the end of the run. Returns the subscription's id.
+    /// Starts calling `callback` with each of `signums` that arrives, on the lane of the run
+    /// `handle` belongs to, until [`unsubscribe`] or the end of the run. Returns the
+    /// subscription's id.
     ///
     /// # Errors
     /// `ValueError` for a number that cannot be received, `OSError` if the OS refuses.
-    pub(crate) fn subscribe(signums: &[i32], callback: Callback) -> PyResult<u64> {
+    pub(crate) fn subscribe(handle: &Handle, signums: &[i32], callback: Callback) -> PyResult<u64> {
         HUB.with_borrow_mut(|hub| {
-            let hub = open(hub)?;
+            let hub = open(hub, handle)?;
             let mut subscriptions = Vec::with_capacity(signums.len());
             for &signum in signums {
                 subscriptions.push(hub.signals.subscribe(signum).map_err(|error| {
@@ -209,7 +210,8 @@ mod unix {
                 error.write_unraisable(py, Some(callback.bind(py)));
             }
         });
-        let id = subscribe(&signums, callback)?;
+        let handle = lane::current().ok_or_else(not_in_a_run)?;
+        let id = subscribe(&handle, &signums, callback)?;
         Ok(SignalSubscription { id })
     }
 

@@ -26,7 +26,6 @@ pub(crate) enum Cause {
     /// SIGINT: `porto.run` raises `KeyboardInterrupt` after the shutdown.
     Interrupt,
     /// SIGTERM: `porto.run` raises `porto.Terminated` after the shutdown.
-    #[allow(dead_code, reason = "made by the signal receiver")]
     Terminate,
 }
 

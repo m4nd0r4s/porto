@@ -26,6 +26,7 @@ static RESOLVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 ///
 /// The M1 single-lane runtime uses `io_backend`, `io_backend_strict`, `timer_resolution`,
 /// `coop_budget`, `blocking_threads`, `blocking_keepalive` (the blocking pool, spec 19 §1),
+/// `graceful_timeout` (how long main may take to finish once a shutdown was requested, 26 §2),
 /// `cancel_timeout` (how long `porto.run` waits for the root scope's tasks, C12), `debug`
 /// (the swallowed-`Cancelled` warning, C11) and `handle_signals` (whether the signal receiver
 /// start step applies, 26 §2) only; the other fields are checked (in Python) and
@@ -61,6 +62,10 @@ pub(crate) fn resolve(
         .getattr(pyo3::intern!(py, "cancel_timeout"))?
         .extract()?;
     let cancel_timeout = Duration::try_from_secs_f64(cancel_timeout).unwrap_or(Duration::MAX);
+    let graceful_timeout: f64 = resolved
+        .getattr(pyo3::intern!(py, "graceful_timeout"))?
+        .extract()?;
+    let graceful_timeout = Duration::try_from_secs_f64(graceful_timeout).unwrap_or(Duration::MAX);
     let io_backend: String = resolved
         .getattr(pyo3::intern!(py, "io_backend"))?
         .extract()?;
@@ -99,6 +104,7 @@ pub(crate) fn resolve(
         .blocking_threads(blocking_threads)
         .blocking_keepalive(blocking_keepalive)
         .cancel_timeout(cancel_timeout)
+        .graceful_timeout(graceful_timeout)
         .build()
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }

@@ -54,8 +54,8 @@ thread_local! {
 
 /// `porto.run(main, *args, config=None, **overrides)`: runs `main(*args)` (or the coroutine
 /// object `main`) as the main task of a fresh runtime whose lane 0 is this thread, and returns
-/// its result or raises its exception. Ctrl-C raises `KeyboardInterrupt` out of it, also while
-/// every task sleeps. The configuration is resolved first, so an invalid one raises before
+/// its result or raises its exception. Ctrl-C raises `KeyboardInterrupt` out of it after the
+/// shutdown (SIGTERM: `porto.Terminated`), also while every task sleeps (`handle_signals`, 18 §3). The configuration is resolved first, so an invalid one raises before
 /// `main` is called. A coroutine object `main` that is rejected is closed.
 #[pyfunction]
 #[pyo3(signature = (main, /, *args, config=None, **overrides))]
@@ -110,6 +110,7 @@ fn run_in_root_scope(
             config,
             startup::on_main_thread(py),
             runtime_object.get().lifecycle(),
+            runtime.handle(),
         )?;
         // Owned by no task: nobody enters or exits it.
         let node = PyScopeNode::new_root(0);
