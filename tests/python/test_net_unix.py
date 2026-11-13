@@ -203,7 +203,9 @@ def test_the_mode_is_exact_whatever_the_processs_umask(unix_socket_path: str) ->
         os.umask(previous)
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores file permissions"
+)
 def test_a_socket_without_write_permission_cannot_be_connected_to(unix_socket_path: str) -> None:
     async def main() -> None:
         async with await net.listen_unix(unix_socket_path, mode=0o400):
