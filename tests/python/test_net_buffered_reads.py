@@ -3,14 +3,17 @@
 first. Over loopback, like ``test_net_tcp.py``; I/O needs the Unix backends.
 """
 
+import socket
 import sys
+import threading
+import time
 from collections.abc import Coroutine
 from typing import Any
 
 import pytest
 
 import porto
-from porto import net
+from porto import _core, net
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="registering raw sockets needs the AFD backend (Windows)"
@@ -511,3 +514,140 @@ def test_a_peer_reset_is_an_os_error_not_an_incomplete_read() -> None:
                 await server.read_exact(4)
 
     run(main())
+
+
+# Large reads cost linear time and do not starve the lane
+
+
+MEBIBYTE = 1 << 20
+
+
+def sending_thread(port: int, size: int, tail: bytes = b"") -> threading.Thread:
+    """A peer that is not porto: sends `size` bytes as fast as it can, then `tail`, and closes."""
+
+    def send() -> None:
+        with socket.create_connection((LOOPBACK, port)) as sock:
+            chunk = b"x" * MEBIBYTE
+            for _ in range(size // MEBIBYTE):
+                sock.sendall(chunk)
+            sock.sendall(b"x" * (size % MEBIBYTE) + tail)
+
+    thread = threading.Thread(target=send, daemon=True)
+    thread.start()
+    return thread
+
+
+async def accept_from_sender(size: int, tail: bytes = b"") -> tuple[net.TcpStream, net.TcpListener]:
+    listener = await net.listen_tcp(LOOPBACK)
+    sending_thread(listener.port, size, tail)
+    return await listener.accept(), listener
+
+
+@pytest.mark.parametrize("call", ["read_to_end", "read_until", "read_exact"])
+def test_reading_64_mib_takes_linear_time(call: str) -> None:
+    size = 64 * MEBIBYTE
+
+    async def main() -> tuple[int, float]:
+        stream, listener = await accept_from_sender(size - 1, b"\n")
+        async with stream, listener:
+            started = time.perf_counter()
+            if call == "read_to_end":
+                data = await stream.read_to_end(limit=size)
+            elif call == "read_until":
+                data = await stream.read_until(b"\n", limit=size)
+            else:
+                data = await stream.read_exact(size)
+            return len(data), time.perf_counter() - started
+
+    length, seconds = run(main())
+    assert length == size
+    # Quadratic growth took 4 to 40 seconds; this is generous for a slow CI machine.
+    assert seconds < 5.0, f"{call} of 64 MiB took {seconds:.1f} s"
+
+
+def test_a_large_read_from_a_fast_peer_lets_other_tasks_run() -> None:
+    size = 64 * MEBIBYTE
+
+    async def main() -> int:
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                await porto.checkpoint()
+                ticks += 1
+
+        stream, listener = await accept_from_sender(size)
+        async with stream, listener, porto.scope() as s:
+            s.spawn(ticker())
+            await stream.read_to_end(limit=size)
+            s.cancel()
+        return ticks
+
+    # The lane is yielded every MiB received: dozens of turns for the ticker (without it, none).
+    assert run(main()) >= 20
+
+
+# An idle stream holds no receive storage
+
+
+def test_reads_that_waited_and_gave_up_leave_no_storage_with_the_stream() -> None:
+    async def main() -> tuple[int, int]:
+        listener = await net.listen_tcp(LOOPBACK)
+        async with listener:
+            clients = [await net._connect_tcp_numeric(LOOPBACK, listener.port) for _ in range(50)]  # pyright: ignore[reportPrivateUsage]
+            servers = [await listener.accept() for _ in range(50)]
+            before = sum(row[3] for row in _core._buffer_pool_stats())  # pyright: ignore[reportPrivateUsage]
+
+            async def give_up(stream: net.TcpStream, size: int) -> None:
+                async with porto.move_on_after(0.02):
+                    if size:
+                        await stream.read_exact(size)
+                    else:
+                        await stream.readline()
+
+            async with porto.scope() as s:
+                for number, stream in enumerate(servers):
+                    s.spawn(give_up(stream, 0 if number % 2 else 1 << 20))
+            after = sum(row[3] for row in _core._buffer_pool_stats())  # pyright: ignore[reportPrivateUsage]
+            # Each stream can still read: nothing was lost, nothing is held.
+            await clients[0].write(b"hi\n")
+            assert await servers[0].readline() == b"hi\n"
+            for stream in [*clients, *servers]:
+                await stream.aclose()
+            return before, after
+
+    before, after = run(main())
+    # 100 reads that waited, 50 of them for 1 MiB: if each kept its storage, each would have
+    # taken one from the pool (a miss); returned at once, one buffer is reused by all.
+    assert after - before <= 4, f"{after - before} pool misses: idle streams hold storage"
+
+
+# LimitOverrunError.consumed
+
+
+def test_limit_overrun_says_how_many_bytes_are_buffered() -> None:
+    async def main() -> list[tuple[int, bytes]]:
+        client, server, listener = await connected()
+        async with client, server, listener:
+            found: list[tuple[int, bytes]] = []
+            await client.write(b"x" * 100)
+            with pytest.raises(porto.LimitOverrunError) as until:
+                await server.read_until(b"\n", limit=10)
+            found.append((until.value.consumed, await server.read_exact(until.value.consumed)))
+            assert await server.read_exact(90) == b"x" * 90  # what the first read left unread
+            await client.write(b"y" * 50)
+            await client.aclose()
+            with pytest.raises(porto.LimitOverrunError) as to_end:
+                await server.read_to_end(limit=20)
+            found.append((to_end.value.consumed, await server.read_exact(to_end.value.consumed)))
+            return found
+
+    assert run(main()) == [(10, b"x" * 10), (21, b"y" * 21)]
+
+
+def test_limit_overrun_survives_pickling() -> None:
+    import pickle
+
+    error = pickle.loads(pickle.dumps(porto.LimitOverrunError("too much", 7)))
+    assert (str(error), error.consumed) == ("too much", 7)

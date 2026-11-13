@@ -46,6 +46,7 @@ from typing import NoReturn
 
 from porto import _core
 from porto._core import Semaphore, Started, TcpListener, TcpStream, scope
+from porto.errors import ClosedResourceError, IncompleteReadError
 
 __all__ = ["TcpListener", "TcpStream", "listen_tcp", "serve_tcp"]
 
@@ -117,7 +118,10 @@ async def serve_tcp(
     with the handler, and a failure of one fails the handler, not the server. The connection is
     closed when the handler returns, raises or is cancelled. A handler that raises an
     ``Exception`` is logged on the ``porto.net`` logger (error level, with the traceback) and
-    the server goes on; ``Cancelled`` and other ``BaseException`` propagate as always.
+    the server goes on; ``Cancelled`` and other ``BaseException`` propagate as always. A handler
+    that lets a client's disconnect escape (``IncompleteReadError``, a ``ConnectionError`` such as
+    ``ConnectionResetError`` or ``BrokenPipeError``, ``ClosedResourceError``) is not a bug and is
+    logged at debug level only. Accepted streams have ``TCP_NODELAY`` set, like asyncio's.
 
     ``max_connections`` (a positive int, ``None`` for no limit) bounds the connections served
     at once: at the limit the server stops accepting until one ends, and further clients wait in
@@ -147,7 +151,9 @@ async def serve_tcp(
             "of connections at once"
         )
     slots = None if max_connections is None else Semaphore(max_connections)
-    async with await listen_tcp(host, port) as listener, scope(name="serve_tcp") as server:
+    # The listener is the inner context, so it closes first when the server stops: new
+    # connections are refused at once while the handlers still running are cancelled and awaited.
+    async with scope(name="serve_tcp") as server, await listen_tcp(host, port) as listener:
         if started is not None:
             started.set(listener.port)
         while True:
@@ -179,6 +185,15 @@ async def _serve_connection(
         try:
             async with stream, scope(name="connection"):
                 await handler(stream)
+        except (IncompleteReadError, ConnectionError, ClosedResourceError) as error:
+            # The client went away (a handler that does not catch it): not a bug, so not an error.
+            _logger.debug(
+                "porto: serve_tcp's handler for the connection from %s ended because the client "
+                "disconnected (%r)",
+                _peer(stream),
+                error,
+                exc_info=error,
+            )
         except Exception as error:
             _logger.error(
                 "porto: serve_tcp's handler for the connection from %s failed with %r; the "

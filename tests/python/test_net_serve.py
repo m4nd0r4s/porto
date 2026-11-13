@@ -6,6 +6,8 @@ with porto clients (``_connect_tcp_numeric``); I/O needs the Unix backends.
 import errno
 import functools
 import logging
+import os
+import socket
 import sys
 from collections.abc import Coroutine
 from typing import Any
@@ -301,3 +303,103 @@ def test_a_host_name_is_a_value_error_until_the_resolver_lands() -> None:
             await net.serve_tcp(echo, "localhost")
 
     run(main())
+
+
+def nodelay_of(stream: net.TcpStream) -> int:
+    """The stream's TCP_NODELAY, read through a duplicate of its descriptor."""
+    with socket.socket(fileno=os.dup(stream.fileno())) as duplicate:
+        return duplicate.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+
+
+def test_accepted_streams_have_tcp_nodelay_like_asyncios() -> None:
+    seen: list[int] = []
+
+    async def handler(stream: net.TcpStream) -> None:
+        seen.append(nodelay_of(stream))
+        await stream.write(b"ok")
+
+    async def main() -> int:
+        async with await net.listen_tcp(LOOPBACK) as listener:
+            client = await connect(listener.port)
+            async with client, await listener.accept() as accepted:
+                accepted_nodelay = nodelay_of(accepted)
+                accepted.set_nodelay(False)  # it can still be turned off
+                assert nodelay_of(accepted) == 0
+        async with Serving(handler) as port, await connect(port) as stream:
+            assert await stream.read_exact(2) == b"ok"
+        return accepted_nodelay
+
+    assert run(main()) != 0
+    assert seen
+    assert all(value != 0 for value in seen)
+
+
+@pytest.mark.parametrize(
+    "disconnect",
+    [
+        porto.IncompleteReadError(b"par", 10),
+        ConnectionResetError(errno.ECONNRESET, "reset"),
+        BrokenPipeError(errno.EPIPE, "broken pipe"),
+        porto.ClosedResourceError(errno.EBADF, "closed"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_a_client_disconnect_that_escapes_a_handler_is_logged_at_debug_only(
+    disconnect: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def handler(stream: net.TcpStream) -> None:
+        raise disconnect
+
+    async def main() -> bool:
+        async with Serving(handler) as port, await connect(port) as stream:
+            return await at_eof(stream)
+
+    with caplog.at_level(logging.DEBUG, logger="porto.net"):
+        assert run(main())
+    records = [r for r in caplog.records if r.name == "porto.net"]
+    assert [r.levelno for r in records] == [logging.DEBUG]
+    assert "client disconnected" in records[0].getMessage()
+
+
+def test_a_real_handler_bug_is_still_an_error(caplog: pytest.LogCaptureFixture) -> None:
+    async def handler(stream: net.TcpStream) -> None:
+        raise ValueError("a bug")
+
+    async def main() -> None:
+        async with Serving(handler) as port, await connect(port) as stream:
+            await at_eof(stream)
+
+    with caplog.at_level(logging.DEBUG, logger="porto.net"):
+        run(main())
+    [record] = [r for r in caplog.records if r.name == "porto.net"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+
+
+def test_stopping_the_server_refuses_new_connections_while_handlers_still_wind_down() -> None:
+    async def slow_to_stop(stream: net.TcpStream) -> None:
+        try:
+            await porto.sleep_forever()
+        finally:
+            with porto.shield():
+                await porto.sleep(0.4)  # cleanup that takes a while
+
+    async def main() -> tuple[bool, bool]:
+        async with await net.listen_tcp(LOOPBACK) as probe:
+            port = probe.port
+        async with porto.scope() as outer:
+            server = outer.spawn(net.serve_tcp, slow_to_stop, LOOPBACK, port)
+            await porto.sleep(0.05)
+            async with await connect(port):
+                await porto.sleep(0.05)  # the handler is running
+                server.cancel()
+                await porto.sleep(0.1)  # the handler is still in its cleanup
+                still_winding_down = not server.done()
+                try:
+                    await connect(port)
+                    refused = False
+                except OSError:  # ConnectionRefusedError on Linux, EINVAL on macOS (szb.150)
+                    refused = True
+            return still_winding_down, refused
+
+    assert run(main()) == (True, True)

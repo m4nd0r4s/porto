@@ -30,6 +30,34 @@ const EXACT_CHUNK: usize = 64 << 10;
 const SEARCH_CHUNK: usize = 4 << 10;
 const TO_END_CHUNK: usize = 16 << 10;
 
+/// How many bytes one attempt receives before it yields the lane: a peer that sends faster than
+/// the lane reads would otherwise hold it for up to the `limit` of a `read_to_end`.
+const YIELD_AFTER: usize = 1 << 20;
+
+/// The error an attempt returns after [`YIELD_AFTER`] bytes without completing: the operation
+/// yields its lane and attempts again, readiness not cleared (more may be waiting).
+#[derive(Debug)]
+pub(crate) struct YieldLane;
+
+impl YieldLane {
+    fn error() -> io::Error {
+        io::Error::other(Self)
+    }
+
+    /// Whether `error` is the request to yield.
+    pub(crate) fn is(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for YieldLane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the read yields the lane before it receives more")
+    }
+}
+
+impl std::error::Error for YieldLane {}
+
 /// What a buffered read waits for.
 pub(crate) enum ReadMode {
     /// Exactly `n` bytes.
@@ -159,16 +187,23 @@ impl BufferedRead {
     /// # Errors
     ///
     /// `WouldBlock` when the socket has nothing more and the read is not complete (what it
-    /// received stays buffered), or the receive's error.
+    /// received stays buffered), [`YieldLane`] after [`YIELD_AFTER`] bytes without completing, or
+    /// the receive's error.
     pub(crate) fn attempt(&mut self, socket: &Socket) -> io::Result<Outcome> {
         let shared = Arc::clone(&self.buffer);
         let mut buffer = shared.lock();
+        let mut received = 0;
         loop {
             if let Some(outcome) = self.check(&mut buffer) {
                 return Ok(outcome);
             }
+            if received >= YIELD_AFTER {
+                return Err(YieldLane::error());
+            }
             let (room, want) = self.room_and_want(buffer.len());
-            if buffer.fill(socket, room, want)? > 0 {
+            let arrived = buffer.fill(socket, room, want)?;
+            if arrived > 0 {
+                received += arrived;
                 continue;
             }
             // The end of the stream: nothing more will arrive.
@@ -208,10 +243,13 @@ impl Outcome {
                 } else {
                     format!("reached its limit of {limit} bytes before the stream ended")
                 };
-                Err(LimitOverrunError::new_err(format!(
-                    "porto: {call} {found}; the {buffered} bytes received so far are still \
+                Err(LimitOverrunError::new_err((
+                    format!(
+                        "porto: {call} {found}; the {buffered} bytes received so far are still \
                      buffered (nothing was consumed): read them with read(), call again with a \
                      larger limit, or close the stream if the peer should not send this much"
+                    ),
+                    buffered,
                 )))
             }
         }

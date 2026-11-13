@@ -17,6 +17,10 @@ use crate::driver::lane;
 /// The capacities of the pooled buffers, smallest first.
 pub(crate) const SIZE_CLASSES: [usize; 4] = [4 << 10, 16 << 10, 64 << 10, 256 << 10];
 
+/// The capacity of the largest pooled class: a request above it is allocated exactly and never
+/// pooled.
+pub(crate) const LARGEST_CLASS: usize = SIZE_CLASSES[SIZE_CLASSES.len() - 1];
+
 /// The most free storage one class keeps: 256 buffers of 4 KiB, ..., 4 of 256 KiB.
 const MAX_POOLED_BYTES_PER_CLASS: usize = 1 << 20;
 

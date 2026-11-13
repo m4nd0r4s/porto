@@ -30,7 +30,7 @@ use socket2::{SockAddr, Socket};
 
 use super::buffer::Buffer;
 use super::buffer_view::{PyBufferMut, PyBufferRef};
-use super::buffered::{BufferedRead, Outcome, SharedRecvBuffer};
+use super::buffered::{BufferedRead, Outcome, SharedRecvBuffer, YieldLane};
 use super::handle::IoHandle;
 use super::pool::PooledBytes;
 use super::sockaddr;
@@ -432,6 +432,12 @@ impl IoOp {
             && tcp::AcceptSkipLimit::of(error).is_some()
     }
 
+    /// Whether `error` asks the operation to yield its lane and attempt again (a buffered read
+    /// that received a lot without completing): readiness is not cleared, more may be waiting.
+    fn yields_on(&self, error: &io::Error) -> bool {
+        matches!(self, Self::ReadBuffered(_)) && YieldLane::is(error)
+    }
+
     /// `error` as the exception this operation raises.
     fn raise(&self, error: &io::Error) -> PyErr {
         match self {
@@ -509,6 +515,11 @@ impl Completed {
                     .unbind()
             }
             Self::AcceptedTcp(connection, address) => {
+                // As asyncio and uvloop do for every accepted socket: a server answers small
+                // messages, which Nagle would hold back waiting for an ACK (17 §1.2). A socket
+                // that refuses (the peer already reset it) is still handed over: its first
+                // read or write reports the real error.
+                let _ = tcp::set_nodelay(&connection, true);
                 Py::new(py, TcpStream::adopt(py, connection, Some(address))?)?.into_any()
             }
             Self::Received(bytes, address) => {
@@ -635,6 +646,8 @@ pub(crate) fn submit_claimed(
             Err(error) if op.backs_off_on(&error) => warn_accept_backs_off(py, &error),
             // The trap yields the lane before it accepts again.
             Err(error) if op.skipped_too_many(&error) => {}
+            // The trap yields the lane before it receives more.
+            Err(error) if op.yields_on(&error) => {}
             Err(error) => {
                 op.finish(Some(&error));
                 return Err(op.raise(&error));
@@ -714,6 +727,7 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option
                     warn_accept_backs_off(unsafe { Python::assume_attached() }, &error);
                     back_off(&registration).await;
                 }
+                Err(error) if op.yields_on(&error) => yield_lane().await,
                 Err(error) if op.skipped_too_many(&error) => {
                     capped_rounds += 1;
                     if capped_rounds < CAPPED_ROUNDS_BEFORE_BACKOFF {

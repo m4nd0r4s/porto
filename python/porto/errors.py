@@ -100,7 +100,20 @@ class LimitOverrunError(PortoError):
     """A read went past its ``limit`` without finding the separator (``read_until``,
     ``readline``) or reaching the end of the stream (``read_to_end``). Nothing was consumed: the
     bytes received so far are still buffered. Read them with ``read()``, pass a larger ``limit``,
-    or close the stream if the peer should not send this much."""
+    or close the stream if the peer should not send this much.
+
+    ``consumed`` is how many bytes are buffered and unconsumed (``read_exact(e.consumed)`` takes
+    them): at least ``limit`` for ``read_until``/``readline``, ``limit + 1`` for
+    ``read_to_end``, more if earlier reads left bytes in the buffer."""
+
+    consumed: int
+
+    def __init__(self, message: str, consumed: int = 0) -> None:
+        super().__init__(message)
+        self.consumed = consumed
+
+    def __reduce__(self) -> tuple[type["LimitOverrunError"], tuple[str, int]]:
+        return type(self), (str(self), self.consumed)
 
 
 class Lagged(PortoError):

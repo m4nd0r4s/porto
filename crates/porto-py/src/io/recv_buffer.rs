@@ -15,7 +15,7 @@ use std::io;
 
 use socket2::Socket;
 
-use super::pool::PooledBytes;
+use super::pool::{self, PooledBytes};
 
 /// The unconsumed bytes of a stream.
 #[derive(Default)]
@@ -95,7 +95,18 @@ impl RecvBuffer {
     /// `socket.recv`'s error (`WouldBlock` when nothing arrived yet: the buffer is unchanged),
     /// or `OutOfMemory` when the storage cannot grow.
     pub(crate) fn fill(&mut self, socket: &Socket, room: usize, want: usize) -> io::Result<usize> {
-        let want = want.clamp(1, room);
+        let outcome = self.try_fill(socket, room, want.clamp(1, room));
+        // Nothing arrived and nothing is buffered (a read that waits, then is cancelled, or the
+        // end of the stream): the storage taken for the receive goes back to the pool, so a
+        // stream that is idle between messages holds none, however many reads gave up on it.
+        if !matches!(outcome, Ok(received) if received > 0) && self.is_empty() {
+            self.bytes = None;
+            self.start = 0;
+        }
+        outcome
+    }
+
+    fn try_fill(&mut self, socket: &Socket, room: usize, want: usize) -> io::Result<usize> {
         let bytes = self.make_room(want)?;
         let used = bytes.len();
         let spare = bytes.vec_mut().spare_capacity_mut();
@@ -109,6 +120,8 @@ impl RecvBuffer {
     }
 
     /// The storage with at least `want` bytes of spare capacity, moving or growing it if needed.
+    /// Above the pool's largest class the capacity at least doubles, so receiving `n` bytes
+    /// copies `O(n)` in all, not `O(n^2)` (a 64 MiB `read_to_end` grows in 16 KiB steps).
     fn make_room(&mut self, want: usize) -> io::Result<&mut PooledBytes> {
         let bytes = match self.bytes.take() {
             Some(bytes) => bytes,
@@ -122,7 +135,16 @@ impl RecvBuffer {
             bytes.vec_mut().drain(..self.start);
             self.start = 0;
         }
-        let grown = bytes.reserve_total(bytes.len() + want);
+        let needed = bytes.len() + want;
+        let grown = if needed > bytes.vec().capacity() && needed > pool::LARGEST_CLASS {
+            let doubled = needed.max(bytes.vec().capacity().saturating_mul(2));
+            // If the doubled storage cannot be had, the exact one may.
+            bytes
+                .reserve_total(doubled)
+                .or_else(|_| bytes.reserve_total(needed))
+        } else {
+            bytes.reserve_total(needed)
+        };
         // The storage stays with the buffer whatever happened: a failed growth keeps the bytes.
         let bytes = self.bytes.insert(bytes);
         grown.map(|()| bytes)
@@ -174,6 +196,51 @@ mod tests {
         assert_eq!(buffer.take(100), b" world");
         assert!(buffer.is_empty());
         assert!(buffer.bytes.is_none(), "the storage went back to the pool");
+    }
+
+    #[test]
+    fn a_receive_that_found_nothing_gives_the_storage_back_while_the_buffer_is_empty() {
+        let (socket, mut writer) = pair();
+        let mut buffer = RecvBuffer::default();
+        let error = buffer.fill(&socket, 100, 100).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(buffer.bytes.is_none(), "an idle buffer holds no storage");
+        // With bytes buffered, a receive that finds nothing more keeps them and their storage.
+        writer.write_all(b"abc").unwrap();
+        assert_eq!(buffer.fill(&socket, 100, 100).unwrap(), 3);
+        assert!(buffer.fill(&socket, 100, 100).is_err());
+        assert_eq!(buffer.data(), b"abc");
+        assert!(buffer.bytes.is_some());
+        // The end of the stream with nothing buffered also leaves none.
+        let (socket, writer) = pair();
+        let mut buffer = RecvBuffer::default();
+        drop(writer);
+        assert_eq!(buffer.fill(&socket, 100, 100).unwrap(), 0);
+        assert!(buffer.bytes.is_none());
+    }
+
+    #[test]
+    fn storage_above_the_largest_class_grows_geometrically() {
+        let mut buffer = RecvBuffer::default();
+        let mut reallocations = 0;
+        let mut capacity = 0;
+        for _ in 0..(64 << 20) / (16 << 10) {
+            let bytes = buffer.make_room(16 << 10).unwrap();
+            let grown = bytes.vec().capacity();
+            if grown != capacity {
+                reallocations += 1;
+                capacity = grown;
+            }
+            // Pretend 16 KiB arrived.
+            let length = bytes.len();
+            bytes.vec_mut().resize(length + (16 << 10), 0);
+        }
+        assert_eq!(buffer.len(), 64 << 20);
+        // 4 KiB to 256 KiB is up to four classes; doubling from there to 64 MiB is eight more.
+        assert!(
+            reallocations <= 16,
+            "{reallocations} reallocations for 64 MiB"
+        );
     }
 
     #[test]

@@ -463,8 +463,9 @@ class TcpStream:
     ) -> Awaitable[bytes]:
         """Receives up to and including the first ``sep`` (not empty), which has to end within
         the first ``limit`` bytes (``limit >= len(sep)``): otherwise ``porto.LimitOverrunError``,
-        with the bytes received so far left buffered. If the stream ends first it raises
-        ``porto.IncompleteReadError`` (``.partial`` is what arrived). Scans the stream's receive
+        with the bytes received so far left buffered (``.consumed`` says how many). If the
+        stream ends first it raises ``porto.IncompleteReadError`` (``.partial`` is what
+        arrived). Scans the stream's receive
         buffer without copying; a cancelled call loses nothing."""
 
     def readline(self, limit: int = 65536) -> Awaitable[bytes]:
