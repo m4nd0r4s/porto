@@ -16,11 +16,11 @@
 //! that arrive close together are delivered once (as the kernel coalesces a pending signal).
 //!
 //! **Repeated signals chain.** A subscription made with [`Signals::subscribe_chained`] also
-//! calls the disposition it replaced (Python's C handler for SIGINT) when the signal arrives
-//! again while the previous one is still pending, that is, while the lane has not run its
-//! reader: a lane stuck in synchronous code cannot act on the first Ctrl-C, and Python's handler
-//! then trips the interpreter's eval breaker, so the second Ctrl-C raises `KeyboardInterrupt`
-//! in that code.
+//! calls the disposition it replaced (Python's C handler for SIGINT) from the second arrival of
+//! the signal on, whether or not the reader took the first: a lane stuck in synchronous code
+//! (before or after it acted on the first Ctrl-C) cannot do anything else, and Python's handler
+//! trips the interpreter's eval breaker, so the second Ctrl-C raises `KeyboardInterrupt` in that
+//! code, as with `asyncio.Runner`.
 
 use std::io::{self, Read};
 use std::mem::MaybeUninit;
@@ -43,6 +43,10 @@ static WRITE_FDS: [AtomicI32; SIGNAL_SLOTS] = [const { AtomicI32::new(-1) }; SIG
 
 /// How many times each signal arrived since [`Signals::next`] last took it.
 static PENDING: [AtomicU32; SIGNAL_SLOTS] = [const { AtomicU32::new(0) }; SIGNAL_SLOTS];
+
+/// How many times each signal arrived since it was subscribed, whatever the reader took: from the
+/// second on, a chaining subscription calls the replaced handler every time.
+static SEEN: [AtomicU32; SIGNAL_SLOTS] = [const { AtomicU32::new(0) }; SIGNAL_SLOTS];
 
 /// The handler each signal's handler chains to on a repeat, as a function address; 0 for none
 /// (the default or ignore disposition, or a handler that takes `siginfo`).
@@ -85,14 +89,15 @@ extern "C" fn on_signal(signum: libc::c_int) {
     {
         let fd = slot.load(Ordering::Relaxed);
         if fd >= 0 {
-            let pending = PENDING[index].fetch_add(1, Ordering::AcqRel);
+            PENDING[index].fetch_add(1, Ordering::AcqRel);
+            let seen = SEEN[index].fetch_add(1, Ordering::AcqRel);
             // Signal numbers are below 256.
             let byte = u8::try_from(signum).unwrap_or(u8::MAX);
             // SAFETY: `write` is async-signal-safe; `fd` is the write end of a pipe that stays
             // open while a subscription to this signal exists, and the buffer is one live byte.
             // A failed write (full pipe) loses only the wakeup: the pending count stays.
             let _ = unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
-            if pending > 0 && CHAIN[index].load(Ordering::Relaxed) {
+            if seen > 0 && CHAIN[index].load(Ordering::Relaxed) {
                 let previous = PREVIOUS[index].load(Ordering::Relaxed);
                 if previous != 0 {
                     // SAFETY: `previous` was stored by `install` from a `sigaction` whose
@@ -196,7 +201,17 @@ impl Signals {
         let mut slots = lock_slots();
         let slot = &mut slots[index];
         if slot.subscribers == 0 {
-            let previous = install(signum)?;
+            // Before the handler is installed, so a signal that arrives at once is not dropped.
+            PENDING[index].store(0, Ordering::Release);
+            SEEN[index].store(0, Ordering::Release);
+            WRITE_FDS[index].store(fd, Ordering::Release);
+            let previous = match install(signum) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    WRITE_FDS[index].store(-1, Ordering::Release);
+                    return Err(error);
+                }
+            };
             let callable = previous.sa_flags & libc::SA_SIGINFO == 0
                 && previous.sa_sigaction != libc::SIG_DFL
                 && previous.sa_sigaction != libc::SIG_IGN
@@ -205,9 +220,7 @@ impl Signals {
                 if callable { previous.sa_sigaction } else { 0 },
                 Ordering::Release,
             );
-            PENDING[index].store(0, Ordering::Release);
             slot.previous = Some(previous);
-            WRITE_FDS[index].store(fd, Ordering::Release);
         } else if WRITE_FDS[index].load(Ordering::Acquire) != fd {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -274,7 +287,11 @@ fn install(signum: i32) -> io::Result<libc::sigaction> {
     // SAFETY: `sigaction` is plain data; zeroed is a valid empty value to fill in.
     let mut action: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
     action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-    action.sa_flags = libc::SA_RESTART;
+    // No `SA_RESTART`, as Python installs its own handlers: a blocking syscall of the lane
+    // (`recv`, `read`, a lock wait) returns `EINTR` so the chained Python handler's
+    // `KeyboardInterrupt` is raised by the code that made it, instead of the syscall resuming.
+    // The driver's poll treats `EINTR` as a wakeup.
+    action.sa_flags = 0;
     // SAFETY: `action.sa_mask` is a valid sigset to initialize.
     unsafe { libc::sigfillset(&raw mut action.sa_mask) };
     let mut previous = MaybeUninit::<libc::sigaction>::zeroed();
@@ -325,6 +342,7 @@ impl Drop for Subscription {
             WRITE_FDS[self.index].store(-1, Ordering::Release);
             PREVIOUS[self.index].store(0, Ordering::Release);
             PENDING[self.index].store(0, Ordering::Release);
+            SEEN[self.index].store(0, Ordering::Release);
         }
     }
 }
@@ -338,6 +356,20 @@ static FORK_LOCKED: AtomicBool = AtomicBool::new(false);
 pub fn prepare_fork() {
     std::mem::forget(SLOTS.lock());
     FORK_LOCKED.store(true, Ordering::Release);
+}
+
+/// Like [`prepare_fork`], without waiting: `false` if another thread holds the lock. A caller
+/// that holds the GIL retries with the GIL released in between, so that the holder (which may
+/// need the GIL to finish) is never waited for with it.
+pub fn try_prepare_fork() -> bool {
+    match SLOTS.try_lock() {
+        Some(guard) => {
+            std::mem::forget(guard);
+            FORK_LOCKED.store(true, Ordering::Release);
+            true
+        }
+        None => false,
+    }
 }
 
 /// After `fork()` in the parent: lets the slots go.
@@ -361,6 +393,7 @@ pub fn forget_in_child() {
     for (index, target) in WRITE_FDS.iter().enumerate() {
         target.store(-1, Ordering::Release);
         PENDING[index].store(0, Ordering::Release);
+        SEEN[index].store(0, Ordering::Release);
         PREVIOUS[index].store(0, Ordering::Release);
         CHAIN[index].store(false, Ordering::Release);
     }

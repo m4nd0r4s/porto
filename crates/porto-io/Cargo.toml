@@ -10,10 +10,11 @@ publish.workspace = true
 
 [dependencies]
 mio.workspace = true
-parking_lot.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# The signal table's lock, which `fork()` hooks hold across the fork (`force_unlock`).
+parking_lot.workspace = true
 
 [lints]
 workspace = true

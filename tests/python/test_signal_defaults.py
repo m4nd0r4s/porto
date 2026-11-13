@@ -432,3 +432,59 @@ print("done", flush=True)
     child.signal(signal.SIGTERM)
     assert child.finish() == 0, child.stderr()
     assert child.seen == ["ready", "custom term", "done"]
+
+
+def test_a_second_sigint_interrupts_a_main_blocked_in_a_socket_recv() -> None:
+    child = Child(
+        """
+import socket
+import porto
+
+async def main():
+    left, right = socket.socketpair()
+    print("ready", flush=True)
+    left.recv(1)
+
+try:
+    porto.run(main)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt", flush=True)
+"""
+    )
+    child.wait_for("ready")
+    child.signal(signal.SIGINT)
+    time.sleep(0.3)
+    assert child.process.poll() is None, "the first Ctrl-C must not restart-and-ignore or exit"
+    child.signal(signal.SIGINT)
+    assert child.finish() == 0, child.stderr()
+    assert child.seen == ["ready", "KeyboardInterrupt"]
+
+
+def test_a_second_sigint_interrupts_synchronous_cleanup_after_the_first_was_acted_on() -> None:
+    child = Child(
+        """
+import time
+import porto
+
+async def main():
+    try:
+        print("ready", flush=True)
+        await porto.sleep(60)
+    finally:
+        print("cleanup", flush=True)
+        time.sleep(60)
+
+try:
+    porto.run(main)
+except KeyboardInterrupt:
+    print("KeyboardInterrupt", flush=True)
+"""
+    )
+    child.wait_for("ready")
+    child.signal(signal.SIGINT)  # cancels main, which runs its blocking cleanup
+    child.wait_for("cleanup")
+    time.sleep(0.3)
+    assert child.process.poll() is None
+    child.signal(signal.SIGINT)  # the lane took the first one: this one must still interrupt
+    assert child.finish() == 0, child.stderr()
+    assert child.seen[-1] == "KeyboardInterrupt"
