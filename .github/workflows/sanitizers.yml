@@ -42,15 +42,24 @@ jobs:
     env:
       RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
       TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/.github/sanitizers/tsan.supp
-      # detect_leaks=0 until the leaks LeakSanitizer reports in porto-core's tests are triaged
-      # (porto bead: symbolize and fix them, then turn it back on).
-      ASAN_OPTIONS: detect_leaks=0 detect_stack_use_after_return=1 strict_string_checks=1 halt_on_error=1
+      # LeakSanitizer runs with the address one (detect_leaks=1). fast_unwind_on_malloc=0 records
+      # the full allocation stack of a leak (the frame-pointer unwinder misses frames in std).
+      ASAN_OPTIONS: detect_leaks=1 detect_stack_use_after_return=1 strict_string_checks=1 halt_on_error=1 fast_unwind_on_malloc=0
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/sanitizers/lsan.supp print_suppressions=0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install "$NIGHTLY" --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: sanitizer-${{ matrix.sanitizer }}
+      # Symbolized reports: the sanitizer runtimes call llvm-symbolizer, which the runner image
+      # does not put on PATH (the first ASAN run printed raw addresses only).
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends llvm
+          symbolizer="$(command -v llvm-symbolizer || ls /usr/lib/llvm-*/bin/llvm-symbolizer | sort -V | tail -n 1)"
+          echo "ASAN_SYMBOLIZER_PATH=$symbolizer" >> "$GITHUB_ENV"
+          "$symbolizer" --version
       # Newer kernels randomise mmap more than TSAN's shadow memory layout allows
       # ("unexpected memory mapping"); the usual fix is a lower entropy.
       - if: matrix.sanitizer == 'thread'

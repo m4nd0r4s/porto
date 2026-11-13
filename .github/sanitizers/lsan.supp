@@ -1,0 +1,7 @@
+# LeakSanitizer suppressions for the nightly sanitizers workflow (sanitizers.yml, LSAN_OPTIONS).
+# Kept empty: a leak in porto-core or porto-io is a bug to fix, and a test that leaks on purpose
+# is a test to fix (porto-szb.155 found one and fixed it). An entry needs a comment above it
+# saying what it leaks, why that is deliberate or foreign, and the bead that removes it, for
+# example:
+#   # Deliberate: <thing> lives for the whole process (porto-xxx).
+#   leak:<crate>::<function>
