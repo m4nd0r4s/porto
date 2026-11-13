@@ -10,19 +10,28 @@
 mod stream;
 mod tcp_listener;
 mod tcp_stream;
+mod udp;
+mod unix;
 
+use std::io;
+use std::net::IpAddr;
 use std::ops::RangeInclusive;
 
-use pyo3::exceptions::{PyOverflowError, PyValueError};
+use pyo3::exceptions::{PyNotImplementedError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use socket2::Socket;
 
+use crate::io::op::os_error;
+
 pub(crate) use tcp_stream::TcpStream;
+pub(crate) use unix::UnixStream;
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<stream::SocketStream>()?;
     module.add_class::<TcpStream>()?;
-    tcp_listener::register(module)
+    tcp_listener::register(module)?;
+    udp::register(module)?;
+    unix::register(module)
 }
 
 /// The `int` `value` (`TypeError` for anything else), which must be in `range`: a `ValueError`
@@ -66,4 +75,30 @@ fn raw_number(socket: &Socket) -> i64 {
         use std::os::windows::io::AsRawSocket;
         i64::try_from(socket.as_raw_socket()).unwrap_or(-1)
     }
+}
+
+/// `host`, the numeric IP address `call` takes (`None` for every interface): a `ValueError` that
+/// says to resolve a host name first otherwise.
+fn parse_host(host: Option<&str>, call: &str) -> PyResult<Option<IpAddr>> {
+    host.map(|host| {
+        host.parse::<IpAddr>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "porto: {call} takes a numeric IP address for host, or None for every \
+                 interface, not {host:?}; resolve the name first (await porto.net.resolve(host, \
+                 port)) and pass the address it returns"
+            ))
+        })
+    })
+    .transpose()
+}
+
+/// The exception for a socket that could not be opened: `NotImplementedError` for an option the
+/// OS lacks (`option` names the keyword argument to leave out), `OSError` with its errno else.
+fn option_error(error: &io::Error, option: &str) -> PyErr {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return PyNotImplementedError::new_err(format!(
+            "porto: {error}; leave {option}=False on this OS"
+        ));
+    }
+    os_error(error)
 }

@@ -621,6 +621,110 @@ def _listen_tcp(
 ) -> TcpListener: ...
 
 @final
+class UdpSocket:
+    """A bound UDP socket: ``porto.net.UdpSocket``, made by ``porto.net.bind_udp``. Datagrams are
+    sent and received whole; several tasks may wait to receive on one socket, each getting
+    different datagrams. A socket belongs to the ``porto.run`` that opened it."""
+
+    def send_to(
+        self, data: bytes | bytearray | memoryview | Buffer, address: _SocketAddress, /
+    ) -> Awaitable[None]:
+        """Sends ``data`` as one datagram to ``address``, a numeric ``(host, port)``. ``ValueError``
+        for more than 65535 bytes, or on a connected socket; ``OSError(EAFNOSUPPORT)`` for an
+        address of a family the socket cannot reach."""
+
+    def recv_from(self, max: int | None = None, /) -> Awaitable[tuple[bytes, _SocketAddress]]:
+        """Receives one datagram: ``(data, sender's address)``. ``max`` (1 to 65535, default 65535)
+        cuts a longer datagram, losing the rest of it. Cancelling loses no datagram."""
+
+    def connect(self, address: _SocketAddress, /) -> Awaitable[None]:
+        """Makes ``address`` the peer: ``send`` sends there, and only its datagrams are received.
+        No handshake: it does not wait. Calling it again changes the peer."""
+
+    def send(self, data: bytes | bytearray | memoryview | Buffer, /) -> Awaitable[None]:
+        """Sends ``data`` as one datagram to the peer. ``OSError(ENOTCONN)`` before ``connect``."""
+
+    def recv(self, max: int | None = None, /) -> Awaitable[bytes]:
+        """Receives one datagram of the peer, like ``recv_from`` without the address.
+        ``OSError(ENOTCONN)`` before ``connect``. Cancelling loses no datagram."""
+
+    @property
+    def port(self) -> int:
+        """The port the socket is bound to (the one the OS picked, for ``port=0``)."""
+
+    @property
+    def sockname(self) -> _SocketAddress:
+        """The address the socket is bound to; an IPv6 socket that takes IPv4 shows an IPv4 sender
+        as an IPv4-mapped address (``::ffff:a.b.c.d``)."""
+
+    @property
+    def peername(self) -> _SocketAddress:
+        """The peer ``connect`` set; ``OSError(ENOTCONN)`` before it."""
+
+    def fileno(self) -> int:
+        """The OS file descriptor (the socket handle on Windows); the socket still owns it.
+        ``porto.ClosedResourceError`` once closed."""
+
+    def aclose(self) -> Awaitable[None]:
+        """Closes the socket; operations waiting on it fail with ``porto.ClosedResourceError``.
+        Closing again does nothing."""
+
+    def __aenter__(self) -> Awaitable[Self]: ...
+    def __aexit__(self, *exception: object) -> Awaitable[None]: ...
+
+def _bind_udp(
+    host: str | None, port: int, reuse_port: bool, broadcast: bool, /
+) -> UdpSocket: ...
+
+# Unix domain sockets (17-networking-tls-dns.md §2)
+
+_UnixAddress: TypeAlias = str | bytes
+
+@final
+class UnixStream(_SocketStream):
+    """A Unix domain stream connection: ``porto.net.UnixStream``, a ``porto.abc.ByteStream``.
+    Open one with ``porto.net.connect_unix`` or ``porto.net.listen_unix(...).accept()``."""
+
+    @property
+    def peername(self) -> _UnixAddress:
+        """The peer's address: the socket's path (``str``), ``bytes`` starting with a NUL byte for
+        a Linux abstract name, ``""`` for a peer that bound no name (a connecting client)."""
+
+    @property
+    def sockname(self) -> _UnixAddress:
+        """This end's address, in the same shape."""
+
+@final
+class UnixListener:
+    """A listening Unix domain socket: ``porto.net.UnixListener``, made by
+    ``porto.net.listen_unix``. Closing it removes the socket file it created."""
+
+    def accept(self) -> Awaitable[UnixStream]:
+        """Waits for a connection and accepts it. When the process or the system is out of file
+        descriptors it waits 100 ms and tries again (logging a warning on the ``porto.net``
+        logger at most every 10 s) instead of failing."""
+
+    def __aiter__(self) -> Self: ...
+    def __anext__(self) -> Awaitable[UnixStream]: ...
+    @property
+    def sockname(self) -> _UnixAddress:
+        """The path the listener is bound to, or its abstract name (``bytes``)."""
+
+    def fileno(self) -> int:
+        """The OS file descriptor; the listener still owns it."""
+
+    def aclose(self) -> Awaitable[None]:
+        """Stops listening and removes the socket file this listener created. An ``accept()``
+        waiting on it fails with ``porto.ClosedResourceError`` and an ``async for`` over it ends.
+        Closing again does nothing."""
+
+    def __aenter__(self) -> Awaitable[Self]: ...
+    def __aexit__(self, *exception: object) -> Awaitable[None]: ...
+
+def _listen_unix(path: _UnixAddress, backlog: int, mode: int, /) -> UnixListener: ...
+def _connect_unix(path: _UnixAddress, /) -> UnixStream | None: ...
+
+@final
 class Event:
     """A flag that starts unset and, once ``set()``, stays set: every waiter, current and
     future, is released. Not clearable (Trio semantics). Thread-safe."""

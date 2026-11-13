@@ -5,17 +5,14 @@
 //! Running out of file descriptors does not fail an accept: it waits ([`IoOp`] backs off) and
 //! tries again, so a server sheds load by not accepting rather than by crashing.
 
-use std::io;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use porto_net::tcp::{self, ListenOptions};
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use socket2::SockAddr;
 
-use super::{int_in_range, raw_number};
+use super::{int_in_range, option_error, parse_host, raw_number};
 use crate::driver::ready::{ready, ready_none};
 use crate::driver::step;
 use crate::io::handle::register_on_lane;
@@ -47,17 +44,7 @@ fn listen_tcp(
     reuse_port: bool,
     dual_stack: bool,
 ) -> PyResult<TcpListener> {
-    let host = host
-        .map(|host| {
-            host.parse::<IpAddr>().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "porto: listen_tcp() takes a numeric IP address for host, or None for every \
-                     interface, not {host:?}; resolve the name first (socket.getaddrinfo) and \
-                     pass the address it returns"
-                ))
-            })
-        })
-        .transpose()?;
+    let host = parse_host(host, "listen_tcp()")?;
     let port = int_in_range(
         port,
         "listen_tcp()",
@@ -83,21 +70,12 @@ fn listen_tcp(
         reuse_port,
         dual_stack,
     })
-    .map_err(|error| listen_error(&error))?;
+    .map_err(|error| option_error(&error, "reuse_port"))?;
     let local = socket.local_addr().map_err(|error| os_error(&error))?;
     Ok(TcpListener {
         registration: register_on_lane(socket, "a TcpListener")?,
         local,
     })
-}
-
-fn listen_error(error: &io::Error) -> PyErr {
-    if error.kind() == io::ErrorKind::Unsupported {
-        return PyNotImplementedError::new_err(format!(
-            "porto: {error}; leave reuse_port=False on this OS"
-        ));
-    }
-    os_error(error)
 }
 
 #[pymethods]

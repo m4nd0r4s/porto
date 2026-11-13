@@ -34,7 +34,7 @@ use super::buffered::{BufferedRead, Outcome, SharedRecvBuffer, YieldLane};
 use super::handle::IoHandle;
 use super::pool::PooledBytes;
 use super::sockaddr;
-use crate::api::net::TcpStream;
+use crate::api::net::{TcpStream, UnixStream};
 use crate::driver::pending::IoWait;
 use crate::driver::pytask::Resume;
 use crate::driver::ready::ready;
@@ -126,12 +126,17 @@ pub(crate) enum IoOp {
     /// Accept a TCP connection → `porto.net.TcpStream`; with `ending_iteration`, a listener
     /// closed under it ends an `async for` (`StopAsyncIteration`) instead of raising.
     AcceptTcp { ending_iteration: bool },
+    /// Accept a Unix stream connection → `porto.net.UnixStream`; `ending_iteration` as for
+    /// `AcceptTcp`.
+    AcceptUnix { ending_iteration: bool },
     /// Finish a nonblocking connect → `None`, or the connect's error (`SO_ERROR`).
     Connect,
     /// Receive one datagram of at most `max` bytes → `(bytes, address)`.
     RecvFrom { max: usize },
     /// Send one datagram to `addr` → `None`.
     SendTo { data: PyBufferRef, addr: SockAddr },
+    /// Send one datagram to the peer a datagram socket is connected to → `None`.
+    Send { data: PyBufferRef },
     /// Wait until the socket is readable → `None` (raw readiness, `porto.lowlevel`).
     WaitReadable,
     /// Wait until the socket is writable → `None`.
@@ -154,6 +159,8 @@ pub(crate) enum Completed {
     Accepted(Socket, SockAddr),
     /// An accepted TCP connection and its peer's address.
     AcceptedTcp(Socket, SockAddr),
+    /// An accepted Unix stream connection and its peer's address (empty for an unbound client).
+    AcceptedUnix(Socket, SockAddr),
     /// A datagram and its sender's address.
     Received(Vec<u8>, SockAddr),
 }
@@ -195,12 +202,14 @@ impl IoOp {
             | Self::ReadBuffered(_)
             | Self::Accept
             | Self::AcceptTcp { .. }
+            | Self::AcceptUnix { .. }
             | Self::RecvFrom { .. }
             | Self::WaitReadable => Interest::READABLE,
             Self::Write { .. }
             | Self::WriteV { .. }
             | Self::Connect
             | Self::SendTo { .. }
+            | Self::Send { .. }
             | Self::WaitWritable => Interest::WRITABLE,
         }
     }
@@ -375,6 +384,10 @@ impl IoOp {
                 let (connection, address) = tcp::accept(socket)?;
                 Ok(Completed::AcceptedTcp(connection, address))
             }
+            Self::AcceptUnix { .. } => {
+                let (connection, address) = tcp::accept(socket)?;
+                Ok(Completed::AcceptedUnix(connection, address))
+            }
             Self::Connect => connect_outcome(socket),
             Self::RecvFrom { max } => {
                 let mut bytes = receive_buffer(*max)?;
@@ -385,6 +398,9 @@ impl IoOp {
             }
             Self::SendTo { data, addr } => socket
                 .send_to_with_flags(data.bytes(), addr, SEND_FLAGS)
+                .map(|_| Completed::Done),
+            Self::Send { data } => socket
+                .send_with_flags(data.bytes(), SEND_FLAGS)
                 .map(|_| Completed::Done),
             Self::WaitReadable | Self::WaitWritable => Ok(Completed::Done),
         }
@@ -480,15 +496,22 @@ impl IoOp {
     /// of descriptors, buffers or memory in an accept leaves the connection queued, so it is
     /// retried after a pause ([`tcp::ACCEPT_BACKOFF`]).
     fn backs_off_on(&self, error: &io::Error) -> bool {
-        matches!(self, Self::Accept | Self::AcceptTcp { .. }) && tcp::is_resource_exhaustion(error)
+        self.is_accept() && tcp::is_resource_exhaustion(error)
+    }
+
+    /// Whether the operation accepts connections from a listening socket.
+    fn is_accept(&self) -> bool {
+        matches!(
+            self,
+            Self::Accept | Self::AcceptTcp { .. } | Self::AcceptUnix { .. }
+        )
     }
 
     /// Whether `error` says the accept skipped [`tcp::MAX_SKIPPED_CONNECTIONS`] connections in
     /// a row: the operation yields its lane and tries again (readiness is not cleared, more
     /// may be waiting), and backs off with a warning if that keeps happening.
     fn skipped_too_many(&self, error: &io::Error) -> bool {
-        matches!(self, Self::Accept | Self::AcceptTcp { .. })
-            && tcp::AcceptSkipLimit::of(error).is_some()
+        self.is_accept() && tcp::AcceptSkipLimit::of(error).is_some()
     }
 
     /// Whether `error` asks the operation to yield its lane and attempt again (a buffered read
@@ -501,6 +524,9 @@ impl IoOp {
     fn raise(&self, error: &io::Error) -> PyErr {
         match self {
             Self::AcceptTcp {
+                ending_iteration: true,
+            }
+            | Self::AcceptUnix {
                 ending_iteration: true,
             } if ClosedResource::of(error).is_some_and(|closed| !closed.by_driver()) => {
                 PyStopAsyncIteration::new_err(())
@@ -580,6 +606,9 @@ impl Completed {
                 // read or write reports the real error.
                 let _ = tcp::set_nodelay(&connection, true);
                 Py::new(py, TcpStream::adopt(connection, Some(address))?)?.into_any()
+            }
+            Self::AcceptedUnix(connection, address) => {
+                Py::new(py, UnixStream::adopt(connection, Some(address))?)?.into_any()
             }
             Self::Received(bytes, address) => {
                 (PyBytes::new(py, &bytes), sockaddr::to_py(py, &address)?)

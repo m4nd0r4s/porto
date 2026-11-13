@@ -65,33 +65,82 @@ pub(crate) fn from_py(object: &Bound<'_, PyAny>) -> PyResult<SockAddr> {
     )))
 }
 
+/// The bytes of the Unix socket name `object` is: a `str` path (encoded as `os.fsencode` does),
+/// a `bytes` one, or an `os.PathLike`; a name starting with a NUL byte is a Linux abstract name.
+#[cfg(unix)]
+fn unix_name(object: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if let Ok(bytes) = object.cast::<PyBytes>() {
+        return Ok(bytes.as_bytes().to_vec());
+    }
+    let path: std::path::PathBuf = object.extract()?;
+    Ok(path.as_os_str().as_bytes().to_vec())
+}
+
 /// A Unix socket address from a `str` path (encoded as `os.fsencode` does) or a `bytes` one; a
 /// name starting with a NUL byte is a Linux abstract name.
 #[cfg(unix)]
 fn unix_from_py(object: &Bound<'_, PyAny>) -> PyResult<SockAddr> {
-    use std::os::unix::ffi::OsStrExt;
+    let encoded = unix_name(object)?;
+    porto_net::unix::address(&encoded).map_err(|error| invalid_unix_address(object, &error))
+}
 
-    let encoded = if let Ok(bytes) = object.cast::<PyBytes>() {
-        bytes.as_bytes().to_vec()
-    } else {
-        let path: std::path::PathBuf = object.extract()?;
-        path.as_os_str().as_bytes().to_vec()
-    };
-    let invalid = |reason: &dyn std::fmt::Display| {
-        PyValueError::new_err(format!(
-            "porto: {} is not a valid Unix socket address ({reason}); use a path of at most \
-             about 100 bytes, without NUL bytes except a leading one for a Linux abstract name",
-            object
-                .repr()
-                .map_or_else(|_| "the address".to_owned(), |repr| repr.to_string())
-        ))
-    };
-    // The kernel ends a path at its first NUL: refuse one inside a path rather than send to a
-    // shorter path than the one asked for (an abstract name may hold any byte).
-    if encoded.first().is_some_and(|&first| first != 0) && encoded.contains(&0) {
-        return Err(invalid(&"a NUL byte inside the path"));
+#[cfg(unix)]
+fn invalid_unix_address(object: &Bound<'_, PyAny>, reason: &std::io::Error) -> PyErr {
+    PyValueError::new_err(format!(
+        "porto: {} is not a valid Unix socket address ({reason}); use a path of at most about \
+         100 bytes, without NUL bytes except a leading one for a Linux abstract name",
+        object
+            .repr()
+            .map_or_else(|_| "the address".to_owned(), |repr| repr.to_string())
+    ))
+}
+
+/// The address of the socket `path` names, for `call` (`listen_unix()`, `connect_unix()`): a
+/// `str`, `bytes` or `os.PathLike`; `TypeError` for anything else, `ValueError` for a name that
+/// is empty, has a NUL byte inside, is too long, or is abstract on an OS without them.
+#[cfg(unix)]
+pub(crate) fn unix_address(path: &Bound<'_, PyAny>, call: &str) -> PyResult<SockAddr> {
+    if !(path.is_instance_of::<PyString>()
+        || path.is_instance_of::<PyBytes>()
+        || path.hasattr("__fspath__")?)
+    {
+        return Err(PyTypeError::new_err(format!(
+            "porto: {call}'s path must be a str, bytes or os.PathLike naming the socket, not {}; \
+             pass the path of the socket file, or a name starting with \"\\0\" for a Linux \
+             abstract socket",
+            path.get_type().name()?
+        )));
     }
-    SockAddr::unix(std::ffi::OsStr::from_bytes(&encoded)).map_err(|error| invalid(&error))
+    let name = unix_name(path)?;
+    porto_net::unix::address(&name).map_err(|reason| {
+        PyValueError::new_err(format!(
+            "porto: {call}'s path {} is not a valid Unix socket address: {reason}",
+            path.repr()
+                .map_or_else(|_| "the path".to_owned(), |repr| repr.to_string())
+        ))
+    })
+}
+
+/// An OS error from binding or connecting the Unix socket `address`, as the `OSError` Python
+/// raises for a path: its errno, its message, and the path as `filename`.
+#[cfg(unix)]
+pub(crate) fn path_error(error: &std::io::Error, address: &SockAddr) -> PyErr {
+    let Some(errno) = error.raw_os_error() else {
+        return PyOSError::new_err(error.to_string());
+    };
+    let filename = address.as_pathname().map_or_else(
+        || {
+            address
+                .as_abstract_namespace()
+                .map_or_else(String::new, |name| {
+                    format!("\\0{}", String::from_utf8_lossy(name))
+                })
+        },
+        |path| path.to_string_lossy().into_owned(),
+    );
+    PyOSError::new_err((errno, error.to_string(), filename))
 }
 
 fn from_tuple(tuple: &Bound<'_, PyTuple>) -> PyResult<SockAddr> {
