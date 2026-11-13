@@ -234,8 +234,9 @@ def _unix_name(path: object) -> str | bytes:
     """``path`` as the ``str`` or ``bytes`` the socket layer takes (``os.PathLike`` is resolved)."""
     if isinstance(path, (str, bytes)):
         return path
-    if hasattr(path, "__fspath__"):
-        name: object = os.fspath(path)  # pyright: ignore[reportArgumentType]
+    fspath = getattr(path, "__fspath__", None)
+    if fspath is not None:
+        name = fspath()
         if isinstance(name, (str, bytes)):
             return name
     raise TypeError(
