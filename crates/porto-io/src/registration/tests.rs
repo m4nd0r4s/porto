@@ -230,6 +230,96 @@ fn attempt_io_reads_before_the_driver_reports_and_clears_on_would_block() {
 }
 
 #[test]
+fn attempt_io_when_ready_skips_the_syscall_once_readiness_was_cleared() {
+    let driver = driver();
+    let (mut left, right) = socketpair();
+    let registration = register(&driver, right);
+    let calls = std::cell::Cell::new(0_usize);
+    // Reads up to `room` bytes; `touched` is what `f` was told.
+    let read_now = |registration: &Registration<UnixStream>, room: usize| {
+        registration.attempt_io_when_ready(Interest::READABLE, |mut stream, ready| {
+            calls.set(calls.get() + 1);
+            if !ready {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let mut buffer = vec![0; room];
+            let read = stream.read(&mut buffer)?;
+            Ok((buffer[..read].to_vec(), read < room))
+        })
+    };
+    // Fresh: the driver has reported nothing, so the socket is tried (data may be queued).
+    left.write_all(b"early").unwrap();
+    assert_eq!(read_now(&registration, 64).unwrap(), b"early");
+    // Never observed and nothing there: tried once more, and not an error to retry.
+    assert_eq!(
+        read_now(&registration, 64).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    // The driver reports data: ready, read, and the short read drains the readiness.
+    left.write_all(b"ping").unwrap();
+    assert!(driver.turn(LONG).unwrap() >= 1);
+    assert_eq!(read_now(&registration, 64).unwrap(), b"ping");
+    let readiness = |registration: &Registration<UnixStream>| {
+        registration
+            .scheduled_io()
+            .ready_event(registration.id(), Interest::READABLE)
+            .ready()
+    };
+    assert!(
+        readiness(&registration).is_empty(),
+        "a short read forgets readiness"
+    );
+    // Now the registration was observed and has no readiness: `f` is told not to touch the
+    // socket, and a byte that arrived meanwhile is not read until the driver reports it.
+    left.write_all(b"x").unwrap();
+    let before = calls.get();
+    let error = read_now(&registration, 64).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(calls.get(), before + 1, "f ran, told ready = false");
+    assert!(driver.turn(LONG).unwrap() >= 1);
+    assert_eq!(read_now(&registration, 64).unwrap(), b"x");
+    // A full read (no room left) says nothing about the socket: readiness stays.
+    left.write_all(b"abcd").unwrap();
+    assert!(driver.turn(LONG).unwrap() >= 1);
+    assert_eq!(read_now(&registration, 4).unwrap(), b"abcd");
+    assert!(
+        !readiness(&registration).is_empty(),
+        "a full read keeps readiness"
+    );
+    registration.close().unwrap();
+    assert_closed(&read_now(&registration, 4).unwrap_err());
+}
+
+#[test]
+fn async_io_drain_clears_readiness_after_a_short_read() {
+    let driver = driver();
+    let (mut left, right) = socketpair();
+    let registration = register(&driver, right);
+    left.write_all(b"ping").unwrap();
+    assert!(driver.turn(LONG).unwrap() >= 1);
+    let mut future = pin!(
+        registration.async_io_drain(Interest::READABLE, |mut stream| {
+            let mut buffer = [0; 64];
+            let read = stream.read(&mut buffer)?;
+            Ok((buffer[..read].to_vec(), read < buffer.len()))
+        })
+    );
+    let waker = CountingWaker::new();
+    let mut cx = Context::from_waker(&waker.1);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(bytes)) => assert_eq!(bytes, b"ping"),
+        other => panic!("expected the bytes, got {other:?}"),
+    }
+    let event = registration
+        .scheduled_io()
+        .ready_event(registration.id(), Interest::READABLE);
+    assert!(
+        event.ready().is_empty(),
+        "the short read cleared the readiness"
+    );
+}
+
+#[test]
 fn close_wakes_every_waiter_with_a_closed_error() {
     let driver = driver();
     let (_left, right) = socketpair();

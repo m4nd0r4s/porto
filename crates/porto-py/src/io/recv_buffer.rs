@@ -24,6 +24,8 @@ pub(crate) struct RecvBuffer {
     bytes: Option<PooledBytes>,
     /// Where the unconsumed bytes start in `bytes`.
     start: usize,
+    /// Whether the last receive got less than it had room for: the socket was empty then.
+    last_receive_short: bool,
 }
 
 impl RecvBuffer {
@@ -32,6 +34,12 @@ impl RecvBuffer {
         self.bytes
             .as_ref()
             .map_or(0, |bytes| bytes.len() - self.start)
+    }
+
+    /// Whether the last [`fill`](Self::fill) that received anything got less than it had room
+    /// for, which means a stream socket had nothing more at that moment.
+    pub(crate) fn last_receive_short(&self) -> bool {
+        self.last_receive_short
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -116,6 +124,7 @@ impl RecvBuffer {
         // SAFETY: `recv` initialized the first `received` bytes after the `used` ones, which
         // are within the capacity.
         unsafe { bytes.vec_mut().set_len(used + received) };
+        self.last_receive_short = received < size;
         Ok(received)
     }
 

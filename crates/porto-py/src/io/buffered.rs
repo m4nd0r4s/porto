@@ -101,6 +101,8 @@ pub(crate) struct BufferedRead {
     /// attempt resumes there and a delimiter that arrives in many small segments is not scanned
     /// for from the start each time.
     searched: usize,
+    /// Whether the last attempt ended with a receive that found the socket empty.
+    drained: bool,
 }
 
 impl BufferedRead {
@@ -109,7 +111,14 @@ impl BufferedRead {
             buffer,
             mode,
             searched: 0,
+            drained: false,
         }
+    }
+
+    /// Whether the last [`attempt`](Self::attempt) ended with a receive that got less than it
+    /// had room for: the socket had nothing more then.
+    pub(crate) fn drained(&self) -> bool {
+        self.drained
     }
 
     /// Completes from what is buffered already, without the socket: the outcome, or `None`
@@ -193,6 +202,7 @@ impl BufferedRead {
         let shared = Arc::clone(&self.buffer);
         let mut buffer = shared.lock();
         let mut received = 0;
+        self.drained = false;
         loop {
             if let Some(outcome) = self.check(&mut buffer) {
                 return Ok(outcome);
@@ -204,6 +214,7 @@ impl BufferedRead {
             let arrived = buffer.fill(socket, room, want)?;
             if arrived > 0 {
                 received += arrived;
+                self.drained = buffer.last_receive_short();
                 continue;
             }
             // The end of the stream: nothing more will arrive.

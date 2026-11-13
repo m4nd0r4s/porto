@@ -55,6 +55,11 @@ pub struct Registration<S> {
     driver: Arc<dyn Driver>,
     id: RegistrationId,
     gate: CloseGate<S>,
+    /// The tick of the readiness word right after registering: while it is the current tick, the
+    /// driver has reported nothing for this registration yet ([`attempt_io_when_ready`]).
+    ///
+    /// [`attempt_io_when_ready`]: Self::attempt_io_when_ready
+    fresh_tick: usize,
 }
 
 impl<S: IoSource> Registration<S> {
@@ -66,11 +71,17 @@ impl<S: IoSource> Registration<S> {
     /// `source` is dropped, which closes it.
     pub fn new(driver: Arc<dyn Driver>, source: S, interest: Interest) -> io::Result<Self> {
         let id = driver.register(source.raw_source(), interest)?;
-        Ok(Self {
+        let mut registration = Self {
             driver,
             id,
             gate: CloseGate::new(source),
-        })
+            fresh_tick: 0,
+        };
+        registration.fresh_tick = registration
+            .scheduled_io()
+            .ready_event(id, Interest::READABLE)
+            .tick();
+        Ok(registration)
     }
 }
 
@@ -212,6 +223,81 @@ impl<S> Registration<S> {
             self.scheduled_io().clear_readiness(event);
         }
         result
+    }
+
+    /// Runs `f`, a nonblocking operation on the source, as [`attempt_io`](Self::attempt_io)
+    /// does, but touches the source only when an attempt can succeed: tokio's `try_io` rule.
+    /// `f(source, ready)` is always called (so an operation can answer from bytes it holds
+    /// without the source); `ready` is `true` when the driver reported readiness matching
+    /// `interest` that no `WouldBlock` has cleared since, or has reported nothing at all for
+    /// this registration yet (a fresh registration may have data queued that no poll has
+    /// announced), and `false` when the last attempt hit `WouldBlock` and nothing arrived
+    /// since: the syscall would only hit `WouldBlock` again, so `f` must not make it.
+    ///
+    /// `f` returns its result and whether it *drained* the source: that it received less than
+    /// it had room for, so a stream socket has nothing left and readiness can be forgotten
+    /// without a further, failing attempt (the driver is edge-triggered: new data is a new
+    /// event). Readiness is cleared, unless newer readiness arrived meanwhile, when `f` drained
+    /// the source or hit `WouldBlock` having been `ready`.
+    ///
+    /// # Errors
+    ///
+    /// A [`ClosedResource`] error once the registration is closed or released, or `f`'s error
+    /// (`WouldBlock` when the source is not ready: wait with [`readiness`](Self::readiness),
+    /// then try again).
+    pub fn attempt_io_when_ready<R>(
+        &self,
+        interest: Interest,
+        f: impl FnOnce(&S, bool) -> io::Result<(R, bool)>,
+    ) -> io::Result<R> {
+        let source = self.source()?;
+        let event = self.checked(self.scheduled_io().ready_event(self.id, interest))?;
+        let observed = !event.ready().is_empty();
+        let ready = observed || event.tick() == self.fresh_tick;
+        match source.with(|source| f(source, ready)) {
+            Ok((value, drained)) => {
+                if drained && observed {
+                    self.scheduled_io().clear_readiness(event);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                if observed && error.kind() == io::ErrorKind::WouldBlock {
+                    self.scheduled_io().clear_readiness(event);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Like [`async_io`](Self::async_io), for an `f` that also reports whether it drained the
+    /// source (see [`attempt_io_when_ready`](Self::attempt_io_when_ready)): the readiness it
+    /// consumed is then cleared, so the next operation waits instead of attempting in vain.
+    ///
+    /// # Errors
+    ///
+    /// A [`ClosedResource`] error once the registration is closed (also while this waits),
+    /// or `f`'s error.
+    pub async fn async_io_drain<R>(
+        &self,
+        interest: Interest,
+        mut f: impl FnMut(&S) -> io::Result<(R, bool)>,
+    ) -> io::Result<R> {
+        loop {
+            let event = self.readiness(interest).await?;
+            match self.source()?.with(&mut f) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.clear_readiness(event);
+                }
+                Ok((value, drained)) => {
+                    if drained {
+                        self.clear_readiness(event);
+                    }
+                    return Ok(value);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Runs `f`, a nonblocking operation on the source, until it does not hit `WouldBlock`,

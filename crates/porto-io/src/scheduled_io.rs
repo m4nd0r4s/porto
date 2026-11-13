@@ -85,6 +85,11 @@ impl ReadyEvent {
         self.ready
     }
 
+    /// How many dispatches the registration had seen when this was observed (modulo 2^15).
+    pub(crate) const fn tick(self) -> usize {
+        self.tick
+    }
+
     /// Whether the registration was released (closed, deregistered, or its driver shut down)
     /// rather than observed ready: its readiness is then [`Ready::CLOSED`] and no operation on
     /// it can succeed.

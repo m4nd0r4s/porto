@@ -36,6 +36,7 @@ import json
 import subprocess
 import sys
 import threading
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import cast
 
@@ -91,7 +92,26 @@ async def porto_echo(stream: net.TcpStream) -> None:
         pass  # the client closed
 
 
+async def porto_echo_read(stream: net.TcpStream) -> None:
+    """The same echo with ``read`` instead of ``read_exact``: a short receive tells the stream the
+    socket is empty, so it skips the receive that would only hit ``EAGAIN`` (porto-szb.148)."""
+    read, write = stream.read, stream.write
+    while chunk := await read(MESSAGE_SIZE):
+        await write(chunk)
+
+
 async def porto_tcp_echo(rounds: int) -> float:
+    return await _porto_echo_server(porto_echo, rounds)
+
+
+async def porto_tcp_echo_read(rounds: int) -> float:
+    """Informative (``echo_probe.py`` only, not a pyperf row): porto's echo with ``read``."""
+    return await _porto_echo_server(porto_echo_read, rounds)
+
+
+async def _porto_echo_server(
+    handler: Callable[[net.TcpStream], Awaitable[None]], rounds: int
+) -> float:
     finished = porto.Event()
     outcome: list[float | BaseException] = []
 
@@ -104,7 +124,7 @@ async def porto_tcp_echo(rounds: int) -> float:
             finished.set()  # safe from any thread
 
     async with porto.scope() as s:
-        port = await s.start(net.serve_tcp, porto_echo, LOOPBACK)
+        port = await s.start(net.serve_tcp, handler, LOOPBACK)
         threading.Thread(target=generate, args=(port,), daemon=True).start()
         await finished.wait()
         s.cancel()  # serve_tcp runs forever

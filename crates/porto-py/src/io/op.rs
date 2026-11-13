@@ -245,38 +245,74 @@ impl IoOp {
     }
 
     /// Attempts the operation once, nonblocking (retrying on `EINTR`). `WouldBlock` when the
-    /// socket is not ready; a partial send keeps its progress for the next attempt.
-    pub(crate) fn attempt(&mut self, socket: &Socket) -> io::Result<Completed> {
+    /// socket is not ready; a partial send keeps its progress for the next attempt. Also says
+    /// whether the attempt left a stream socket empty (a receive that got less than it had room
+    /// for): the registration can then forget its readiness, and the operation after this one
+    /// wait instead of receiving in vain.
+    pub(crate) fn attempt_draining(&mut self, socket: &Socket) -> io::Result<(Completed, bool)> {
         loop {
-            match self.attempt_once(socket) {
+            let mut drained = false;
+            match self.attempt_once(socket, &mut drained) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => return result,
+                result => return result.map(|completed| (completed, drained)),
             }
         }
     }
 
-    fn attempt_once(&mut self, socket: &Socket) -> io::Result<Completed> {
+    /// [`attempt_draining`](Self::attempt_draining) for the fast path, which does not touch
+    /// the socket when `ready` is `false` (the last attempt hit `WouldBlock` and nothing has
+    /// arrived since: [`Registration::attempt_io_when_ready`]): the operation then completes
+    /// from the bytes it already has, or reports `WouldBlock`.
+    pub(crate) fn attempt_when_ready(
+        &mut self,
+        socket: &Socket,
+        ready: bool,
+    ) -> io::Result<(Completed, bool)> {
+        if ready {
+            return self.attempt_draining(socket);
+        }
+        match self.complete_from_buffer() {
+            Some(completed) => completed.map(|completed| (completed, false)),
+            None => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
+
+    fn attempt_once(&mut self, socket: &Socket, drained: &mut bool) -> io::Result<Completed> {
         if let Some(completed) = self.complete_from_buffer() {
             return completed;
         }
         match self {
-            Self::ReadBuffered(read) => read.attempt(socket).map(Completed::Buffered),
-            Self::Read { max, .. } => {
+            Self::ReadBuffered(read) => {
+                let outcome = read.attempt(socket).map(Completed::Buffered);
+                *drained = read.drained();
+                outcome
+            }
+            Self::Read { max, buffered } => {
                 let mut bytes = receive_buffer(*max)?;
+                let room = bytes.spare_capacity_mut().len();
                 let received = socket.recv(bytes.spare_capacity_mut())?;
                 // SAFETY: `recv` initialized the first `received` bytes.
                 unsafe { bytes.set_len(received) };
+                // Only a stream (a TCP stream's buffered read) is empty after a short receive:
+                // a datagram socket's short receive says nothing about the next datagram.
+                *drained = buffered.is_some() && received < room;
                 Ok(Completed::Bytes(bytes))
             }
-            Self::ReadBuffer { max, .. } => {
+            Self::ReadBuffer { max, buffered } => {
                 let mut bytes = PooledBytes::with_capacity(*max)?;
                 let spare = &mut bytes.vec_mut().spare_capacity_mut()[..*max];
                 let received = socket.recv(spare)?;
                 // SAFETY: `recv` initialized the first `received` bytes.
                 unsafe { bytes.vec_mut().set_len(received) };
+                *drained = buffered.is_some() && received < *max;
                 Ok(Completed::Buffer(bytes))
             }
-            Self::ReadInto { buf, .. } => socket.recv(buf.spare()).map(Completed::Count),
+            Self::ReadInto { buf, buffered } => {
+                let room = buf.spare().len();
+                let received = socket.recv(buf.spare())?;
+                *drained = buffered.is_some() && received < room;
+                Ok(Completed::Count(received))
+            }
             Self::Write { data, off, .. } => {
                 let bytes = data.bytes();
                 while *off < bytes.len() {
@@ -659,7 +695,9 @@ pub(crate) fn submit_claimed(
 ) -> PyResult<Py<PyAny>> {
     ensure_same_run(registration)?;
     if !op.waits_only() && step::proceed(py)? {
-        match registration.attempt_io(op.interest(), |socket| op.attempt(socket)) {
+        match registration.attempt_io_when_ready(op.interest(), |socket, ready| {
+            op.attempt_when_ready(socket, ready)
+        }) {
             Ok(completed) => {
                 op.finish(None);
                 return ready(py, completed.into_py(py)?);
@@ -742,7 +780,7 @@ async fn wait_for(registration: Arc<IoRegistration>, mut op: IoOp, claim: Option
         let mut capped_rounds = 0;
         loop {
             let result = registration
-                .async_io(interest, |socket| op.attempt(socket))
+                .async_io_drain(interest, |socket| op.attempt_draining(socket))
                 .await;
             match result {
                 Err(error) if op.backs_off_on(&error) => {

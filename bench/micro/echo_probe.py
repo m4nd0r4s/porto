@@ -3,9 +3,10 @@ row is the number that counts; this is not).
 
     <venv>/bin/python bench/micro/echo_probe.py [--workers 8] [--rounds 2000] [--reps 5]
 
-Runs each server ``--reps`` times in turn (porto, uvloop streams, uvloop protocol, asyncio
-streams) against the same load generator, printing the median and minimum microseconds per
-round trip and the throughput. Interleaving puts the same machine noise on every server. With
+Runs each server ``--reps`` times in turn (porto with ``read_exact``, porto with ``read``, uvloop
+streams, uvloop protocol, asyncio streams) against the same load generator, printing the median
+and minimum microseconds per round trip and the throughput. Interleaving puts the same machine
+noise on every server; ``--only a,b`` runs just those. With
 ``--serve porto|uvloop`` it runs only that server, for a long run you can attach a profiler to
 (``sample <pid> 3`` on macOS, ``perf record -p <pid>`` on Linux): it prints its pid first.
 """
@@ -26,12 +27,18 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=8, help="load generator processes")
     parser.add_argument("--rounds", type=int, default=2000, help="round trips per connection")
     parser.add_argument("--reps", type=int, default=5)
-    parser.add_argument("--serve", choices=("porto", "uvloop"), help="run one server only")
+    parser.add_argument(
+        "--only", default="", help="comma-separated servers to run (default: all of them)"
+    )
+    parser.add_argument(
+        "--serve", choices=("porto", "porto-read", "uvloop"), help="run one server only"
+    )
     options = parser.parse_args()
     net_programs.CLIENT_WORKERS = options.workers
     rounds: int = options.rounds
     servers: dict[str, Callable[[], float]] = {
         "porto": lambda: programs.run_porto(net_programs.porto_tcp_echo, rounds),
+        "porto-read": lambda: programs.run_porto(net_programs.porto_tcp_echo_read, rounds),
         "uvloop": lambda: programs.runasyncio_program(
             "uvloop", net_programs.asyncio_tcp_echo, rounds
         ),
@@ -42,6 +49,9 @@ def main() -> None:
             "asyncio", net_programs.asyncio_tcp_echo, rounds
         ),
     }
+    if options.only:
+        chosen = options.only.split(",")
+        servers = {name: run for name, run in servers.items() if name in chosen}
     if options.serve:
         print("pid", os.getpid(), flush=True)
         servers[options.serve]()
