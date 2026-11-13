@@ -98,8 +98,6 @@ thread_local! {
     /// The tasks whose coroutines awaited while they were closed at the end of the run: name and
     /// stack of each (see `abandon.rs`).
     static STUCK: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-    /// See [`forget_inherited_lane`].
-    static FORKED_LANE: Cell<bool> = const { Cell::new(false) };
     /// Whether this thread is running a Python lane (inside [`run`]).
     static ON_PYTHON_LANE: Cell<bool> = const { Cell::new(false) };
     /// Whether the run on this thread is in debug mode (`RuntimeConfig.debug`): read only by
@@ -278,15 +276,8 @@ pub(crate) fn any_introspection() -> bool {
 pub(crate) fn forget_inherited_lane() {
     if ON_PYTHON_LANE.get() {
         ON_PYTHON_LANE.set(false);
-        FORKED_LANE.set(true);
         porto_core::forget_lane_in_forked_child();
     }
-}
-
-/// Whether this thread is a forked child's only thread, which ran a Python lane before the
-/// fork: the runtime context the parent entered is still on its stack, but dead.
-pub(crate) fn is_forked_lane() -> bool {
-    FORKED_LANE.get()
 }
 
 /// Whether this thread is running a Python lane.

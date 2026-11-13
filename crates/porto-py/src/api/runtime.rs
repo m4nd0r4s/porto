@@ -255,9 +255,7 @@ pub(crate) fn refuse_nested_start() -> PyResult<()> {
              running runtime from a thread, use `porto.from_thread`",
         ));
     }
-    // A forked child's thread that was a lane still has the parent's runtime context on its
-    // stack, which is dead: a fresh runtime may start on it.
-    if Handle::try_current().is_some() && !lane::is_forked_lane() {
+    if Handle::try_current().is_some() {
         return Err(PyRuntimeError::new_err(
             "porto: porto.run() cannot be called from inside a running porto runtime; `await` \
              the coroutine instead, or run it as a task with `async with porto.scope() as s: \
@@ -343,8 +341,10 @@ impl Runtime {
     /// A runtime that runs is shut down in order (26 §2): `porto.lifecycle.shutdown_requested()`
     /// is set, main gets `timeout` seconds to finish by itself, then the root scope is cancelled
     /// and given `cancel_timeout`, and what is left is abandoned. Called from another thread, it
-    /// returns once the runtime stopped; called from a task of the runtime itself it returns at
-    /// once, and the shutdown goes on while main continues.
+    /// returns once the runtime stopped; called from a task of the runtime itself, or from a
+    /// blocking-pool worker (`porto.to_thread`), it returns at once and the shutdown goes on.
+    /// `block_on` then returns main's result if main finished within the period, else raises
+    /// what main ended with: `porto.Cancelled`.
     #[pyo3(signature = (*, timeout=10.0))]
     fn shutdown(&self, py: Python<'_>, timeout: f64) -> PyResult<()> {
         if !timeout.is_finite() || timeout < 0.0 {
@@ -364,7 +364,10 @@ impl Runtime {
                     cause: Cause::Shutdown,
                     graceful: Some(Duration::try_from_secs_f64(timeout).unwrap_or(Duration::MAX)),
                 });
-                if lane::is_active() {
+                // From a task the shutdown goes on while main continues; from a blocking-pool
+                // worker, waiting would wait for a runtime whose pool join waits for this very
+                // worker. Both return at once.
+                if lane::is_active() || ON_BLOCKING_WORKER.get() {
                     return Ok(());
                 }
                 self.wait_stopped(py)
@@ -421,6 +424,9 @@ fn in_runtime() -> bool {
 /// a runtime whose threads are gone (25 §6, ST-14).
 #[pyfunction(name = "_before_fork")]
 fn before_fork(py: Python<'_>) -> PyResult<()> {
+    // Held across the fork, so the child never inherits the signal table locked mid-update.
+    #[cfg(unix)]
+    porto_io::signal::prepare_fork();
     if !PROCESS_RUN.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -436,6 +442,13 @@ fn before_fork(py: Python<'_>) -> PyResult<()> {
     )
 }
 
+/// `os.register_at_fork(after_in_parent=...)`.
+#[pyfunction(name = "_after_fork_in_parent")]
+fn after_fork_in_parent() {
+    #[cfg(unix)]
+    porto_io::signal::after_fork_in_parent();
+}
+
 /// `os.register_at_fork(after_in_child=...)`: the child of a `fork()` taken while a runtime
 /// runs inherits the process-wide I1 flag with no thread left to clear it, so every `porto.run`
 /// there would be refused for good: clears it ("fresh runtimes may be created in the child",
@@ -448,6 +461,8 @@ fn after_fork_in_child() {
     FORK_EPOCH.fetch_add(1, Ordering::AcqRel);
     lane::forget_inherited_lane();
     super::signals::forget_in_child();
+    super::run::forget_in_child();
+    std::mem::forget(CURRENT.take());
     #[cfg(unix)]
     porto_io::signal::forget_in_child();
 }
@@ -469,6 +484,7 @@ pub(crate) fn install_fork_hooks(py: Python<'_>) -> PyResult<()> {
             let module = py.import("porto._core")?;
             let keywords = PyDict::new(py);
             keywords.set_item("before", module.getattr("_before_fork")?)?;
+            keywords.set_item("after_in_parent", module.getattr("_after_fork_in_parent")?)?;
             keywords.set_item("after_in_child", module.getattr("_after_fork_in_child")?)?;
             os.call_method("register_at_fork", (), Some(&keywords))?;
             Ok(())
@@ -483,5 +499,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(runtime, module)?)?;
     module.add_function(wrap_pyfunction!(in_runtime, module)?)?;
     module.add_function(wrap_pyfunction!(before_fork, module)?)?;
+    module.add_function(wrap_pyfunction!(after_fork_in_parent, module)?)?;
     module.add_function(wrap_pyfunction!(after_fork_in_child, module)?)
 }

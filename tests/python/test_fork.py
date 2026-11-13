@@ -84,12 +84,15 @@ def test_the_child_of_a_fork_inside_a_task_cannot_use_the_inherited_runtime_but_
                     ("root_scope", lambda: runtime.root_scope),
                     ("shutdown", lambda: runtime.shutdown()),
                     ("block_on", lambda: runtime.block_on(fresh)),
-                    ("shutdown_requested", lambda: porto.lifecycle.shutdown_requested()),
                 ]:
                     try:
                         use()
                     except porto.RuntimeClosed as error:
                         checks.append(name if "does not survive fork()" in str(error) else "?")
+                try:
+                    porto.runtime()
+                except porto.NoRuntimeError:
+                    checks.append("runtime() is none")
                 print("inherited:", checks, repr(runtime), flush=True)
                 print("fresh:", porto.run(fresh), flush=True)
                 os._exit(0)
@@ -101,7 +104,8 @@ def test_the_child_of_a_fork_inside_a_task_cannot_use_the_inherited_runtime_but_
     )
     assert done.returncode == 0, done.stderr
     assert (
-        "inherited: ['root_scope', 'shutdown', 'block_on', 'shutdown_requested'] "
+        "inherited: ['root_scope', 'shutdown', 'block_on', "
+        "'runtime() is none'] "
         "<porto.Runtime poisoned by fork()>" in done.stdout
     )
     assert "fresh: 41" in done.stdout
@@ -168,6 +172,7 @@ def test_a_signal_in_the_child_is_not_delivered_to_the_parents_runtime() -> None
     done = run_program(
         """
         warnings.simplefilter("ignore")
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
         async def main():
             pid = os.fork()
