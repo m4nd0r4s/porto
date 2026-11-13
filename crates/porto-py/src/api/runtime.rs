@@ -15,13 +15,13 @@
 //!   test_runtime.py` (task handles, scopes, channels, streams).
 
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use porto_core::Handle;
 use porto_core::config::RuntimeConfig;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyRuntimeWarning};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -38,6 +38,10 @@ const STOPPED: u8 = 2;
 
 /// Whether a public run (`porto.run`, `Runtime.block_on`) is in progress in the process (I1).
 static PROCESS_RUN: AtomicBool = AtomicBool::new(false);
+
+/// How many `fork()`s this process is the child of: a runtime that started in an earlier epoch
+/// than the current one was inherited by a forked child, where it does not work (25 §6).
+static FORK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The runtime whose lane this thread is, from the start of its run until it ends.
@@ -65,6 +69,8 @@ pub(crate) struct Runtime {
     shutdown_event: Mutex<Option<Py<PyAny>>>,
     /// Whether the run ended (`STOPPED`), for `shutdown()` called from another thread.
     stopped: (Mutex<bool>, Condvar),
+    /// The [`FORK_EPOCH`] the run started in.
+    epoch: AtomicU64,
 }
 
 impl Runtime {
@@ -76,7 +82,29 @@ impl Runtime {
             lifecycle: Arc::new(Lifecycle::default()),
             shutdown_event: Mutex::new(None),
             stopped: (Mutex::new(false), Condvar::new()),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this runtime was running when the process was forked: in the child it is a
+    /// copy of memory whose threads, descriptors' readiness and locks do not exist (25 §6).
+    fn is_poisoned(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RUNNING
+            && self.epoch.load(Ordering::Acquire) != FORK_EPOCH.load(Ordering::Acquire)
+    }
+
+    /// `RuntimeClosed` if [`is_poisoned`](Self::is_poisoned).
+    pub(crate) fn check_not_poisoned(&self) -> PyResult<()> {
+        if self.is_poisoned() {
+            return Err(RuntimeClosed::new_err(
+                "porto: runtime does not survive fork(): this runtime was running when the \
+                 process forked, and a forked child gets only the forking thread, so the \
+                 runtime's lanes, pool and driver are gone. Start a fresh runtime in the child \
+                 with porto.run(...), or fork before any runtime starts (the supervisor of a \
+                 server does), or use subprocess or multiprocessing's 'spawn' start method",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn config(&self) -> &RuntimeConfig {
@@ -121,6 +149,7 @@ impl Runtime {
     pub(crate) fn claim(slf: &Bound<'_, Self>) -> PyResult<RunClaim> {
         refuse_nested_start()?;
         let this = slf.get();
+        this.check_not_poisoned()?;
         match this
             .state
             .compare_exchange(NEW, RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -136,6 +165,8 @@ impl Runtime {
             this.state.store(NEW, Ordering::Release);
             return Err(another_runtime_runs());
         }
+        this.epoch
+            .store(FORK_EPOCH.load(Ordering::Acquire), Ordering::Release);
         Ok(RunClaim {
             runtime: slf.clone().unbind(),
         })
@@ -224,7 +255,9 @@ pub(crate) fn refuse_nested_start() -> PyResult<()> {
              running runtime from a thread, use `porto.from_thread`",
         ));
     }
-    if Handle::try_current().is_some() {
+    // A forked child's thread that was a lane still has the parent's runtime context on its
+    // stack, which is dead: a fresh runtime may start on it.
+    if Handle::try_current().is_some() && !lane::is_forked_lane() {
         return Err(PyRuntimeError::new_err(
             "porto: porto.run() cannot be called from inside a running porto runtime; `await` \
              the coroutine instead, or run it as a task with `async with porto.scope() as s: \
@@ -274,6 +307,7 @@ impl Runtime {
     fn block_on(slf: &Bound<'_, Self>, main: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let (coro, claim) = closing_on_error(&main, || {
+            slf.get().check_not_poisoned()?;
             refuse_nested_start()?;
             if slf.get().state.load(Ordering::Acquire) != NEW {
                 return Err(already_ran());
@@ -288,6 +322,7 @@ impl Runtime {
     /// while the runtime runs.
     #[getter]
     fn root_scope(&self, py: Python<'_>) -> PyResult<Py<Scope>> {
+        self.check_not_poisoned()?;
         let root = self.lock_root().as_ref().map(|root| root.clone_ref(py));
         match (root, self.state.load(Ordering::Acquire)) {
             (Some(root), _) => Ok(root),
@@ -324,6 +359,7 @@ impl Runtime {
         {
             Ok(_) | Err(STOPPED) => Ok(()),
             Err(_) => {
+                self.check_not_poisoned()?;
                 self.lifecycle.request(Request {
                     cause: Cause::Shutdown,
                     graceful: Some(Duration::try_from_secs_f64(timeout).unwrap_or(Duration::MAX)),
@@ -348,6 +384,7 @@ impl Runtime {
     fn __repr__(&self) -> String {
         let state = match self.state.load(Ordering::Acquire) {
             NEW => "new",
+            RUNNING if self.is_poisoned() => "poisoned by fork()",
             RUNNING => "running",
             _ => "stopped",
         };
@@ -380,27 +417,71 @@ fn in_runtime() -> bool {
     lane::is_active()
 }
 
-/// `os.register_at_fork(after_in_child=...)`: the child of a `fork()` taken while a runtime runs
-/// in another thread inherits the process-wide I1 flag with no thread left to clear it, so every
-/// `porto.run` there would be refused for good. Clears it: "fresh runtimes may be created in the
-/// child" (25 §6). What happens to the runtime the child inherited is the fork hooks' business.
+/// `os.register_at_fork(before=...)`: forking while a runtime runs leaves the child a copy of
+/// a runtime whose threads are gone (25 §6, ST-14).
+#[pyfunction(name = "_before_fork")]
+fn before_fork(py: Python<'_>) -> PyResult<()> {
+    if !PROCESS_RUN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let category = py.get_type::<PyRuntimeWarning>();
+    PyErr::warn(
+        py,
+        &category,
+        c"fork() while porto runtime is running is unsafe: the child gets only the forking \
+          thread, so the runtime does not survive in it (using it raises porto.RuntimeClosed); \
+          fork before any runtime starts, start a fresh runtime in the child with porto.run(...), \
+          or use subprocess or multiprocessing's 'spawn' start method",
+        2,
+    )
+}
+
+/// `os.register_at_fork(after_in_child=...)`: the child of a `fork()` taken while a runtime
+/// runs inherits the process-wide I1 flag with no thread left to clear it, so every `porto.run`
+/// there would be refused for good: clears it ("fresh runtimes may be created in the child",
+/// 25 §6). The runtime that was running is *poisoned* (every use raises `RuntimeClosed`), the
+/// signals it received are not delivered to the parent's pipe any more, and the forking thread,
+/// if it was the lane, is no lane.
 #[pyfunction(name = "_after_fork_in_child")]
 fn after_fork_in_child() {
     PROCESS_RUN.store(false, Ordering::Release);
+    FORK_EPOCH.fetch_add(1, Ordering::AcqRel);
+    lane::forget_inherited_lane();
+    super::signals::forget_in_child();
+    #[cfg(unix)]
+    porto_io::signal::forget_in_child();
 }
 
-/// Adds the class and the functions to `module`, and the fork hook.
+/// The fork hooks are registered once per process: `os.register_at_fork` has no unregister.
+static FORK_HOOKS: std::sync::Once = std::sync::Once::new();
+
+/// Registers the fork hooks (26 §2 step 1, the `fork_hooks` start step). Later runs find them
+/// installed.
+pub(crate) fn install_fork_hooks(py: Python<'_>) -> PyResult<()> {
+    let os = py.import("os")?;
+    // Windows has no fork.
+    if !os.hasattr("register_at_fork")? {
+        return Ok(());
+    }
+    let mut result = Ok(());
+    FORK_HOOKS.call_once(|| {
+        result = (|| {
+            let module = py.import("porto._core")?;
+            let keywords = PyDict::new(py);
+            keywords.set_item("before", module.getattr("_before_fork")?)?;
+            keywords.set_item("after_in_child", module.getattr("_after_fork_in_child")?)?;
+            os.call_method("register_at_fork", (), Some(&keywords))?;
+            Ok(())
+        })();
+    });
+    result
+}
+
+/// Adds the class and the functions to `module`.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Runtime>()?;
     module.add_function(wrap_pyfunction!(runtime, module)?)?;
     module.add_function(wrap_pyfunction!(in_runtime, module)?)?;
-    let os = module.py().import("os")?;
-    // Windows has no fork.
-    if os.hasattr("register_at_fork")? {
-        let hook = wrap_pyfunction!(after_fork_in_child, module)?;
-        let keywords = PyDict::new(module.py());
-        keywords.set_item("after_in_child", hook)?;
-        os.call_method("register_at_fork", (), Some(&keywords))?;
-    }
-    Ok(())
+    module.add_function(wrap_pyfunction!(before_fork, module)?)?;
+    module.add_function(wrap_pyfunction!(after_fork_in_child, module)?)
 }

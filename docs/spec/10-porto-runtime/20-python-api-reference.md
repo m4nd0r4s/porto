@@ -41,13 +41,13 @@ An entry point that takes a coroutine object and refuses it (`run` inside a runn
 | `timer_resolution` | `float` | `0.001` |
 | `asyncio_compat` | `bool` | `True` |
 | `anyio_backend` | `Literal["native","facade","off"]` | `"native"` |
-| `handle_signals` | `bool` | `True` (only effective on the main thread) |
+| `handle_signals` | `bool` | `True` (only effective on the main thread, on Unix; SIGINT and SIGTERM shut the runtime down, 18 §3) |
 | `debug` | `bool` | `False` (env `PORTO_DEBUG=1`, or `python -X dev` enables) |
 | `slow_step_threshold` | `float \| None` | `0.1` |
 | `console` | `str \| None` | `None` (e.g. `"127.0.0.1:6669"`) |
 | `metrics` | `bool` | `True` |
 | `deterministic` | `DeterministicConfig \| None` | `None` (§24) |
-| `graceful_timeout` | `float` | `10.0` |
+| `graceful_timeout` | `float` | `10.0` (how long main may take to finish after SIGTERM; `Runtime.shutdown(timeout=)` overrides it, 26 §2) |
 | `cancel_timeout` | `float` | `5.0` |
 
 Until multi-lane scheduling lands (M2, `12`), the runtime runs one lane: `porto.run` MUST refuse an int `lanes` above 1, from any source, with `NotImplementedError` that names the source (`lanes=4`, or `PORTO_LANES='4'`) and says to leave it out or use 1, rather than silently run on one lane. `RuntimeConfig(lanes=4)` itself stays valid. `"auto"` is accepted from any source and runs on one lane for now. Once multi-lane scheduling lands it resolves as in `12` §7, with no change for callers that pass it.

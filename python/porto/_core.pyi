@@ -78,7 +78,9 @@ class Runtime:
     and the root scope drains, ``STOPPED`` for good after. Only one runtime runs per process at
     a time: a second ``block_on`` or ``porto.run`` while one runs (from a task, from another
     thread, or from a ``to_thread`` worker) raises ``RuntimeError``. A runtime that stopped
-    raises ``RuntimeClosed`` when asked to run again.
+    raises ``RuntimeClosed`` when asked to run again. A runtime that was running when the process
+    forked is poisoned in the child: every use raises ``RuntimeClosed`` ("runtime does not
+    survive fork()"); a fresh ``porto.run`` works there (25 §6).
     """
 
     def __init__(self, config: RuntimeConfig | None = None, **overrides: Any) -> None:

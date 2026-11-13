@@ -28,6 +28,7 @@ use std::future::Future;
 
 use crate::task::JoinHandle;
 
+pub use context::forget_lane_in_forked_child;
 pub(crate) use context::{current_handle, current_time, with_current_handle};
 #[cfg(all(test, loom))]
 pub(crate) use inject::Inject;

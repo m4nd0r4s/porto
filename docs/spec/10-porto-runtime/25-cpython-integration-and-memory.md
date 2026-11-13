@@ -30,9 +30,14 @@ CPython 3.11, 3.12, 3.13, 3.14 (GIL) and 3.14t (free-threaded, and later t build
 | Trap | ≤ 48 B (Python object header + enum pointer) |
 
 ## 6. Fork handling
-`os.register_at_fork(before=…, after_in_parent=…, after_in_child=…)`:
-- `before`: if a runtime is running, emit RuntimeWarning("fork() while porto runtime is running is unsafe").
-- `after_in_child`: mark every runtime in the child as poisoned. Any use raises `RuntimeClosed("runtime does not survive fork()")`. Fresh runtimes may be created in the child: `after_in_child` also clears the process-wide one-runtime flag (I1), which a child forked from another thread while a runtime ran would otherwise inherit, with no thread to clear it. (Implemented already for that flag; the warning and the poisoning are the fork hooks' bead.)
+`os.register_at_fork(before=…, after_in_child=…)`, registered once per process by the `fork_hooks` start step (26 §2; `os.register_at_fork` cannot be undone, so later runs find them installed):
+- `before`: if a runtime is running, emit `RuntimeWarning("fork() while porto runtime is running is unsafe: …")` (the message says what to do instead).
+- `after_in_child`:
+  - marks every runtime that was **running** at the fork as poisoned: any use (`block_on`, `root_scope`, `shutdown`, `porto.lifecycle.shutdown_requested()`) raises `RuntimeClosed("runtime does not survive fork()…")`, and its `repr` says `poisoned by fork()`. A `Runtime` that never started holds nothing from the parent and stays usable (a deliberate narrowing of "every runtime"; a stopped one raises `RuntimeClosed` anyway).
+  - clears the process-wide one-runtime flag (I1), which a child forked from another thread while a runtime ran would otherwise inherit with no thread to clear it: fresh runtimes may be created in the child.
+  - if the forking thread was a lane (the fork was called from a task), it stops being one: the parent's lane context on its stack is dead, and a fresh `porto.run` may start on that thread. Such a child should end with `os._exit()` (or start a fresh runtime and then exit): returning into the parent's frames would run the parent's runtime teardown over descriptors shared with the parent.
+  - lets go of the signals the parent's runtime received: each gets its previous disposition back and nothing is written to the parent's self-pipe (18 §3), so a signal in the child never reaches the parent's runtime. The inherited hub is leaked, not dropped, because dropping it would deregister from the parent's poller.
+- Windows has no `fork()`: the hooks are not registered there.
 
 ## 7. Interpreter finalization
 At `Py_Finalize`, an `atexit` hook shuts down any runtime still running. Lanes must not touch Python after `Py_IsFinalizing()` is true. They drop deferred decrefs without executing them (leak instead of crash).

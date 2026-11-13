@@ -2,9 +2,9 @@
 //! order the spec lists and undone in reverse when the run stops (step 6).
 //!
 //! Each step is an extension point: it says when it applies, and what it installs. The owners
-//! (the asyncgen hooks of 11 §9, the fork hooks of 25 §3, the import hook of 25 §6) fill their
-//! step in; until then it installs nothing, so a run does exactly what it did before. The signal
-//! receiver (18 §3) is filled in: the default handling of SIGINT and SIGTERM. What ran, in which order, is kept for the `_startup_trace` test hook.
+//! (the asyncgen hooks of 11 §9, the import hook of 25 §6) fill their step in; until then it
+//! installs nothing, so a run does exactly what it did before. Filled in: the fork hooks (25 §6)
+//! and the signal receiver (18 §3), the default handling of SIGINT and SIGTERM. What ran, in which order, is kept for the `_startup_trace` test hook.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,6 @@ use crate::api::lifecycle::Lifecycle;
 
 /// What a step may look at when it decides and installs.
 pub(crate) struct StartContext<'a, 'py> {
-    #[allow(dead_code, reason = "read by the steps once their owners fill them in")]
     pub(crate) py: Python<'py>,
     pub(crate) config: &'a RuntimeConfig,
     /// Whether the thread that starts the runtime (lane 0) is the process's main thread, the only
@@ -94,7 +93,11 @@ const STEPS: [Step; 4] = [
     Step {
         name: "fork_hooks",
         applies: |_| true,
-        install: nothing_to_install,
+        install: |context| {
+            crate::api::runtime::install_fork_hooks(context.py)?;
+            // Registered for the life of the process: `os.register_at_fork` cannot undo it.
+            Ok(None)
+        },
     },
     Step {
         name: "signal_receiver",

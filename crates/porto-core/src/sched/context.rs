@@ -13,6 +13,15 @@ thread_local! {
     static CURRENT: Cell<*const Lane> = const { Cell::new(ptr::null()) };
 }
 
+/// In a forked child, on the thread that called `fork()` from inside a lane: forgets that this
+/// thread runs a lane. The parent's lane (and the loop on this thread's stack that entered it) is
+/// dead in the child, which has no other thread: a fresh runtime may be run on this thread. The
+/// loop's own `Enter` guard clears the same slot if the stack ever unwinds.
+pub fn forget_lane_in_forked_child() {
+    // `try_with` fails only while thread locals are being destroyed: nothing to forget then.
+    let _ = CURRENT.try_with(|current| current.set(ptr::null()));
+}
+
 /// Calls `f` with the lane running on this thread, if any.
 fn with_lane<R>(f: impl FnOnce(&Lane) -> R) -> Option<R> {
     // `try_with` fails only while thread locals are being destroyed: not on a lane then.

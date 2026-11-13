@@ -14,10 +14,13 @@
 //! (Python's own SIGINT handling stays in charge there).
 
 #[cfg(unix)]
-pub(crate) use unix::{Callback, end_of_run, subscribe, unsubscribe};
+pub(crate) use unix::{Callback, end_of_run, forget_in_child, subscribe, unsubscribe};
 
 #[cfg(not(unix))]
 pub(crate) fn end_of_run() {}
+
+#[cfg(not(unix))]
+pub(crate) fn forget_in_child() {}
 
 /// Adds the functions to `module`.
 pub(crate) fn register(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
@@ -181,6 +184,13 @@ mod unix {
     pub(crate) fn end_of_run() {
         let hub = HUB.take();
         drop(hub);
+    }
+
+    /// In a forked child, on the thread that was the parent's lane: the hub it holds belongs to
+    /// the parent's runtime (its pipe and driver are shared with the parent). It is leaked, not
+    /// dropped, as dropping it would deregister from the parent's poller.
+    pub(crate) fn forget_in_child() {
+        std::mem::forget(HUB.take());
     }
 
     /// `_signals_subscribe(signums, callback)`: what `porto.signals.receive` is built on.

@@ -116,6 +116,7 @@ fn shutdown_requested(py: Python<'_>) -> PyResult<Py<PyAny>> {
              porto.run(main) or Runtime.block_on(main) runs; call it inside main",
         )
     })?;
+    runtime.get().check_not_poisoned()?;
     let event = runtime.get().shutdown_event(py);
     event.ok_or_else(|| {
         NoRuntimeError::new_err(

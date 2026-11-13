@@ -227,7 +227,8 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         let mut slots = lock_slots();
         let slot = &mut slots[self.index];
-        slot.subscribers -= 1;
+        // Zero already in a forked child, which let go of every signal ([`forget_in_child`]).
+        slot.subscribers = slot.subscribers.saturating_sub(1);
         if slot.subscribers == 0
             && let Some(previous) = slot.previous.take()
         {
@@ -236,6 +237,30 @@ impl Drop for Subscription {
             // writes to a pipe that stays open until `WRITE_FDS` is cleared below.
             unsafe { libc::sigaction(self.signum, &raw const previous, std::ptr::null_mut()) };
             WRITE_FDS[self.index].store(-1, Ordering::Release);
+        }
+    }
+}
+
+/// In a forked child: lets go of every signal the parent's runtime received. The child shares
+/// the parent's pipe, so its handlers would write signal numbers to the *parent's* runtime;
+/// instead each signal gets its previous disposition back (Python's, usually) and nothing is
+/// delivered to any pipe. Call it from `os.register_at_fork(after_in_child=...)`.
+pub fn forget_in_child() {
+    // The thread that held the lock may not exist in the child: never wait for it. Without the
+    // lock only the handlers' targets can be cleared, which silences them.
+    let mut slots = SLOTS.try_lock();
+    for (index, target) in WRITE_FDS.iter().enumerate() {
+        target.store(-1, Ordering::Release);
+        if let Ok(slots) = &mut slots
+            && let Some(slot) = slots.get_mut(index)
+        {
+            slot.subscribers = 0;
+            if let Some(previous) = slot.previous.take()
+                && let Ok(signum) = i32::try_from(index)
+            {
+                // SAFETY: `previous` is what `sigaction` returned for this signal.
+                unsafe { libc::sigaction(signum, &raw const previous, std::ptr::null_mut()) };
+            }
         }
     }
 }

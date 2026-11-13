@@ -37,4 +37,7 @@ pub mod time;
 
 pub use blocking::{BlockingError, BlockingStats, WorkerHooks};
 pub use registry::{LiveTask, SnapshotError, TaskKind, TaskRecord, TaskSnapshotRequest, TaskState};
-pub use sched::{Builder, Handle, ParkHook, Runtime, WeakHandle, spawn, spawn_blocking};
+pub use sched::{
+    Builder, Handle, ParkHook, Runtime, WeakHandle, forget_lane_in_forked_child, spawn,
+    spawn_blocking,
+};
