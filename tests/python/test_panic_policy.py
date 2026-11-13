@@ -188,3 +188,112 @@ def test_the_cargo_profiles_keep_panic_unwind() -> None:
     for config in (REPO / ".cargo" / "config.toml", REPO / ".cargo" / "config"):
         if config.exists():
             assert "panic=abort" not in config.read_text().replace(" ", "")
+
+
+def test_a_panic_drains_the_scopes_the_task_entered_before_it_surfaces() -> None:
+    """The panic is raised in the coroutine at its await: the nested scope cancels its child and
+    waits for it, the child's shielded cleanup finishes, and only then does the panic reach the
+    enclosing scope and ``porto.run``."""
+    events: list[str] = []
+
+    async def sleeper() -> None:
+        try:
+            await porto.sleep(1000)
+        finally:
+            events.append("cleanup started")
+            with porto.shield():
+                await porto.sleep(0.3)
+            events.append("cleanup finished")
+
+    async def victim() -> None:
+        async with porto.scope() as inner:
+            inner.spawn(sleeper)
+            await porto.sleep(0.01)
+            await _core._panicking_future("nested")
+
+    async def main() -> None:
+        async with porto.scope() as outer:
+            outer.spawn(victim)
+            await porto.sleep(10)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        porto.run(main)
+    assert events == ["cleanup started", "cleanup finished"]
+    assert _panic_of(raised.value).message == "nested"
+
+
+def test_a_panicked_task_unwinds_in_its_own_context_as_a_porto_task() -> None:
+    """``finally`` blocks of the panicked coroutine see its ContextVars and can enter a scope."""
+    import contextvars
+
+    variable: contextvars.ContextVar[str] = contextvars.ContextVar("variable", default="outer")
+    seen: list[str] = []
+
+    async def victim() -> None:
+        variable.set("inner")
+        try:
+            await _core._panicking_future("contexts")
+        finally:
+            seen.append(variable.get())
+            with porto.shield():
+                await porto.sleep(0)
+            seen.append("shielded await finished")
+
+    async def main() -> None:
+        async with porto.scope() as scope:
+            scope.spawn(victim)
+
+    with pytest.raises(ExceptionGroup):
+        porto.run(main)
+    assert seen == ["inner", "shielded await finished"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no fork on Windows")
+def test_a_fork_while_a_runtime_runs_in_another_thread_leaves_the_child_free_to_run() -> None:
+    child = _run_child(
+        """
+        import os, threading, warnings
+        warnings.simplefilter("ignore")
+
+        started = threading.Event()
+        release = threading.Event()
+
+        async def main():
+            started.set()
+            while not release.is_set():
+                await porto.sleep(0.005)
+
+        thread = threading.Thread(target=porto.run, args=(main,))
+        thread.start()
+        started.wait()
+        pid = os.fork()
+        if pid == 0:
+            async def child():
+                await porto.sleep(0)
+                return 41
+            code = 0 if porto.run(child) == 41 else 1
+            os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        release.set()
+        thread.join()
+        print("child exit", os.waitstatus_to_exitcode(status))
+        """
+    )
+    assert child.returncode == 0, child.stderr
+    assert "child exit 0" in child.stdout
+
+
+def test_a_second_panic_while_the_task_unwinds_fails_it_with_the_first() -> None:
+    async def victim() -> None:
+        try:
+            await _core._panicking_future("first")
+        finally:
+            await _core._panicking_future("second")
+
+    async def main() -> None:
+        async with porto.scope() as scope:
+            scope.spawn(victim)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        porto.run(main)
+    assert _panic_of(raised.value).message == "first"

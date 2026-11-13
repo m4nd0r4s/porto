@@ -93,7 +93,9 @@ pub fn install_panic_hook() {
     });
 }
 
-/// Takes the location of the last panic on this thread, if the hook recorded one.
+/// Takes the location of the last panic on this thread, if the hook recorded one. The slot is
+/// per thread: a `PanicException` that a `to_thread` job raised came from another thread, so the
+/// `RustPanic` made from it on the lane may carry no location (or an older one).
 pub fn take_panic_location() -> Option<String> {
     LAST_PANIC_LOCATION.with_borrow_mut(Option::take)
 }

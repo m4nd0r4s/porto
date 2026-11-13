@@ -570,9 +570,10 @@ impl PyTask {
         unsafe { &(*task.as_ptr()).join }
     }
 
-    /// Ends the task with `porto.RustPanic` after its step loop panicked (the unwind dropped the
-    /// coroutine, closing it, and every guard of the poll): the scope it was spawned into hears
-    /// it like any other exception of the task (C4), joiners get it, and the lane goes on.
+    /// The backstop for a panic that `step::guarded_steps` did not see (in `step::poll` outside
+    /// the stepping, which unwound the coroutine and the poll's guards): ends the task with
+    /// `porto.RustPanic`. The scope it was spawned into hears it like any other exception of the
+    /// task (C4), joiners get it, and the lane goes on.
     fn fail_with_panic(&mut self, py: Python<'_>, header: &Header, payload: &(dyn Any + Send)) {
         let exception = crate::errors::caught_panic(payload).into_value(py);
         // Nothing of the half-done step is trusted: `complete` gives the wait up, and the
@@ -653,9 +654,10 @@ impl TaskBody for PyTask {
     /// returned, or if it was cancelled (a `Cancelled` raised while its scope was cancelling
     /// ends the task as cancelled, see `step::poll`). The outcome stays for the joiners.
     ///
-    /// A Rust panic in the step loop is not asked for here: the task fails without a payload
-    /// for the scope, which is cancelled with `ChildFailed`, and the panic goes on out of
-    /// `porto.run` (it is resumed on the lane), so no scope exit waits to report it.
+    /// A Rust panic in the step loop is raised in the coroutine as `porto.RustPanic` at its
+    /// current `await` (`step::guarded_steps`), so it comes out of the coroutine like any other
+    /// exception and is asked for here. Only a panic outside the step loop ends the task through
+    /// [`PyTask::fail_with_panic`], which stores the same `RustPanic` as the failure.
     fn take_failure(self: Pin<&mut Self>) -> Option<Box<dyn Any + Send>> {
         if self.slot_kind != SlotKind::Err {
             return None;

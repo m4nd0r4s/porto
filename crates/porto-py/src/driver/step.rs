@@ -47,6 +47,7 @@
 //! [`exit_cancel_scope`]) while the loop holds the task.
 
 use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
 use std::task::{Context, Poll, Waker};
 
@@ -588,7 +589,7 @@ pub(super) fn poll(
         // Published only while the coroutine steps: Python code that `complete` runs (a
         // `Task.finish`, an unraisable hook) must not see the finished task as running.
         let _running = RunningTask::set(&running);
-        step_until_wait(task, &coro, &running, cx)
+        guarded_steps(task, &coro, &running, cx)
     };
     task.coro = Some(coro.unbind().into());
     if let Some(handle) = running.made_handle.take() {
@@ -667,6 +668,52 @@ fn cancelled_by_its_scope(
             }
         }
         outcome => outcome,
+    }
+}
+
+/// [`step_until_wait`], with a panic in it (Rust code between two resumes of the coroutine: a Rust
+/// future the task awaits, the driver) turned into a `porto.RustPanic` raised in the coroutine at
+/// the `await` it was suspended in (ADR-027, spec 25 §8). The coroutine then unwinds like for any
+/// exception, in its own context and with the task published: the scopes it entered cancel and
+/// wait for their children, `finally` blocks run and may shield cleanup, and the `RustPanic`
+/// reaches the task's scope only after that subtree drained.
+///
+/// A second panic while that unwinds ends the task at once: the coroutine is closed here, still
+/// inside its context, and the task fails with the `RustPanic` of the first.
+fn guarded_steps(
+    task: &mut PyTask,
+    coro: &Bound<'_, PyAny>,
+    running: &Running,
+    cx: &mut Context<'_>,
+) -> Option<TaskOutcome> {
+    let py = coro.py();
+    let mut thrown: Option<Py<PyBaseException>> = None;
+    loop {
+        match catch_unwind(AssertUnwindSafe(|| {
+            step_until_wait(task, coro, running, cx)
+        })) {
+            Ok(outcome) => return outcome,
+            Err(payload) => {
+                let exception = crate::errors::caught_panic(&*payload).into_value(py);
+                // What the panic left half-done is not trusted: the wait it was in is given up
+                // (dropping the Rust future that panicked), and a cancel stack that was out
+                // with the step goes back to the task.
+                task.abandon_wait();
+                let stack = running.stack.take();
+                if stack.innermost().is_some() {
+                    task.put_cancel_stack(stack);
+                }
+                if let Some(first) = thrown {
+                    drop(exception);
+                    if let Err(error) = coro.call_method0(intern!(py, "close")) {
+                        error.write_unraisable(py, Some(coro));
+                    }
+                    return Some(TaskOutcome::Err(first));
+                }
+                thrown = Some(exception.clone_ref(py));
+                task.set_resume(Resume::Throw(exception));
+            }
+        }
     }
 }
 

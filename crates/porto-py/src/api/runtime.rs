@@ -296,9 +296,27 @@ fn in_runtime() -> bool {
     lane::is_active()
 }
 
-/// Adds the class and the functions to `module`.
+/// `os.register_at_fork(after_in_child=...)`: the child of a `fork()` taken while a runtime runs
+/// in another thread inherits the process-wide I1 flag with no thread left to clear it, so every
+/// `porto.run` there would be refused for good. Clears it: "fresh runtimes may be created in the
+/// child" (25 §6). What happens to the runtime the child inherited is the fork hooks' business.
+#[pyfunction(name = "_after_fork_in_child")]
+fn after_fork_in_child() {
+    PROCESS_RUN.store(false, Ordering::Release);
+}
+
+/// Adds the class and the functions to `module`, and the fork hook.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Runtime>()?;
     module.add_function(wrap_pyfunction!(runtime, module)?)?;
-    module.add_function(wrap_pyfunction!(in_runtime, module)?)
+    module.add_function(wrap_pyfunction!(in_runtime, module)?)?;
+    let os = module.py().import("os")?;
+    // Windows has no fork.
+    if os.hasattr("register_at_fork")? {
+        let hook = wrap_pyfunction!(after_fork_in_child, module)?;
+        let keywords = PyDict::new(module.py());
+        keywords.set_item("after_in_child", hook)?;
+        os.call_method("register_at_fork", (), Some(&keywords))?;
+    }
+    Ok(())
 }
