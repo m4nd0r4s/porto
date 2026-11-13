@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,6 +67,9 @@ thread_local! {
     /// Whether the run on this thread is in debug mode (`RuntimeConfig.debug`): read only by
     /// the cold paths that report mistakes (a swallowed `Cancelled`, 15 C11).
     static DEBUG: Cell<bool> = const { Cell::new(false) };
+    /// Test hook (`_arm_scheduler_panic`): the next poll of the run's `main_or_interrupt` future
+    /// panics, outside any task.
+    static SCHEDULER_PANIC_ARMED: Cell<bool> = const { Cell::new(false) };
     /// What the run on this thread keeps (see the module docs).
     static LANE: RefCell<LaneState> = RefCell::new(LaneState::default());
 }
@@ -295,6 +299,36 @@ pub(crate) fn fail(exception: Py<PyBaseException>) {
     }
 }
 
+/// Drives `future` on `runtime`'s lane (the run's `block_on`). A panic in a task never gets here:
+/// `PyTask::poll` turns it into a `porto.RustPanic` failure of that task. One that does is a
+/// panic in scheduler internals (the queues, the timers, the driver, the lane's own futures),
+/// which leaves state that no task can repair: it is logged and the process aborts (ADR-027,
+/// spec 25 §8), instead of unwinding into CPython or running on with a broken scheduler.
+pub(crate) fn block_on<F: Future>(runtime: &Runtime, future: F) -> F::Output {
+    match catch_unwind(AssertUnwindSafe(|| runtime.block_on(future))) {
+        Ok(output) => output,
+        Err(payload) => abort_after_scheduler_panic(&*payload),
+    }
+}
+
+/// Logs a panic of the scheduler's own code and aborts the process.
+#[cold]
+fn abort_after_scheduler_panic(payload: &(dyn core::any::Any + Send)) -> ! {
+    let panic = crate::errors::rust_panic_description(payload);
+    // The panic hook already printed the message and location; this says what it means.
+    eprintln!(
+        "porto: fatal: a Rust panic in the scheduler ({panic}); the runtime cannot continue and \
+         the process aborts. This is a bug in porto: please report it with the panic message above"
+    );
+    std::process::abort();
+}
+
+/// Test hook: makes the next poll of [`main_or_interrupt`] on this thread panic, which is a panic
+/// in scheduler internals ([`block_on`] aborts the process).
+pub(crate) fn arm_scheduler_panic() {
+    SCHEDULER_PANIC_ARMED.set(true);
+}
+
 /// Waits for `main`, the outcome of the run's main task, and meanwhile delivers what stops the
 /// run early: a signal handler that raises (`KeyboardInterrupt` on Ctrl-C), checked every
 /// [`SIGNAL_CHECK_INTERVAL`], and a [`fail`]ure. MUST be polled by the lane's `block_on`.
@@ -302,6 +336,10 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
     let mut main = pin!(main);
     let mut ticker = pin!(sleep_until(Deadline::after(SIGNAL_CHECK_INTERVAL)));
     poll_fn(|cx| {
+        assert!(
+            !SCHEDULER_PANIC_ARMED.replace(false),
+            "test hook: a panic in the scheduler"
+        );
         if let Poll::Ready(outcome) = main.as_mut().poll(cx) {
             return Poll::Ready(outcome);
         }

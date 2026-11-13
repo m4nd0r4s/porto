@@ -12,9 +12,14 @@
 //! [`RustPanic`] through [`rust_panic`].
 
 use core::any::Any;
+use core::cell::RefCell;
 use core::iter::successors;
 use std::error::Error;
+use std::panic;
+use std::sync::Once;
 
+use pyo3::exceptions::PyBaseException;
+use pyo3::panic::PanicException;
 use pyo3::prelude::*;
 use pyo3::{PyTypeInfo, import_exception};
 
@@ -61,6 +66,71 @@ pub fn add_cause_notes(py: Python<'_>, exception: &PyErr, error: &(dyn Error + '
 /// the `file:line:column` of the panic when a panic hook recorded it.
 pub fn rust_panic(payload: &(dyn Any + Send), location: Option<&str>) -> PyErr {
     RustPanic::new_err((panic_message(payload), location.map(str::to_owned)))
+}
+
+thread_local! {
+    /// Where the last panic on this thread happened, recorded by the hook of
+    /// [`install_panic_hook`] before the unwind starts.
+    static LAST_PANIC_LOCATION: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Chains a panic hook that records where each panic happened (`file:line:column`), so the
+/// [`RustPanic`] of a task that panicked can say where (spec 25 §8). The previous hook still
+/// runs, so the message and the location are logged to stderr as usual. Idempotent.
+pub fn install_panic_hook() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let location = info.location().map(ToString::to_string);
+            LAST_PANIC_LOCATION.with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = location;
+                }
+            });
+            previous(info);
+        }));
+    });
+}
+
+/// Takes the location of the last panic on this thread, if the hook recorded one.
+pub fn take_panic_location() -> Option<String> {
+    LAST_PANIC_LOCATION.with_borrow_mut(Option::take)
+}
+
+/// The [`RustPanic`] for a panic that `catch_unwind` caught on this thread, with the location the
+/// panic hook recorded for it.
+pub fn caught_panic(payload: &(dyn Any + Send)) -> PyErr {
+    rust_panic(payload, take_panic_location().as_deref())
+}
+
+/// `exception` as `porto.RustPanic` if it is the `PanicException` that pyo3 raises for a panic
+/// in a `#[pyfunction]`/`#[pymethods]` body (pyo3 catches the unwind at every such entry point
+/// and raises it in the caller, a `BaseException` outside `porto.errors`): the original stays as
+/// `__cause__`. Any other exception is returned as it is.
+pub fn panic_exception_as_rust_panic<'py>(
+    py: Python<'py>,
+    exception: Bound<'py, PyBaseException>,
+) -> Bound<'py, PyBaseException> {
+    if !exception.is_instance_of::<PanicException>() {
+        return exception;
+    }
+    let message = exception
+        .str()
+        .map_or_else(|_| "a Rust panic".to_owned(), |text| text.to_string());
+    let converted = RustPanic::new_err((message, take_panic_location()));
+    converted.set_cause(py, Some(PyErr::from_value(exception.into_any())));
+    converted.into_value(py).into_bound(py)
+}
+
+/// `message` or `message at location`, for a log line about a panic that is not turned into a
+/// Python exception.
+pub fn rust_panic_description(payload: &(dyn Any + Send)) -> String {
+    let message = panic_message(payload);
+    match take_panic_location() {
+        Some(location) => format!("{message} at {location}"),
+        None => message,
+    }
 }
 
 /// The message of a panic: `panic!` payloads are a `&str` or a `String`; anything else came from

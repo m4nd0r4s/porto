@@ -7,16 +7,49 @@
 
 use core::fmt;
 use std::error::Error;
+use std::future::poll_fn;
 use std::panic::catch_unwind;
+use std::task::Poll;
 
 use pyo3::prelude::*;
 
+use crate::driver::pytask::Resume;
+use crate::driver::thin::BoxedFuture;
+use crate::driver::trap::{Trap, TrapKind};
 use crate::errors::{self, PortoError};
 
 /// Adds the hooks to `module`.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(raise_rust_error_chain, module)?)?;
-    module.add_function(wrap_pyfunction!(raise_rust_panic, module)?)
+    module.add_function(wrap_pyfunction!(raise_rust_panic, module)?)?;
+    module.add_function(wrap_pyfunction!(panicking_future, module)?)?;
+    module.add_function(wrap_pyfunction!(panic_in_pyfunction, module)?)?;
+    module.add_function(wrap_pyfunction!(arm_scheduler_panic, module)?)
+}
+
+/// A trap that waits for a Rust future which panics when polled: awaiting it makes the step
+/// loop of the awaiting task panic (outside any `#[pyfunction]`, so pyo3 does not catch it).
+#[pyfunction(name = "_panicking_future")]
+#[pyo3(signature = (message, /))]
+fn panicking_future(message: String) -> Trap {
+    Trap::new(TrapKind::Future(BoxedFuture::new(poll_fn(
+        move |_cx| -> Poll<Resume> { panic!("{message}") },
+    ))))
+}
+
+/// Panics inside a `#[pyfunction]`: pyo3 catches it and raises `pyo3_runtime.PanicException`,
+/// which a task that does not handle it fails with as `porto.RustPanic`.
+#[pyfunction(name = "_panic_in_pyfunction")]
+#[pyo3(signature = (message, /))]
+fn panic_in_pyfunction(message: &str) {
+    panic!("{message}");
+}
+
+/// Makes the lane's next `main_or_interrupt` poll panic: a panic in scheduler internals, which
+/// aborts the process.
+#[pyfunction(name = "_arm_scheduler_panic")]
+fn arm_scheduler_panic() {
+    crate::driver::lane::arm_scheduler_panic();
 }
 
 /// A Rust error `depth` levels deep: `level 0` is caused by `level 1`, ... down to

@@ -14,6 +14,15 @@
 //! assert_eq!(rt.block_on(task).unwrap(), 2);
 //! ```
 
+// ADR-027 / spec 25 §8: a panic in a task must unwind to the task boundary, so the task fails
+// with `porto.RustPanic` and the lane keeps running. `panic = "abort"` would turn every panic
+// into a process abort: set `panic = "unwind"` in the profile (Cargo.toml) and drop `-C panic=abort`.
+#[cfg(panic = "abort")]
+compile_error!(
+    "porto requires panic = \"unwind\" (ADR-027): a panic in a task is caught and becomes \
+     porto.RustPanic; set `panic = \"unwind\"` in the Cargo profile and remove `-C panic=abort`"
+);
+
 pub mod blocking;
 pub mod config;
 pub mod coop;

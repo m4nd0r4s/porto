@@ -1483,6 +1483,15 @@ def _raise_rust_error_chain(depth: int, /) -> NoReturn:
 def _raise_rust_panic(message: str, /) -> NoReturn:
     """Test hook: panics in Rust with ``message`` and raises the resulting ``RustPanic``."""
 
+def _panicking_future(message: str, /) -> Awaitable[NoReturn]:
+    """Test hook: a trap that waits for a Rust future that panics with ``message`` when polled."""
+
+def _panic_in_pyfunction(message: str, /) -> NoReturn:
+    """Test hook: panics inside a ``#[pyfunction]`` (pyo3 raises ``PanicException``)."""
+
+def _arm_scheduler_panic() -> None:
+    """Test hook: the lane's next scheduler poll panics, which aborts the process."""
+
 @final
 class _WaitProbe:
     """Test hook: a wait queue with permits. ``wait()`` is a ``Notified`` trap on it."""

@@ -98,12 +98,15 @@ fn run_in_root_scope(
         let main = pytask::spawn(runtime.handle(), coro, spawned)?;
         task.get().bind(&main);
         let abandoned = Cell::new(0);
-        let outcome = runtime.block_on(lane::main_or_interrupt(async {
-            let outcome = pytask::join(main).await;
-            node.cancel(CancelReason::Shutdown);
-            abandoned.set(drain(&node, Deadline::after(cancel_timeout)).await);
-            outcome
-        }));
+        let outcome = lane::block_on(
+            runtime,
+            lane::main_or_interrupt(async {
+                let outcome = pytask::join(main).await;
+                node.cancel(CancelReason::Shutdown);
+                abandoned.set(drain(&node, Deadline::after(cancel_timeout)).await);
+                outcome
+            }),
+        );
         if abandoned.get() > 0 {
             warn_abandoned(py, abandoned.get(), cancel_timeout)?;
         }
@@ -246,7 +249,10 @@ fn private_run(coro: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     let unstarted = coro.clone();
     let outcome = lane::run(py, &RuntimeConfig::default(), |runtime| {
         let main = pytask::spawn(runtime.handle(), coro, Spawned::Joined)?;
-        PyResult::Ok(runtime.block_on(lane::main_or_interrupt(pytask::join(main))))
+        PyResult::Ok(lane::block_on(
+            runtime,
+            lane::main_or_interrupt(pytask::join(main)),
+        ))
     })
     .inspect_err(|_| {
         // The runtime did not start (its I/O driver did not open): close the coroutine, so

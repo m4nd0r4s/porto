@@ -56,6 +56,7 @@ use porto_core::task::{Header, TaskFlags};
 use pyo3::exceptions::{
     PyBaseException, PyRuntimeError, PyRuntimeWarning, PyStopIteration, PyTypeError,
 };
+use pyo3::panic::PanicException;
 use pyo3::prelude::*;
 use pyo3::{ffi, intern};
 
@@ -598,6 +599,7 @@ pub(super) fn poll(
     release_spare_value(py);
     match outcome {
         Some(outcome) => {
+            let outcome = panic_as_rust_panic(py, outcome);
             let outcome = cancelled_by_its_scope(py, task, &running, outcome);
             if matches!(outcome, TaskOutcome::Ok(_)) {
                 warn_if_swallowed(py, task);
@@ -606,6 +608,21 @@ pub(super) fn poll(
             Poll::Ready(())
         }
         None => Poll::Pending,
+    }
+}
+
+/// `outcome`, with the `PanicException` pyo3 raised for a panic in a `#[pyfunction]` or
+/// `#[pymethods]` body that the coroutine did not handle replaced by `porto.RustPanic` (ADR-027:
+/// a task that panics fails with `RustPanic`, wherever in Rust the panic happened).
+#[inline]
+fn panic_as_rust_panic(py: Python<'_>, outcome: TaskOutcome) -> TaskOutcome {
+    match outcome {
+        TaskOutcome::Err(exception) if exception.bind(py).is_instance_of::<PanicException>() => {
+            let converted =
+                crate::errors::panic_exception_as_rust_panic(py, exception.into_bound(py));
+            TaskOutcome::Err(converted.unbind())
+        }
+        outcome => outcome,
     }
 }
 

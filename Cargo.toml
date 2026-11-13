@@ -68,6 +68,8 @@ panic = "unwind"
 inherits = "release"
 
 [profile.dev]
+# Task-level panics are caught and become `porto.RustPanic` (ADR-027): unwinding must stay on.
+panic = "unwind"
 # Keep the dev build small: line tables for our crates, no debuginfo for dependencies.
 debug = "line-tables-only"
 

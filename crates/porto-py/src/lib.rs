@@ -3,6 +3,15 @@
 //! See the [Python API reference](https://github.com/m4nd0r4s/porto/blob/main/docs/spec/10-porto-runtime/20-python-api-reference.md)
 //! and [CPython integration](https://github.com/m4nd0r4s/porto/blob/main/docs/spec/10-porto-runtime/25-cpython-integration-and-memory.md).
 
+// ADR-027 / spec 25 §8: a panic in a task must unwind to the task boundary, so the task fails
+// with `porto.RustPanic` and the lane keeps running. `panic = "abort"` would turn every panic
+// into a process abort: set `panic = "unwind"` in the profile (Cargo.toml) and drop `-C panic=abort`.
+#[cfg(panic = "abort")]
+compile_error!(
+    "porto requires panic = \"unwind\" (ADR-027): a panic in a task is caught and becomes \
+     porto.RustPanic; set `panic = \"unwind\"` in the Cargo profile and remove `-C panic=abort`"
+);
+
 use pyo3::prelude::*;
 
 mod api;
@@ -38,6 +47,7 @@ driver::freelist::gil_freelist!(channel_op_freelist, 256);
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
+    errors::install_panic_hook();
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_class::<Trap>()?;
     module.add_class::<Ready>()?;

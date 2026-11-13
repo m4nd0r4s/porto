@@ -22,6 +22,7 @@
 use std::any::Any;
 use std::future::Future;
 use std::marker::PhantomPinned;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll};
@@ -569,6 +570,17 @@ impl PyTask {
         unsafe { &(*task.as_ptr()).join }
     }
 
+    /// Ends the task with `porto.RustPanic` after its step loop panicked (the unwind dropped the
+    /// coroutine, closing it, and every guard of the poll): the scope it was spawned into hears
+    /// it like any other exception of the task (C4), joiners get it, and the lane goes on.
+    fn fail_with_panic(&mut self, py: Python<'_>, header: &Header, payload: &(dyn Any + Send)) {
+        let exception = crate::errors::caught_panic(payload).into_value(py);
+        // Nothing of the half-done step is trusted: `complete` gives the wait up, and the
+        // exception replaces whatever the slot held.
+        drop(self.slot.take().map(PyObj::into_unchecked));
+        self.complete(py, header, TaskOutcome::Err(exception));
+    }
+
     /// Stores the outcome, hands it to whoever learns of it, and wakes the joiners. The last
     /// thing the lane does to the body: joiners read the outcome once `join` is closed.
     pub(super) fn complete(&mut self, py: Python<'_>, header: &Header, outcome: TaskOutcome) {
@@ -625,7 +637,16 @@ impl TaskBody for PyTask {
         // parks, when no task runs (`lane.rs`).
         let py = unsafe { Python::assume_attached() };
         // SAFETY: the step loop never moves the body or its nodes (see `PyTask::timer`).
-        step::poll(unsafe { self.get_unchecked_mut() }, header, py, cx)
+        let task = unsafe { self.get_unchecked_mut() };
+        // A panic in the step loop (Rust code between two resumes of the coroutine: a Rust
+        // future the task awaits, a driver bug) fails this task only (ADR-027, spec 25 §8).
+        match catch_unwind(AssertUnwindSafe(|| step::poll(task, header, py, cx))) {
+            Ok(polled) => polled,
+            Err(payload) => {
+                task.fail_with_panic(py, header, &*payload);
+                Poll::Ready(())
+            }
+        }
     }
 
     /// The exception the coroutine raised, for the scope it was spawned into (C4): `None` if it
