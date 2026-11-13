@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use porto_core::Handle;
 use porto_core::config::RuntimeConfig;
@@ -149,7 +149,7 @@ fn run_in_root_scope(
             lane::Interrupted::Interrupt(exception) => Finished::interrupted(exception),
         };
         if finished.abandoned > 0 {
-            warn_abandoned(py, finished.abandoned, cancel_timeout)?;
+            warn_abandoned(py, finished.abandoned, cancel_timeout, &finished)?;
         }
         PyResult::Ok((finished, root.get().close()))
     })
@@ -178,6 +178,10 @@ struct Finished {
     abandoned: u32,
     /// What asked for the shutdown, if something did.
     cause: Option<Cause>,
+    /// How long the root scope was cancelled before the run gave up on it.
+    waited: Duration,
+    /// Whether a second Ctrl-C forced the shutdown.
+    forced: bool,
 }
 
 impl Finished {
@@ -186,6 +190,8 @@ impl Finished {
             outcome: Some(TaskOutcome::Err(exception)),
             abandoned: 0,
             cause: None,
+            waited: Duration::ZERO,
+            forced: false,
         }
     }
 }
@@ -196,8 +202,8 @@ impl Finished {
 /// 2. DRAINING (a request came while main runs): set `porto.lifecycle.shutdown_requested()` and
 ///    give main the graceful period to end by itself.
 /// 3. CANCELLING: cancel the root scope (`Shutdown`) and give main `cancel_timeout` to end.
-/// 4. Once main ended, or was given up on: cancel the root scope, give the tasks still in it
-///    what is left of `cancel_timeout`, and abandon the rest.
+/// 4. Once main ended, or was given up on: cancel the root scope (if it is not yet), give the
+///    tasks still in it what is left of that one `cancel_timeout`, and abandon the rest.
 ///
 /// A forced shutdown (a second Ctrl-C) stops every wait: the scope is cancelled and what is
 /// left is abandoned at once. MUST be polled by the lane's `block_on`.
@@ -233,29 +239,35 @@ async fn supervise<J: Future<Output = TaskOutcome>>(
         )
         .await;
     }
+    // One `cancel_timeout`, from the moment the root scope is cancelled, for main and every
+    // other task of it (26 §2 step 4).
+    let cancelled_at = Instant::now();
+    let cancel_deadline = Deadline::after(waits.cancel);
+    node.cancel(CancelReason::Shutdown);
     if outcome.is_none() {
-        node.cancel(CancelReason::Shutdown);
         outcome = main_or(
             join.as_mut(),
             first_of(
-                sleep_until(Deadline::after(waits.cancel)),
+                sleep_until(cancel_deadline),
                 poll_fn(|cx| lifecycle.poll_forced(cx)),
             ),
         )
         .await;
     }
-    node.cancel(CancelReason::Shutdown);
-    let deadline = if outcome.is_none() || lifecycle.is_forced() {
-        // Main never ended, or the shutdown is forced: nothing more to wait for.
+    let deadline = if outcome.is_none() {
+        // Main never ended: nothing more to wait for.
         Deadline::after(Duration::ZERO)
     } else {
-        Deadline::after(waits.cancel)
+        cancel_deadline
     };
-    let abandoned = drain(node, deadline).await;
+    let abandoned = drain(node, lifecycle, deadline).await;
     Finished {
         outcome,
         abandoned,
-        cause,
+        // A Ctrl-C while the root scope drains after main ended counts too.
+        cause: cause.or_else(|| lifecycle.cause()),
+        waited: cancelled_at.elapsed(),
+        forced: lifecycle.is_forced(),
     }
 }
 
@@ -291,10 +303,11 @@ async fn first_of(first: impl Future<Output = ()>, second: impl Future<Output = 
     .await;
 }
 
-/// Waits until no task is left in `scope`, or `deadline` passed: the tasks still there are
+/// Waits until no task is left in `scope`, `deadline` passed, or a second Ctrl-C forced the
+/// shutdown: the tasks still there are
 /// then abandoned (dropped with the runtime), and their count is returned. MUST be polled by
 /// the lane's `block_on`.
-async fn drain(scope: &PyScopeNode, deadline: Deadline) -> u32 {
+async fn drain(scope: &PyScopeNode, lifecycle: &Lifecycle, deadline: Deadline) -> u32 {
     let mut timeout = pin!(sleep_until(deadline));
     poll_fn(|cx| {
         let mut state = scope.lock_state();
@@ -307,7 +320,7 @@ async fn drain(scope: &PyScopeNode, deadline: Deadline) -> u32 {
         drop(state);
         // Dropped after the lock (see `ScopeNode::lock_state`).
         drop(previous);
-        if drained || timeout.as_mut().poll(cx).is_ready() {
+        if drained || timeout.as_mut().poll(cx).is_ready() || lifecycle.poll_forced(cx).is_ready() {
             return Poll::Ready(());
         }
         Poll::Pending
@@ -322,15 +335,31 @@ async fn drain(scope: &PyScopeNode, deadline: Deadline) -> u32 {
     abandoned
 }
 
-/// Warns that `count` tasks of the root scope outlived `cancel_timeout` after main ended: they
-/// are dropped with the runtime, their coroutines closed with no runtime around (26 §2).
-fn warn_abandoned(py: Python<'_>, count: u32, cancel_timeout: Duration) -> PyResult<()> {
-    let message = format!(
-        "porto.run: {count} task(s) of the root scope still ran {:.3} s (cancel_timeout) after \
-         main ended and the root scope was cancelled, and were abandoned; let them exit when \
-         they get porto.Cancelled (do not swallow it), or raise cancel_timeout",
-        cancel_timeout.as_secs_f64()
-    );
+/// Warns that `count` tasks of the root scope were abandoned: still running when the wait for
+/// them ended, `finished.waited` after the root scope was cancelled. They are dropped with the
+/// runtime, their coroutines closed with no runtime around (26 §2).
+fn warn_abandoned(
+    py: Python<'_>,
+    count: u32,
+    cancel_timeout: Duration,
+    finished: &Finished,
+) -> PyResult<()> {
+    let waited = finished.waited.as_secs_f64();
+    let message = if finished.forced {
+        format!(
+            "porto.run: {count} task(s) of the root scope were abandoned: the shutdown was forced \
+             (a second Ctrl-C) {waited:.3} s after the root scope was cancelled, and they were \
+             still running; let them exit when they get porto.Cancelled (do not swallow it)"
+        )
+    } else {
+        format!(
+            "porto.run: {count} task(s) of the root scope still ran {waited:.3} s after main \
+             ended and the root scope was cancelled (cancel_timeout is {:.3} s), and were \
+             abandoned; let them exit when they get porto.Cancelled (do not swallow it), or \
+             raise cancel_timeout",
+            cancel_timeout.as_secs_f64()
+        )
+    };
     let category = py.get_type::<PyRuntimeWarning>();
     PyErr::warn(py, &category, &std::ffi::CString::new(message)?, 1)
 }
@@ -398,6 +427,12 @@ fn signal_exception(py: Python<'_>, cause: Cause) -> PyResult<Option<PyErr>> {
             Ok(Some(PyErr::from_value(terminated.call1((143,))?)))
         }
     }
+}
+
+/// In a forked child, on the thread that was the parent's lane: the root scope it published is
+/// the parent's. Forgotten, not dropped, as it belongs to a runtime that is gone.
+pub(crate) fn forget_in_child() {
+    std::mem::forget(ROOT_SCOPE.take());
 }
 
 /// Publishes the root scope of the running `porto.run` for `_root_scope()` until dropped.

@@ -203,3 +203,66 @@ def test_a_run_leaves_no_threads_and_no_descriptors_behind() -> None:
     assert threading.active_count() == threads, "a lane or pool thread outlived porto.run"
     if sys.platform != "win32":
         assert open_descriptors() == descriptors, "porto.run leaked a file descriptor"
+
+
+def test_the_root_scope_gets_one_cancel_timeout_in_all_not_one_after_main_ended() -> None:
+    async def slow_main() -> None:
+        with porto.shield():
+            await porto.sleep(0.8)
+
+    async def stuck() -> None:
+        with porto.shield():
+            await porto.sleep(30)
+
+    async def main() -> None:
+        porto.runtime().root_scope.spawn(stuck, name="stuck")
+        porto.runtime().shutdown(timeout=0.1)
+        await slow_main()
+
+    started = time.monotonic()
+    messages = recorded(lambda: porto.run(main, cancel_timeout=1.0))
+    elapsed = time.monotonic() - started
+    assert any("1 task(s) of the root scope" in message for message in messages), messages
+    # 0.1 graceful + 1.0 cancel_timeout in all (main ended 0.7 s into it), not 0.8 + 1.0 more.
+    assert elapsed < 1.6, f"the drain got a second cancel_timeout: {elapsed:.2f} s"
+
+
+def test_block_on_raises_cancelled_when_another_thread_shut_the_runtime_down_on_a_stuck_main() -> (
+    None
+):
+    runtime = porto.Runtime()
+    ready = threading.Event()
+    raised: list[BaseException] = []
+
+    async def main() -> None:
+        ready.set()
+        await porto.sleep(30)
+
+    def run() -> None:
+        try:
+            runtime.block_on(main)
+        except BaseException as error:  # the test looks at what block_on raised
+            raised.append(error)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert ready.wait(10)
+    runtime.shutdown(timeout=0.1)
+    thread.join(10)
+    assert len(raised) == 1
+    assert isinstance(raised[0], porto.Cancelled)
+
+
+def test_shutdown_from_a_blocking_pool_worker_returns_at_once() -> None:
+    runtime = porto.Runtime()
+
+    async def main() -> str:
+        started = time.monotonic()
+        await porto.to_thread(runtime.shutdown, timeout=0.1)
+        assert time.monotonic() - started < 3, "the worker waited for the runtime that waits for it"
+        await porto.lifecycle.shutdown_requested().wait()
+        return "done"
+
+    started = time.monotonic()
+    assert runtime.block_on(main) == "done"
+    assert time.monotonic() - started < 5

@@ -100,6 +100,11 @@ impl Lifecycle {
         Poll::Pending
     }
 
+    /// What asked for the shutdown, if something did, even after main ended.
+    pub(crate) fn cause(&self) -> Option<Cause> {
+        self.lock().request.map(|request| request.cause)
+    }
+
     /// Whether the shutdown was forced.
     pub(crate) fn is_forced(&self) -> bool {
         self.lock().forced
