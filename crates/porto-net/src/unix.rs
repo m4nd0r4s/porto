@@ -74,17 +74,25 @@ pub fn address(name: &[u8]) -> io::Result<SockAddr> {
 }
 
 /// The socket file a listener created, remembered to remove it on close, but only if it is still
-/// the file the listener made: a path another process replaced is not ours to delete.
+/// the file the listener made: a path another process replaced is not ours to delete. And only
+/// in the process that created it: a forked child holds a copy of the listener, and dropping it
+/// must not unlink the parent's socket.
 #[derive(Debug)]
 pub struct SocketFile {
     path: PathBuf,
     device: u64,
     inode: u64,
+    /// The process that made the file.
+    creator: u32,
 }
 
 impl SocketFile {
-    /// Removes the file if the path still holds the socket this made. `true` if it was removed.
+    /// Removes the file if the path still holds the socket this made, and this is the process
+    /// that made it. `true` if it was removed.
     pub fn remove(&self) -> bool {
+        if std::process::id() != self.creator {
+            return false;
+        }
         match std::fs::symlink_metadata(&self.path) {
             Ok(metadata)
                 if metadata.file_type().is_socket()
@@ -111,6 +119,13 @@ static UMASK: Mutex<()> = Mutex::new(());
 /// (`0..=0o777`), and is never visible with more: the bind runs under a `umask` that clears what
 /// `mode` clears, on top of the process's own. The abstract namespace has no file, so `mode`
 /// and the returned file are nothing there.
+///
+/// **`umask` is process-wide**, and a socket's mode cannot be set before the bind (`fchmod` on
+/// the unbound socket does not reach the file the bind makes), so for the few microseconds of the
+/// bind another thread that creates a file gets the stricter mask too. That is the safe
+/// direction (the mask only ever adds bits to the process's own: such a file may lack
+/// permissions it would usually have, never gains any), and the changes are serialized between
+/// listeners, but it is not invisible: see 17 §2.2.
 ///
 /// # Errors
 ///
@@ -172,6 +187,7 @@ fn finish_file(path: &Path, mode: u32) -> io::Result<SocketFile> {
         path: path.to_owned(),
         device: metadata.dev(),
         inode: metadata.ino(),
+        creator: std::process::id(),
     })
 }
 

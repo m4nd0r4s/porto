@@ -147,9 +147,11 @@ async def bind_udp(
     takes IPv4 too (an IPv4 socket on a host without IPv6, or when ``broadcast`` is set). An
     IPv6 ``host`` binds an IPv6-only socket, an IPv4 ``host`` an IPv4 one. ``port=0`` picks a
     free port, which ``socket.port`` reports. ``reuse_port`` lets several sockets bind the same
-    port, the kernel spreading the datagrams between them (``NotImplementedError`` where the OS
-    cannot). ``broadcast`` sets ``SO_BROADCAST`` so the socket may send to a broadcast address
-    (IPv4 only: ``ValueError`` with an IPv6 ``host``).
+    port: on Linux the kernel spreads the datagrams between them, on macOS and the BSDs it only
+    lets the binds succeed and does not balance (unicast datagrams go to one socket)
+    (``NotImplementedError`` where the OS has no ``SO_REUSEPORT``). ``broadcast`` sets
+    ``SO_BROADCAST`` so the socket may send to a broadcast address (IPv4 only: ``ValueError``
+    with an IPv6 ``host``).
 
     A datagram is received whole by ``recv_from`` and sent whole by ``send_to``; a socket
     that ``connect``-ed to a peer uses ``send`` and ``recv``. An IPv4 destination of an IPv6
@@ -177,6 +179,11 @@ async def listen_unix(
     0..0o777; connecting needs write permission on it), and is never visible with more: the
     default 0o660 lets the owner and the group connect. ``mode`` means nothing for an abstract
     name. ``backlog`` is the queue of connections not accepted yet.
+
+    The file's mode cannot be set before it exists, so the bind runs under a stricter ``umask``,
+    which is process-wide: for those few microseconds a file another thread creates gets the
+    stricter mask too (it may lack permissions it would usually have, never gains any). Create
+    the listener before starting threads that create files, if that matters to you.
 
     The path must not exist: a path that does (a running server's socket, or a file a crashed
     server left behind) is ``OSError`` with ``EADDRINUSE`` and is never removed on your behalf.

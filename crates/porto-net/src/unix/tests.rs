@@ -147,3 +147,20 @@ fn an_abstract_name_is_refused_where_the_os_has_none() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("abstract"), "{error}");
 }
+
+#[test]
+fn a_process_other_than_the_creator_never_removes_the_file() {
+    // What a forked child holding a copy of the listener is: another process id.
+    let path = temp_path("creator");
+    drop(std::fs::remove_file(&path));
+    let (_socket, file) = listen(&address_of(&path), 8, 0o660).unwrap();
+    let mut file = file.unwrap();
+    file.creator += 1;
+    assert!(!file.remove());
+    assert!(
+        path.exists(),
+        "the creator's file survives the other process"
+    );
+    file.creator -= 1;
+    assert!(file.remove());
+}
