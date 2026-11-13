@@ -350,9 +350,12 @@ def test_a_broadcast_socket_may_send_to_a_broadcast_address() -> None:
     async def main() -> str:
         async with await net.bind_udp(LOOPBACK, broadcast=True) as sock:
             try:
-                await sock.send_to(b"x", ("255.255.255.255", 9))
+                async with porto.timeout(5):  # a host that never takes the datagram is no failure
+                    await sock.send_to(b"x", ("255.255.255.255", 9))
             except PermissionError:
                 return "refused"
+            except TimeoutError:
+                return "stuck"
             except OSError:
                 return "no route"
             return "sent"
