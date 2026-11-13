@@ -38,6 +38,9 @@ pub struct MioDriver {
     /// The raw handle of each live registration, to reregister and deregister it.
     sources: Mutex<HashMap<RegistrationId, RawOsHandle>>,
     waker: DriverWaker,
+    /// The process that made the poller. The poller (`epoll`) and the sources registered with
+    /// it are shared with a forked child; the child removing one would remove it for the parent.
+    owner: u32,
 }
 
 impl std::fmt::Debug for MioDriver {
@@ -64,6 +67,7 @@ impl MioDriver {
             slab: IoSlab::new(),
             sources: Mutex::default(),
             waker: DriverWaker::new(move || waker.wake()),
+            owner: std::process::id(),
         })
     }
 
@@ -80,6 +84,18 @@ impl MioDriver {
             .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, error))?;
         debug_assert_eq!(selection.kind, NATIVE_DRIVER_KIND);
         Ok((Self::new()?, selection.fallback))
+    }
+
+    /// Removes `raw` from the poller, unless this is a forked child of the process that made it:
+    /// the child shares the parent's `epoll` instance and its interest list, so removing a
+    /// source there would stop the parent's events for it. The child's own copy of the handle
+    /// closes without touching the poller.
+    fn remove_from_poller(&self, raw: RawOsHandle) -> io::Result<()> {
+        if std::process::id() == self.owner {
+            os::deregister(&self.registry, raw)
+        } else {
+            Ok(())
+        }
     }
 
     fn sources(&self) -> std::sync::MutexGuard<'_, HashMap<RegistrationId, RawOsHandle>> {
@@ -108,7 +124,7 @@ impl Driver for MioDriver {
     /// handle was already closed, which removed it), and that error is returned.
     fn deregister(&self, id: RegistrationId) -> io::Result<()> {
         let raw = self.sources().remove(&id).ok_or_else(|| stale(id))?;
-        let removed = os::deregister(&self.registry, raw);
+        let removed = self.remove_from_poller(raw);
         self.slab.release(id);
         removed
     }
@@ -118,7 +134,7 @@ impl Driver for MioDriver {
         let sources = std::mem::take(&mut *self.sources());
         for (id, raw) in sources {
             // The poller goes away with the driver; a refused removal changes nothing here.
-            drop(os::deregister(&self.registry, raw));
+            drop(self.remove_from_poller(raw));
             self.slab.release(id);
         }
     }

@@ -289,3 +289,26 @@ mod unix {
         9
     }
 }
+
+/// A forked child shares the parent's poller: deregistering there must not remove the source
+/// for the parent (the child's drop of an inherited socket would break the parent's events).
+#[cfg(unix)]
+#[test]
+fn a_process_other_than_the_one_that_made_the_poller_leaves_the_source_registered() {
+    use std::os::fd::AsRawFd;
+
+    let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+    left.set_nonblocking(true).unwrap();
+    let mut driver = MioDriver::new().unwrap();
+    let raw = left.as_raw_fd();
+    let id = driver
+        .register(RawSource::new(raw), Interest::READABLE)
+        .unwrap();
+    let real_owner = driver.owner;
+    driver.owner += 1; // what a forked child's process id is: another one
+    driver.deregister(id).unwrap();
+    driver.owner = real_owner;
+    // Still in the poller: removing it now succeeds, where a source already removed would be
+    // refused (ENOENT).
+    os::deregister(&driver.registry, raw).expect("the child's deregister left it registered");
+}
