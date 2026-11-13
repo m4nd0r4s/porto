@@ -11,7 +11,9 @@ import os
 import pathlib
 import socket
 import stat
+import subprocess
 import sys
+import textwrap
 import threading
 from collections.abc import Coroutine
 from typing import Any
@@ -28,8 +30,19 @@ pytestmark = pytest.mark.skipif(
 is_linux = sys.platform.startswith("linux")
 
 
+TEST_DEADLINE = 60  # seconds a test may take: none comes near it
+
+
 def run(coro: Coroutine[Any, Any, Any]) -> Any:
-    return porto.run(coro)
+    """Runs ``coro`` in ``porto.run`` under a deadline: a test that would wait forever (a datagram
+    or connection that never comes) fails after a minute with ``TimeoutError`` instead of
+    hanging the suite."""
+
+    async def bounded() -> Any:
+        async with porto.timeout(TEST_DEADLINE):
+            return await coro
+
+    return porto.run(bounded())
 
 
 def mode_of(path: str) -> int:
@@ -137,8 +150,13 @@ def test_a_foreign_client_and_a_foreign_server_talk_to_porto(unix_socket_path: s
     answer: list[bytes] = []
 
     def foreign_server(listening: socket.socket) -> None:
-        connection, _ = listening.accept()
+        # Bounded everywhere: a failing connect must end the thread, not hang the suite.
+        try:
+            connection, _ = listening.accept()
+        except OSError:
+            return
         with connection:
+            connection.settimeout(5)
             answer.append(connection.recv(100))
             connection.sendall(b"hello porto")
 
@@ -154,14 +172,15 @@ def test_a_foreign_client_and_a_foreign_server_talk_to_porto(unix_socket_path: s
         with socket.socket(socket.AF_UNIX) as listening:
             listening.bind(other)
             listening.listen()
-            thread = threading.Thread(target=foreign_server, args=(listening,))
+            listening.settimeout(5)
+            thread = threading.Thread(target=foreign_server, args=(listening,), daemon=True)
             thread.start()
             try:
-                async with await net.connect_unix(other) as client:
+                async with porto.timeout(10), await net.connect_unix(other) as client:
                     await client.write(b"hello foreign")
                     reply = await client.read_exact(11)
             finally:
-                thread.join()
+                thread.join(timeout=10)
         os.unlink(other)
         return received, reply
 
@@ -268,6 +287,49 @@ def test_a_listener_that_is_dropped_still_removes_its_file(unix_socket_path: str
         assert not os.path.exists(unix_socket_path)
 
     run(main())
+
+
+def test_a_forked_child_dropping_the_listener_does_not_remove_the_parents_file(
+    unix_socket_path: str,
+) -> None:
+    """The child of a fork holds a copy of the listener; letting it go must leave the socket file
+    to the process that made it."""
+    code = textwrap.dedent(
+        """
+        import gc, os, sys, warnings
+        import porto
+        from porto import net
+
+        warnings.simplefilter("ignore")
+        path = sys.argv[1]
+
+        async def main():
+            listener = await net.listen_unix(path)
+            pid = os.fork()
+            if pid == 0:
+                del listener
+                gc.collect()
+                os._exit(0 if os.path.exists(path) else 1)
+            _, status = os.waitpid(pid, 0)
+            print("child exit:", os.waitstatus_to_exitcode(status), flush=True)
+            print("file after the child:", os.path.exists(path), flush=True)
+            await listener.aclose()
+            print("file after the parent:", os.path.exists(path), flush=True)
+
+        porto.run(main)
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code, unix_socket_path],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "child exit: 0" in done.stdout, done.stdout
+    assert "file after the child: True" in done.stdout
+    assert "file after the parent: False" in done.stdout
 
 
 def test_a_file_that_something_else_replaced_is_left_alone(unix_socket_path: str) -> None:

@@ -29,8 +29,19 @@ Listener: TypeAlias = net.TcpListener | net.UnixListener
 Pair: TypeAlias = Callable[[], Awaitable[tuple[Stream, Stream, Listener]]]
 
 
+TEST_DEADLINE = 60  # seconds a test may take: none comes near it
+
+
 def run(coro: Coroutine[Any, Any, Any]) -> Any:
-    return porto.run(coro)
+    """Runs ``coro`` in ``porto.run`` under a deadline: a test that would wait forever (a datagram
+    or connection that never comes) fails after a minute with ``TimeoutError`` instead of
+    hanging the suite."""
+
+    async def bounded() -> Any:
+        async with porto.timeout(TEST_DEADLINE):
+            return await coro
+
+    return porto.run(bounded())
 
 
 async def connected(kind: str, unix_path: str) -> tuple[Stream, Stream, Listener]:
