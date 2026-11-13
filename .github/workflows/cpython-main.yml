@@ -1,0 +1,120 @@
+name: cpython-main
+
+# The Python suite against the CPython development branch (55-risks-open-questions.md §1: a change
+# to `am_send` or `PyIter_Send` would break the coroutine driver). main is built from source and
+# the install is cached by commit, so a night with no new commit reuses it (setup-python's "x.y-dev"
+# only covers released pre-releases, not main). A failure never blocks anything: the `report` job
+# opens or updates one tracking issue labelled `ci-cpython-main`, and closes it when the suite
+# passes again. Not a required check. Runs every night and by hand (input `force_failure` proves
+# the issue path); a pull request starts only the test job, and only for changes to this file.
+on:
+  schedule:
+    - cron: "47 4 * * *"
+  pull_request:
+    paths:
+      - .github/workflows/cpython-main.yml
+  workflow_dispatch:
+    inputs:
+      force_failure:
+        description: Fail the run on purpose, to check that it opens the tracking issue
+        type: boolean
+        default: false
+
+concurrency:
+  group: cpython-main-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: pytest on CPython main
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Find the CPython main commit
+        id: cpython
+        run: echo "sha=$(git ls-remote https://github.com/python/cpython refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/cpython-main
+          key: cpython-main-${{ runner.os }}-${{ steps.cpython.outputs.sha }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: python/cpython
+          ref: ${{ steps.cpython.outputs.sha }}
+          path: cpython-src
+          persist-credentials: false
+      - if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: cpython-src
+        run: |
+          ./configure --prefix="$HOME/cpython-main"
+          make -j"$(nproc)"
+          make install
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: cpython-main
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install porto into a venv on CPython main
+        run: |
+          uv venv .venv-main --python "$HOME/cpython-main/bin/python3"
+          .venv-main/bin/python -VV
+          # The dev tools the Python tests use (pyright for tests/typing is not needed here);
+          # uvloop, trio and anyio are benchmarks only and may not build on main yet.
+          uv pip install --python .venv-main/bin/python pytest "maturin>=1.16,<2"
+          cd packaging/porto
+          ../../.venv-main/bin/maturin build --release --out ../../dist -i ../../.venv-main/bin/python
+          cd ../..
+          uv pip install --python .venv-main/bin/python --no-deps dist/*.whl
+        env:
+          PYO3_PYTHON: ${{ github.workspace }}/.venv-main/bin/python
+      - run: .venv-main/bin/python -m pytest tests/python -q -p no:cacheprovider
+      - if: ${{ inputs.force_failure }}
+        run: |
+          echo "force_failure was set: failing on purpose."
+          exit 1
+
+  report:
+    name: tracking issue
+    needs: test
+    # Not for pull requests, and not for a cancelled run.
+    if: ${{ always() && github.event_name != 'pull_request' && needs.test.result != 'cancelled' && needs.test.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      LABEL: ci-cpython-main
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RESULT: ${{ needs.test.result }}
+    steps:
+      - name: Open, update or close the tracking issue
+        run: |
+          set -euo pipefail
+          gh label create "$LABEL" --color D93F0B --description "Nightly run against CPython main failed" --force
+          issue=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+          if [ "$RESULT" = "success" ]; then
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --body "The suite passes on CPython main again: $RUN_URL"
+              gh issue close "$issue"
+            fi
+          elif [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "Still failing on CPython main ($(date -u +%F)): $RUN_URL"
+          else
+            gh issue create --label "$LABEL" \
+              --title "Nightly: the Python suite fails on CPython main" \
+              --body "The nightly run against the CPython development branch failed: $RUN_URL
+
+          Look for a change to \`am_send\`, \`PyIter_Send\` or another interpreter internal the coroutine driver relies on (docs/spec/50-engineering/55-risks-open-questions.md, first row), or a pyo3 release that does not know the new version yet. This issue is updated on every failing night and closed by the first passing one."
+          fi
