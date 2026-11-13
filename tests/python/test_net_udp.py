@@ -5,6 +5,7 @@ Windows, which is not written yet, so these tests run on Unix.
 """
 
 import errno
+import os
 import socket
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
@@ -356,11 +357,14 @@ def test_a_broadcast_socket_may_send_to_a_broadcast_address() -> None:
                 return "refused"
             except TimeoutError:
                 return "stuck"
-            except OSError:
-                return "no route"
+            except OSError as error:
+                return f"oserror {error.errno} {error}"
             return "sent"
 
-    assert run(main()) != "refused"
+    outcome = run(main())
+    if sys.platform == "darwin" and os.environ.get("CI"):
+        pytest.fail(f"DIAG broadcast outcome on macOS CI: {outcome}")  # TEMPORARY
+    assert outcome != "refused"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="SO_REUSEPORT is not on Windows")
