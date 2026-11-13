@@ -35,10 +35,14 @@ async def echo_server(server: net.UdpSocket, datagrams: int) -> None:
 
 
 async def client(port: int, number: int) -> bytes:
-    """A client: one socket, one datagram, one reply."""
+    """A client: one socket, one datagram, one reply. UDP can lose a datagram, so a client that
+    waits for a reply says how long it waits: ``porto.timeout`` raises ``TimeoutError``."""
     async with await net.bind_udp(HOST) as sock:  # port 0: the OS picks one
         await sock.send_to(b"hello from client %d" % number, (HOST, port))
-        reply, sender = await sock.recv_from()
+        reply = b""  # bound before the scope: pyright cannot know the block ran
+        sender: net.SockAddr = ("", 0)
+        async with porto.timeout(5):
+            reply, sender = await sock.recv_from()
         assert sender == (HOST, port), sender  # the reply names the server
         return reply
 
@@ -123,11 +127,13 @@ async def closing_a_socket() -> None:
 
 
 async def main() -> None:
-    await echo_over_loopback()
-    await datagram_boundaries()
-    await connected_sockets()
-    await cancelling_a_receive_loses_nothing()
-    await closing_a_socket()
+    # Nothing here should wait long; the deadline turns a lost datagram into an error, not a hang.
+    async with porto.timeout(30):
+        await echo_over_loopback()
+        await datagram_boundaries()
+        await connected_sockets()
+        await cancelling_a_receive_loses_nothing()
+        await closing_a_socket()
     print("udp_echo: ok")
 
 

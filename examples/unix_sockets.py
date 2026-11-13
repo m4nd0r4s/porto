@@ -79,10 +79,11 @@ async def main() -> None:
     directory = tempfile.mkdtemp(prefix="porto-", dir="/tmp")
     try:
         path = os.path.join(directory, "echo.sock")
-        await file_socket(path)
-        await mistakes(path)
-        if sys.platform.startswith("linux"):
-            await abstract_socket()
+        async with porto.timeout(30):  # a connection that never comes is an error, not a hang
+            await file_socket(path)
+            await mistakes(path)
+            if sys.platform.startswith("linux"):
+                await abstract_socket()
     finally:
         shutil.rmtree(directory, ignore_errors=True)
     print("unix_sockets: ok")
