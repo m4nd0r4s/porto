@@ -94,7 +94,7 @@ fn open_listener(options: &ListenOptions) -> io::Result<Socket> {
 }
 
 /// Whether `error` says this host cannot make an IPv6 socket or bind to `::`.
-fn no_ipv6(error: &io::Error) -> bool {
+pub(crate) fn no_ipv6(error: &io::Error) -> bool {
     // `EAFNOSUPPORT` (97 on Linux, 47 on the BSDs and macOS, `WSAEAFNOSUPPORT` 10047 on
     // Windows) is what a kernel without IPv6 returns from `socket`; `EADDRNOTAVAIL` (99, 49,
     // 10049) is what one with IPv6 disabled returns from `bind`.
@@ -106,7 +106,7 @@ fn no_ipv6(error: &io::Error) -> bool {
     unix,
     not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
 ))]
-fn set_reuse_port(socket: &Socket) -> io::Result<()> {
+pub(crate) fn set_reuse_port(socket: &Socket) -> io::Result<()> {
     socket.set_reuse_port(true)
 }
 
@@ -114,7 +114,7 @@ fn set_reuse_port(socket: &Socket) -> io::Result<()> {
     unix,
     not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))
 )))]
-fn set_reuse_port(_socket: &Socket) -> io::Result<()> {
+pub(crate) fn set_reuse_port(_socket: &Socket) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "SO_REUSEPORT is not available on this OS",

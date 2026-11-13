@@ -2,6 +2,9 @@
 //! (17-networking-tls-dns.md).
 //!
 //! - [`tcp`]: the listening socket, nonblocking `accept` and the TCP socket options;
+//! - [`udp`]: the bound datagram socket;
+//! - [`unix`]: Unix domain stream sockets: the listening socket with its file mode, the
+//!   connect, and the socket file;
 //! - [`scan`]: finding a separator in a stream's buffered bytes.
 //!
 //! Nothing here registers a socket with the I/O driver or waits: the caller makes the sockets
@@ -10,3 +13,6 @@
 
 pub mod scan;
 pub mod tcp;
+pub mod udp;
+#[cfg(unix)]
+pub mod unix;
