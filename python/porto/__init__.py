@@ -19,7 +19,7 @@ print(porto.run(main))
 ```
 """
 
-from porto import abc, lifecycle, lowlevel, net
+from porto import abc, lifecycle, lowlevel, net, signals
 from porto._channel import broadcast, channel, oneshot, unbounded_channel, watch
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
@@ -138,6 +138,7 @@ __all__ = [
     "runtime",
     "scope",
     "shield",
+    "signals",
     "sleep",
     "timeout",
     "to_thread",

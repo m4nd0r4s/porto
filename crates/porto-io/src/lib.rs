@@ -34,6 +34,8 @@ mod primitives;
 mod ready;
 mod registration;
 mod scheduled_io;
+#[cfg(unix)]
+pub mod signal;
 mod slab;
 mod waiters;
 

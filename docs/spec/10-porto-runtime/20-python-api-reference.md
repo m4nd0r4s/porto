@@ -128,7 +128,7 @@ Terminated(SystemExit)
 ```
 
 ## `porto.net`, `porto.tls`, `porto.fs`, `porto.process`, `porto.signals`
-As specified in §17 and §18.
+As specified in §17 and §18. `porto.signals.receive(*signums)` is implemented (Unix; `NotImplementedError` on Windows, 18 §3): `async with porto.signals.receive(signal.SIGHUP) as sigs:` yields a `Receiver[int]`, `async for signum in sigs`.
 
 Implemented so far: `porto.net.connect_tcp(host, port, *, tls=False, server_hostname=None, local_addr=None, happy_eyeballs_delay=0.25, nodelay=True) -> TcpStream` (an `async def`, 17 §1; `tls` other than `False` raises `NotImplementedError`), `porto.net.listen_tcp(host=None, port=0, *, backlog=1024, reuse_port=False, tls=None, dual_stack=True) -> TcpListener` (an `async def`; `tls` other than `None` raises `NotImplementedError`), `porto.net.TcpListener` (`accept()`, `async for`, `port`, `sockname`, `fileno()`, `aclose()`, `async with`) and `porto.net.TcpStream` (the §17 1.1 methods up to `shutdown_write`/`aclose`, with `set_nodelay`, `set_keepalive`, `peername`, `sockname`, `fileno()`), both final classes that are not constructed by users. `porto.net.resolve(host, port=0, *, family=0) -> list[SockAddr]` (`SockAddr` is the `socket` module's address tuple), the default resolver of 17 §4. `porto.abc.ByteStream` is the `runtime_checkable` protocol `TcpStream` implements. A socket belongs to the `porto.run` that opened it (17 §1).
 

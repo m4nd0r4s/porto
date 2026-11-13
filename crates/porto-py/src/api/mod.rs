@@ -14,6 +14,7 @@ pub(crate) mod scope;
 mod scope_deadline;
 mod scope_exit;
 mod scope_tasks;
+pub(crate) mod signals;
 mod started;
 pub(crate) mod sync;
 pub(crate) mod task;

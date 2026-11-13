@@ -30,5 +30,9 @@ res = await porto.process.run(args, *, input=None, capture=True, check=False, ti
 async with porto.signals.receive(signal.SIGHUP, signal.SIGUSR1) as sigs:
     async for signum in sigs: ...
 ```
-- Implementation: `signal-hook`-style self-pipe registered with the driver. Python-level handlers are **not** installed. Delivery goes to the receiver regardless of which thread the OS chose.
+- Implementation: `signal-hook`-style self-pipe registered with the driver (`porto_io::signal`, Unix; no `signalfd`). Python-level handlers are **not** installed. Delivery goes to the receiver regardless of which thread the OS chose.
+  - The handler installed for a signal does one async-signal-safe thing: `write` the signal number (one byte) to the pipe, saving and restoring `errno`. A task of the run reads the pipe and calls the receivers on the lane. A full pipe drops the number, so signals that arrive close together may be delivered once (the kernel coalesces a pending signal the same way).
+  - The first receiver of a signal replaces its disposition (Python's handler included) and remembers it; the last one leaving puts it back, and the end of the run puts back every one left (a receiver in an abandoned task). Several receivers of a signal all get it.
+  - `receive(*signums)` needs at least one catchable signal (`SIGKILL`/`SIGSTOP` raise `ValueError`), and a running runtime on this thread's lane (`NoRuntimeError`).
+  - **Windows** has no self-pipe yet: `porto.signals.receive` raises `NotImplementedError` there, and `handle_signals` has no effect (Python's own `KeyboardInterrupt` for Ctrl-C stays). A `SIGINT`/`SIGBREAK` console-control-handler receiver is a later bead.
 - **Default runtime behavior** (`handle_signals=True`): SIGINT → cancel the root scope with reason `KeyboardInterrupt`; `porto.run` raises `KeyboardInterrupt` after shutdown. SIGTERM → same, with `porto.Terminated(SystemExit)`. A second SIGINT within the graceful period forces immediate exit. With `handle_signals=False`, Python's defaults remain.

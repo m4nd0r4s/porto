@@ -32,6 +32,8 @@ parking_lot = { version = "0.12.5", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 # Physical core count for `lanes="auto"` (12-scheduler-and-lanes.md §7); std only knows logical.
 num_cpus = "1.17"
+# The signal handler of porto-io's self-pipe (sigaction, write; 18-fs-process-signals.md §3).
+libc = "0.2"
 # Property and model-based tests (dev only; 52-testing-strategy.md item 1).
 proptest = "1.12"
 

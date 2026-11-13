@@ -113,6 +113,15 @@ def in_runtime() -> bool:
 def _shutdown_requested() -> Event:
     """``porto.lifecycle.shutdown_requested()``."""
 
+@final
+class _SignalSubscription:
+    def close(self) -> None: ...
+
+def _signals_subscribe(
+    signums: tuple[int, ...], callback: Callable[[int], None]
+) -> _SignalSubscription:
+    """``porto.signals.receive``: calls ``callback(signum)`` on the lane for each signal."""
+
 # Time
 
 def current_time() -> float:

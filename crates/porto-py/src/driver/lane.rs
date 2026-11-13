@@ -65,6 +65,15 @@ fn active_runs() -> std::sync::MutexGuard<'static, Vec<(usize, Arc<dyn Driver>)>
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The I/O driver of the run on this thread, if one runs.
+pub(crate) fn current_driver() -> Option<Arc<dyn Driver>> {
+    let run = RUN.get();
+    active_runs()
+        .iter()
+        .find(|(active, _)| *active == run)
+        .map(|(_, driver)| driver.clone())
+}
+
 /// Whether the run with this id (nonzero) stopped. Runs end for good: an id is never reused.
 pub(crate) fn run_has_ended(run: usize) -> bool {
     run != 0 && !active_runs().iter().any(|(active, _)| *active == run)
@@ -181,7 +190,11 @@ pub(crate) fn run<T>(
     let _run = RunScope(id);
     let output = {
         let _lane = OnPythonLane::enter(config.debug(), config.introspection());
-        body(&runtime)
+        let output = body(&runtime);
+        // The signals the run received stop being delivered: the previous dispositions are
+        // back before anything of the run is dropped.
+        crate::api::signals::end_of_run();
+        output
     };
     // Dropping the runtime cancels what is left: the tasks' `finally` blocks run in it, and
     // may list a scope's tasks, which the registry answers while it shuts down.
