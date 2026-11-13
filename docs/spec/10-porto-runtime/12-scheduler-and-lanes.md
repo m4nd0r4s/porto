@@ -109,11 +109,10 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 - Rust futures use `porto_core::coop::poll_proceed(cx)` like Tokio: the lane runs each task poll under `coop::budget(coop_budget, ..)`, and `poll_proceed` returns `Pending` (waking the task) once it is spent; the unit is given back unless the operation made progress. A Python task copies the budget into its poll's frame (`coop::remaining()`), so a step touches no thread local; Rust futures it awaits draw on the lane's count separately.
 
 ## 11. Shutdown of the scheduler
-1. `Shared.shutdown = true`.
+1. The task registry (23 §1) closes, then cancels every task still linked in it, until none is left: this is what ends tasks kept alive only by wakers. A cancelled Python task is **closed**, not thrown `Cancelled`: a synchronous `finally` runs (and may read `Scope.tasks`, which the closed registry answers), but an `await` in it cannot (a close that awaits does not finish: the task is dropped and a warning names it, 26 §2 step 5). The graceful phase, `Cancelled` thrown into every task with up to `cancel_timeout` to finish, is `porto.run`'s CANCELLING step (26 §2), before the runtime is dropped.
 2. Lanes finish the current task, then drain: the queues are dropped, which cancels the tasks in them (a Rust task's future is dropped, a Python task's coroutine is closed).
-3. The task registry (23 §1) closes, then cancels every task still linked in it, until none is left: this is what ends tasks kept alive only by wakers. A cancelled Python task is **closed**, not thrown `Cancelled`: a synchronous `finally` runs (and may read `Scope.tasks`, which the closed registry answers), but an `await` in it cannot (a close that awaits is a `RuntimeError`, 26 §2 step 5). The graceful phase, `Cancelled` thrown into every task with up to `cancel_timeout` to finish, is `porto.run`'s CANCELLING step (26 §2), before the runtime is dropped.
-4. Lanes join.
-5. Driver closed.
+3. Lanes join.
+4. Driver closed.
 
 ## 12. Required tests
 - loom: wake/steal/inbox races (3 lanes, 3 tasks).

@@ -14,11 +14,13 @@ use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::task::{Poll, Waker};
 
+use loom::model::Builder;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
 use super::TaskRegistry;
+use crate::loom_support::cap_preemptions;
 use crate::sched::Inject;
 use crate::task::{Notified, Registration, Schedule, free_zombie, new_joinable_task};
 
@@ -216,7 +218,10 @@ fn unlinking_a_neighbour_races_the_last_waker_of_the_adjacent_task() {
 /// linked.
 #[test]
 fn shutdown_cancel_all_races_a_waking_task() {
-    loom::model(|| {
+    // cancel_all spins until the registry is empty: unbounded, loom's branch budget runs out.
+    let mut builder = Builder::new();
+    cap_preemptions(&mut builder, 3);
+    builder.check(|| {
         ON_LANE.with(|on| on.set(true));
         let lane = Lane::new();
         let (task, stash, dropped) = parked_task(&lane);

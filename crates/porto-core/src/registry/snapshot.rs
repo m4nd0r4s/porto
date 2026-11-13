@@ -225,7 +225,9 @@ impl TaskSnapshotRequest {
     /// would otherwise never end.
     pub fn wait(self) -> Result<Vec<TaskRecord>, SnapshotError> {
         let mut state = self.cell.lock();
-        let mut idle = 0;
+        // When the pending lanes were last seen running; a lane that stays stopped for
+        // IDLE_LOOKS slices of elapsed time (not wake-ups: a spurious one must not count) ends it.
+        let mut last_running = Instant::now();
         while !state.pending.is_empty() {
             let (next, _) = self
                 .cell
@@ -237,12 +239,9 @@ impl TaskSnapshotRequest {
                 break;
             }
             if self.cell.pending_lanes_run(&state) {
-                idle = 0;
-            } else {
-                idle += 1;
-                if idle >= IDLE_LOOKS {
-                    return Err(SnapshotError::LaneNotRunning);
-                }
+                last_running = Instant::now();
+            } else if last_running.elapsed() >= WAIT_SLICE * IDLE_LOOKS {
+                return Err(SnapshotError::LaneNotRunning);
             }
         }
         SnapshotCell::take(&mut state)
