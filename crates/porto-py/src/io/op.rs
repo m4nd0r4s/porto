@@ -339,19 +339,7 @@ impl IoOp {
                 let (connection, address) = tcp::accept(socket)?;
                 Ok(Completed::AcceptedTcp(connection, address))
             }
-            Self::Connect => {
-                if let Some(error) = socket.take_error()? {
-                    return Err(error);
-                }
-                match socket.peer_addr() {
-                    Ok(_) => Ok(Completed::Done),
-                    // Still connecting: writable readiness comes when it is done.
-                    Err(error) if error.kind() == io::ErrorKind::NotConnected => {
-                        Err(io::ErrorKind::WouldBlock.into())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
+            Self::Connect => connect_outcome(socket),
             Self::RecvFrom { max } => {
                 let mut bytes = receive_buffer(*max)?;
                 let (received, address) = socket.recv_from(bytes.spare_capacity_mut())?;
@@ -366,6 +354,41 @@ impl IoOp {
         }
     }
 }
+
+/// What a connect started earlier came to, once the socket is writable (or on a first look):
+/// `Done`, `WouldBlock` while it is still going on, or the connect's own error.
+///
+/// `SO_ERROR` is read first: it holds why a failed connect failed (`ECONNREFUSED` ...), and
+/// reading it clears it. Only then is the peer asked for: a socket with no peer is
+/// `ENOTCONN` while the connect is under way. A connect that fails *between* the two reads
+/// (loopback refuses within microseconds) leaves the socket in a failed state where BSD and
+/// macOS answer `getpeername` with `EINVAL`, not `ENOTCONN`; the reason is in `SO_ERROR` by
+/// then, so it is read again, and only when that is empty too (something else already read
+/// it) does `EINVAL` mean the connect failed for a reason that is gone: the refusal, by far
+/// the commonest, is reported (porto-szb.150), not an `Invalid argument` about a socket the
+/// caller never misused.
+fn connect_outcome(socket: &Socket) -> io::Result<Completed> {
+    if let Some(error) = socket.take_error()? {
+        return Err(error);
+    }
+    match socket.peer_addr() {
+        Ok(_) => Ok(Completed::Done),
+        // Still connecting: writable readiness comes when it is done.
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        Err(error) => match socket.take_error()? {
+            Some(reason) => Err(reason),
+            None if cfg!(unix) && error.raw_os_error() == Some(EINVAL) => {
+                Err(io::ErrorKind::ConnectionRefused.into())
+            }
+            None => Err(error),
+        },
+    }
+}
+
+/// `EINVAL`, which `getpeername` reports on a socket whose connect failed (BSD, macOS).
+const EINVAL: i32 = 22;
 
 /// Whether `error`, from a send, means the connection is gone for good, so that every later
 /// send fails again (the peer reset it, it timed out, it is not connected, it was closed or
@@ -763,6 +786,64 @@ mod tests {
     use pyo3::types::PyBytes;
 
     use super::*;
+
+    /// A nonblocking socket connecting to a loopback port nothing listens on.
+    #[cfg(unix)]
+    fn refused_connect() -> Socket {
+        use socket2::{Domain, Protocol, Type};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = SockAddr::from(listener.local_addr().unwrap());
+        drop(listener);
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        // `EINPROGRESS`, or the refusal at once: either way `connect_outcome` has the answer.
+        drop(socket.connect(&address));
+        socket
+    }
+
+    /// Calls `outcome` until it is not `WouldBlock`.
+    #[cfg(unix)]
+    fn settled(socket: &Socket) -> io::Error {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match connect_outcome(socket) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "the connect never settled");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return error,
+                Ok(_) => panic!("a connect to a closed port succeeded"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_connect_is_connection_refused() {
+        let error = settled(&refused_connect());
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error}");
+    }
+
+    /// The refusal arrived and its `SO_ERROR` was read already (the race of porto-szb.150, in its
+    /// worst form): macOS answers `getpeername` with `EINVAL`, which must not reach the caller.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refusal_whose_so_error_was_read_is_still_connection_refused() {
+        let socket = refused_connect();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while socket.peer_addr().map_or_else(
+            |error| error.kind() == io::ErrorKind::NotConnected,
+            |_| false,
+        ) {
+            assert!(Instant::now() < deadline, "the connect never settled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(socket.take_error());
+        let Err(error) = connect_outcome(&socket) else {
+            panic!("a connect to a closed port succeeded");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused, "{error}");
+    }
 
     fn flag() -> MidWrite {
         Arc::new(AtomicBool::new(false))

@@ -263,7 +263,7 @@ def test_cancelling_the_scope_stops_the_server_and_closes_every_connection() -> 
         refused = False
         try:
             await connect(port)
-        except OSError:  # ConnectionRefusedError on Linux; macOS reports EINVAL (porto-szb.69)
+        except ConnectionRefusedError:
             refused = True
         return closed, refused
 
@@ -413,7 +413,7 @@ def test_stopping_the_server_refuses_new_connections_while_handlers_still_wind_d
                 try:
                     await connect(port)
                     refused = False
-                except OSError:  # ConnectionRefusedError on Linux, EINVAL on macOS (szb.150)
+                except ConnectionRefusedError:
                     refused = True
             return still_winding_down, refused
 
