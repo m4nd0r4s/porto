@@ -42,11 +42,11 @@ address.
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import NoReturn
+from typing import NoReturn, cast
 
 from porto import _core
 from porto._core import Semaphore, Started, TcpListener, TcpStream, scope
-from porto.errors import ClosedResourceError, IncompleteReadError
+from porto.errors import IncompleteReadError
 
 __all__ = ["TcpListener", "TcpStream", "listen_tcp", "serve_tcp"]
 
@@ -120,8 +120,9 @@ async def serve_tcp(
     ``Exception`` is logged on the ``porto.net`` logger (error level, with the traceback) and
     the server goes on; ``Cancelled`` and other ``BaseException`` propagate as always. A handler
     that lets a client's disconnect escape (``IncompleteReadError``, a ``ConnectionError`` such as
-    ``ConnectionResetError`` or ``BrokenPipeError``, ``ClosedResourceError``) is not a bug and is
-    logged at debug level only. Accepted streams have ``TCP_NODELAY`` set, like asyncio's.
+    ``ConnectionResetError`` or ``BrokenPipeError``, or an ``ExceptionGroup`` of only those) is
+    not a bug and is logged at debug level only. Accepted streams have ``TCP_NODELAY`` set, like
+    asyncio's.
 
     ``max_connections`` (a positive int, ``None`` for no limit) bounds the connections served
     at once: at the limit the server stops accepting until one ends, and further clients wait in
@@ -175,6 +176,21 @@ async def serve_tcp(
 _MAX_CONNECTIONS_LIMIT = 2**31 - 1
 
 
+# What a client's disconnect raises in a handler that does not catch it. Not ClosedResourceError:
+# a peer going away never raises it; using a stream the handler closed itself is a bug.
+_DISCONNECTS = (IncompleteReadError, ConnectionError)
+
+
+def _is_client_disconnect(error: Exception) -> bool:
+    """Whether ``error`` is a client's disconnect, or a group (of failed children) of only those."""
+    if isinstance(error, _DISCONNECTS):
+        return True
+    if isinstance(error, ExceptionGroup):
+        group = cast("ExceptionGroup[Exception]", error)
+        return group.split(_DISCONNECTS)[1] is None
+    return False
+
+
 async def _serve_connection(
     handler: Callable[[TcpStream], Awaitable[object]],
     stream: TcpStream,
@@ -185,16 +201,18 @@ async def _serve_connection(
         try:
             async with stream, scope(name="connection"):
                 await handler(stream)
-        except (IncompleteReadError, ConnectionError, ClosedResourceError) as error:
-            # The client went away (a handler that does not catch it): not a bug, so not an error.
-            _logger.debug(
-                "porto: serve_tcp's handler for the connection from %s ended because the client "
-                "disconnected (%r)",
-                _peer(stream),
-                error,
-                exc_info=error,
-            )
         except Exception as error:
+            if _is_client_disconnect(error):
+                # The client went away (a handler that does not catch it): not a bug, so not
+                # an error.
+                _logger.debug(
+                    "porto: serve_tcp's handler for the connection from %s ended because the "
+                    "client disconnected (%r)",
+                    _peer(stream),
+                    error,
+                    exc_info=error,
+                )
+                return
             _logger.error(
                 "porto: serve_tcp's handler for the connection from %s failed with %r; the "
                 "connection was closed and the server keeps serving",

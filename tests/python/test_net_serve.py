@@ -340,7 +340,11 @@ def test_accepted_streams_have_tcp_nodelay_like_asyncios() -> None:
         porto.IncompleteReadError(b"par", 10),
         ConnectionResetError(errno.ECONNRESET, "reset"),
         BrokenPipeError(errno.EPIPE, "broken pipe"),
-        porto.ClosedResourceError(errno.EBADF, "closed"),
+        ExceptionGroup("children", [ConnectionResetError(errno.ECONNRESET, "reset")]),
+        ExceptionGroup(
+            "children",
+            [BrokenPipeError(errno.EPIPE, "pipe"), porto.IncompleteReadError(b"", 4)],
+        ),
     ],
     ids=lambda error: type(error).__name__,
 )
@@ -361,9 +365,20 @@ def test_a_client_disconnect_that_escapes_a_handler_is_logged_at_debug_only(
     assert "client disconnected" in records[0].getMessage()
 
 
-def test_a_real_handler_bug_is_still_an_error(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize(
+    "bug",
+    [
+        ValueError("a bug"),
+        porto.ClosedResourceError(errno.EBADF, "used a stream it closed itself"),
+        ExceptionGroup("children", [ConnectionResetError(errno.ECONNRESET, "r"), ValueError("b")]),
+    ],
+    ids=["ValueError", "ClosedResourceError", "mixed-group"],
+)
+def test_a_real_handler_bug_is_still_an_error(
+    bug: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
     async def handler(stream: net.TcpStream) -> None:
-        raise ValueError("a bug")
+        raise bug
 
     async def main() -> None:
         async with Serving(handler) as port, await connect(port) as stream:
