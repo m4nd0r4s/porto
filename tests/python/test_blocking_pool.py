@@ -637,6 +637,7 @@ def test_the_token_of_an_abandoned_job_comes_back_after_the_run_ended() -> None:
 
 def test_to_thread_introspects_like_an_async_function() -> None:
     assert porto.to_thread.__name__ == "to_thread"
-    assert porto.to_thread.__doc__ is not None and "pool thread" in porto.to_thread.__doc__
+    assert porto.to_thread.__doc__ is not None
+    assert "pool thread" in porto.to_thread.__doc__
     if sys.version_info >= (3, 12):
         assert inspect.iscoroutinefunction(porto.to_thread)

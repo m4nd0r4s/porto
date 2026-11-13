@@ -10,6 +10,7 @@ thread that has its own Python thread state, and the awaiting task goes on when 
 from __future__ import annotations
 
 import contextvars
+import inspect
 import os
 import threading
 from collections.abc import Callable
@@ -94,7 +95,14 @@ def _callable_error(fn: object) -> TypeError:
 class _ToThread:
     """The type of ``porto.to_thread``: an async callable with a ``default_limiter()``."""
 
-    __slots__ = ()
+    def __init__(self) -> None:
+        # What a function would have, for introspection and ``help()``.
+        self.__name__ = self.__qualname__ = "to_thread"
+        self.__module__ = "porto"
+        self.__doc__ = type(self).__call__.__doc__
+        mark_coroutine_function = getattr(inspect, "markcoroutinefunction", None)  # 3.12+
+        if mark_coroutine_function is not None:
+            mark_coroutine_function(self)
 
     def default_limiter(self) -> CapacityLimiter:
         """The limiter ``to_thread`` uses when it is not given one: a ``CapacityLimiter`` of 40
@@ -171,14 +179,12 @@ class _ToThread:
         if cancellable:
             # A cancel leaves the job running; the worker gives the token back when it ends.
             return await job
-        try:
-            # A sync ``with`` cancel scope: no await, so no checkpoint before the job is queued.
-            with shield():
-                return await job
-            raise AssertionError("a shield that has no deadline never absorbs the job's outcome")
-        finally:
-            # The job has ended, or never ran (its runtime stopped): the token is back either way.
-            token.release()
+        # A sync ``with`` cancel scope: no await, so no checkpoint before the job is queued.
+        # The token is not given back here: it is the job's, and goes back when ``fn`` ends (or
+        # when a job that never ran is dropped), even if this coroutine is closed meanwhile.
+        with shield():
+            return await job
+        raise AssertionError("a shield that has no deadline never absorbs the job's outcome")
 
     def __repr__(self) -> str:
         return "<porto.to_thread>"
