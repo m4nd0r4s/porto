@@ -120,8 +120,8 @@ fn listen_unix(
             "listen_unix()",
             "mode",
             0..=0o777,
-            " (the permission bits of the socket file, such as 0o660; connecting needs write \
-             permission on it)",
+            " (0o777 at most: the permission bits of the socket file, such as 0o660; connecting \
+             needs write permission on it)",
         )?;
         let backlog = int_in_range(
             backlog,

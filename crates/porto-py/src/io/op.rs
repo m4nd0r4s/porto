@@ -531,9 +531,34 @@ impl IoOp {
             } if ClosedResource::of(error).is_some_and(|closed| !closed.by_driver()) => {
                 PyStopAsyncIteration::new_err(())
             }
+            Self::SendTo { data, .. } | Self::Send { data } if is_message_too_long(error) => {
+                PyOSError::new_err((
+                    MESSAGE_TOO_LONG.unwrap_or_default(),
+                    format!(
+                        "porto: a datagram of {} bytes is too long for this OS to send ({error}); \
+                         send less in each datagram (UDP carries at most 65507 bytes over IPv4, \
+                         and the OS may allow less: macOS defaults to 9216), or use a stream \
+                         (TCP) for large messages",
+                        data.bytes().len()
+                    ),
+                ))
+            }
             _ => os_error(error),
         }
     }
+}
+
+/// `EMSGSIZE` (`WSAEMSGSIZE` on Windows), which a send of a datagram the OS cannot carry fails
+/// with.
+#[cfg(unix)]
+const MESSAGE_TOO_LONG: Option<i32> = Some(libc::EMSGSIZE);
+#[cfg(windows)]
+const MESSAGE_TOO_LONG: Option<i32> = Some(10040);
+#[cfg(not(any(unix, windows)))]
+const MESSAGE_TOO_LONG: Option<i32> = None;
+
+fn is_message_too_long(error: &io::Error) -> bool {
+    MESSAGE_TOO_LONG.is_some() && error.raw_os_error() == MESSAGE_TOO_LONG
 }
 
 thread_local! {

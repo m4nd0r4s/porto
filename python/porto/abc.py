@@ -1,7 +1,7 @@
 """Abstract interfaces of porto's I/O types (17-networking-tls-dns.md §1.1).
 
-``ByteStream`` is the protocol ``porto.net.TcpStream`` implements (and, as they land,
-``UnixStream`` and ``TlsStream``), so code that reads and writes bytes can take any of them.
+``ByteStream`` is the protocol ``porto.net.TcpStream`` and ``porto.net.UnixStream`` implement (and,
+as it lands, ``TlsStream``), so code that reads and writes bytes can take any of them.
 ``sendfile`` joins it with the stream types that implement it.
 """
 
