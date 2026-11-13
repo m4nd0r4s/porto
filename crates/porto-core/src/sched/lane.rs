@@ -166,6 +166,9 @@ impl Lane {
     /// Polls the driver without blocking, fires the expired timers and runs the deferred work.
     /// Returns whether any of it did something: woken tasks are on the local queue by then.
     pub(crate) fn maintenance(&self) -> bool {
+        if let Some(hook) = &self.park_hook {
+            hook.on_maintenance();
+        }
         let events = self.poll_driver();
         let fired = self.fire_expired_timers();
         let deferred = self.run_deferred();

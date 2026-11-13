@@ -1483,6 +1483,9 @@ def _raise_rust_error_chain(depth: int, /) -> NoReturn:
 def _raise_rust_panic(message: str, /) -> NoReturn:
     """Test hook: panics in Rust with ``message`` and raises the resulting ``RustPanic``."""
 
+def _gil_stats() -> tuple[int, int]:
+    """Test hook: ``(park detaches, periodic releases)`` of the lanes in this process."""
+
 def _panicking_future(message: str, /) -> Awaitable[NoReturn]:
     """Test hook: a trap that waits for a Rust future that panics with ``message`` when polled."""
 

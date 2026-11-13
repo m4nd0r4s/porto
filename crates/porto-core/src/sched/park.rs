@@ -31,6 +31,11 @@ pub trait ParkHook: Send + 'static {
     /// the lane is unparked or its earliest timer is due. If it returns without calling `park`,
     /// the lane does not block and checks its queues again.
     fn around_park(&self, park: &mut dyn FnMut());
+
+    /// Called on the lane thread at the start of each maintenance pass (every 61 ticks, and before the lane parks): the
+    /// place for a periodic check that must cost nothing between passes (the Python lane's
+    /// periodic GIL release, 12 §6). Defaults to nothing.
+    fn on_maintenance(&self) {}
 }
 
 /// No notification is "taken back" while parked.

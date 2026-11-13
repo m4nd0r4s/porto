@@ -37,9 +37,18 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(take_unnormalized_exception, module)?)?;
     module.add_function(wrap_pyfunction!(count_allocations, module)?)?;
     module.add_function(wrap_pyfunction!(buffer_pool_stats, module)?)?;
+    module.add_function(wrap_pyfunction!(gil_stats, module)?)?;
     module.add_class::<crate::io::handle::IoHandle>()?;
     errors::register(module)?;
     traps::register(module)
+}
+
+/// `(park detaches, periodic releases)`: how often a lane in this process gave the GIL up to
+/// park, and how often it gave it up for the other Python threads (12 §6). Both stay 0 between
+/// two reads while a lane runs tasks back to back with no other thread around.
+#[pyfunction(name = "_gil_stats")]
+fn gil_stats() -> (u64, u64) {
+    crate::driver::lane::gil_stats()
 }
 
 /// This thread's buffer pool, one `(capacity, free, hits, misses, discarded)` tuple per size

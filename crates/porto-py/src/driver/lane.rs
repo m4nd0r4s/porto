@@ -25,7 +25,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -137,7 +137,7 @@ pub(crate) fn run<T>(
     body: impl FnOnce(&Runtime) -> T,
 ) -> PyResult<T> {
     let runtime = Runtime::builder()
-        .park_hook(DetachWhileParked)
+        .park_hook(DetachWhileParked::new(py))
         .timer_resolution(config.timer_resolution())
         .coop_budget(config.coop_budget())
         .blocking_threads(config.blocking_threads())
@@ -413,16 +413,130 @@ impl Drop for OnPythonLane {
     }
 }
 
-/// Detaches the thread state for the duration of each park.
-struct DetachWhileParked;
+/// How many times a lane detached to park, in the process (test hook `_gil_stats`).
+static PARK_DETACHES: AtomicU64 = AtomicU64::new(0);
+
+/// How many times a lane released the GIL for the other Python threads (see
+/// [`DetachWhileParked::on_maintenance`]), in the process (test hook `_gil_stats`).
+static PERIODIC_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+/// `(park detaches, periodic releases)` so far in this process.
+pub(crate) fn gil_stats() -> (u64, u64) {
+    (
+        PARK_DETACHES.load(Ordering::Relaxed),
+        PERIODIC_RELEASES.load(Ordering::Relaxed),
+    )
+}
+
+/// Maintenance passes between two looks at the clock: a pass comes every 61 ticks (a few
+/// microseconds), the switch interval is milliseconds, so most passes only count.
+#[cfg(not(Py_GIL_DISABLED))]
+const PASSES_PER_CLOCK_READ: u32 = 32;
+
+/// The lane's attachment policy on a GIL build (12 §6, 25 §2 P0, P2).
+///
+/// The lane thread is the thread that called `porto.run`, which already has the thread state
+/// CPython made for it: the lane never calls `PyGILState_*` (P0), it detaches and reattaches that
+/// one state explicitly (`PyEval_SaveThread`, `PyEval_RestoreThread`). It keeps the GIL across
+/// consecutive Python tasks and detaches only around a park (P2: the park is where the lane
+/// blocks in the driver, the only blocking call a lane makes), and, as
+/// [`on_maintenance`](ParkHook::on_maintenance), for a moment every `gil_switch_interval` of
+/// continuous Python execution while other Python threads exist.
+///
+/// On a free-threaded build there is no GIL to hand over: the periodic release is compiled out.
+struct DetachWhileParked {
+    /// When the lane last attached: the start of the current stretch of Python execution.
+    #[cfg(not(Py_GIL_DISABLED))]
+    attached_since: Cell<std::time::Instant>,
+    /// The longest stretch before the other threads get the GIL (`sys.getswitchinterval()` when
+    /// the run started).
+    #[cfg(not(Py_GIL_DISABLED))]
+    switch_interval: Duration,
+    /// Maintenance passes since the clock was last read.
+    #[cfg(not(Py_GIL_DISABLED))]
+    passes: Cell<u32>,
+}
+
+impl DetachWhileParked {
+    fn new(py: Python<'_>) -> Self {
+        #[cfg(Py_GIL_DISABLED)]
+        let _ = py;
+        Self {
+            #[cfg(not(Py_GIL_DISABLED))]
+            attached_since: Cell::new(std::time::Instant::now()),
+            #[cfg(not(Py_GIL_DISABLED))]
+            switch_interval: switch_interval(py),
+            #[cfg(not(Py_GIL_DISABLED))]
+            passes: Cell::new(0),
+        }
+    }
+}
+
+/// `sys.getswitchinterval()`, the default `gil_switch_interval`; 5 ms if it cannot be read.
+#[cfg(not(Py_GIL_DISABLED))]
+fn switch_interval(py: Python<'_>) -> Duration {
+    py.import("sys")
+        .and_then(|sys| sys.call_method0("getswitchinterval"))
+        .and_then(|seconds| seconds.extract::<f64>())
+        .ok()
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .unwrap_or(Duration::from_millis(5))
+}
+
+/// `threading.active_count()`, or 1 if it cannot be read.
+#[cfg(not(Py_GIL_DISABLED))]
+fn other_threads_exist(py: Python<'_>) -> bool {
+    static ACTIVE_COUNT: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    ACTIVE_COUNT
+        .import(py, "threading", "active_count")
+        .and_then(|count| count.call0())
+        .and_then(|count| count.extract::<usize>())
+        .is_ok_and(|count| count > 1)
+}
 
 impl ParkHook for DetachWhileParked {
     fn around_park(&self, park: &mut dyn FnMut()) {
-        // SAFETY: the hook runs on the lane thread, inside `run`, which is attached. No task
-        // runs while the lane is parked, so nothing touches Python until `Detached` reattaches,
-        // also if `park` unwinds.
-        let _detached = Detached(unsafe { ffi::PyEval_SaveThread() });
-        park();
+        PARK_DETACHES.fetch_add(1, Ordering::Relaxed);
+        {
+            // SAFETY: the hook runs on the lane thread, inside `run`, which is attached. No task
+            // runs while the lane is parked, so nothing touches Python until `Detached`
+            // reattaches, also if `park` unwinds.
+            let _detached = Detached(unsafe { ffi::PyEval_SaveThread() });
+            park();
+        }
+        #[cfg(not(Py_GIL_DISABLED))]
+        self.attached_since.set(std::time::Instant::now());
+    }
+
+    /// Periodic GIL release (12 §6): once a stretch of continuous Python execution outlasts the
+    /// switch interval and another Python thread exists, the lane detaches and yields, so that
+    /// thread gets the GIL even when the tasks in between never reach a bytecode that honors
+    /// CPython's own drop request. With no other thread, the cost is a counter increment per
+    /// pass and one clock read per [`PASSES_PER_CLOCK_READ`] passes.
+    #[cfg(not(Py_GIL_DISABLED))]
+    fn on_maintenance(&self) {
+        let passes = self.passes.get().wrapping_add(1);
+        self.passes.set(passes);
+        if !passes.is_multiple_of(PASSES_PER_CLOCK_READ) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.attached_since.get()) < self.switch_interval {
+            return;
+        }
+        // SAFETY: maintenance runs on the lane thread, between task polls, attached.
+        let py = unsafe { Python::assume_attached() };
+        if other_threads_exist(py) {
+            PERIODIC_RELEASES.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: attached (see above); the guard reattaches this thread's state, which
+            // nothing else uses meanwhile.
+            let _detached = Detached(unsafe { ffi::PyEval_SaveThread() });
+            // Lets a thread waiting for the GIL run before this one asks for it back: the
+            // waiter was signalled when the GIL was dropped.
+            std::thread::yield_now();
+        }
+        // The next look comes after another interval, whether or not anything was released.
+        self.attached_since.set(std::time::Instant::now());
     }
 }
 
