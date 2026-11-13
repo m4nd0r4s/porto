@@ -155,9 +155,9 @@ pub(crate) fn refuse_nested_start() -> PyResult<()> {
     }
     if Handle::try_current().is_some() {
         return Err(PyRuntimeError::new_err(
-            "porto: a runtime cannot be started from inside a running porto runtime (I1): \
-             `await` the coroutine instead, or run it as a task with `async with \
-             porto.scope() as s: s.spawn(...)`",
+            "porto: porto.run() cannot be called from inside a running porto runtime; `await` \
+             the coroutine instead, or run it as a task with `async with porto.scope() as s: \
+             s.spawn(...)` (one runtime runs per process, I1)",
         ));
     }
     if PROCESS_RUN.load(Ordering::Acquire) {

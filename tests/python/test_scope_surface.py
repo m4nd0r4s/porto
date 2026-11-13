@@ -554,7 +554,7 @@ def test_tasks_of_a_scope_of_another_run_raises_instead_of_answering_empty() -> 
     scope = porto.run(enter_and_leave_open)
 
     async def read_it() -> None:
-        with pytest.raises(RuntimeError, match=r"another porto\.run"):
+        with pytest.raises(porto.RuntimeClosed, match="runtime that stopped"):
             scope.tasks  # noqa: B018
 
     porto.run(read_it)

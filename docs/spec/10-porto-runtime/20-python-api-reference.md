@@ -13,12 +13,14 @@ class Runtime:
     def block_on[T](self, main: Callable[[], Awaitable[T]] | Awaitable[T]) -> T   # calling thread becomes lane 0
     @property
     def root_scope(self) -> Scope            # escape hatch (ADR-007); only valid while running
-    def portal(self) -> Portal
-    def shutdown(self, *, timeout: float = 10.0) -> None
+    def portal(self) -> Portal                # arrives with porto.from_thread (not implemented yet)
+    def shutdown(self, *, timeout: float = 10.0) -> None   # a running runtime: not supported yet (26 §2)
     def __enter__(self) -> Runtime; def __exit__(self, *exc) -> None    # shutdown on exit
 def runtime() -> Runtime                     # current runtime or NoRuntimeError
 def in_runtime() -> bool
 ```
+
+A `Runtime` runs once (`NEW → RUNNING → STOPPED`, 26 §2); `block_on` on one that ran or was shut down raises `RuntimeClosed`, `root_scope` raises `NoRuntimeError` before the run and `RuntimeClosed` after. `runtime()` and `in_runtime()` answer for code on the lane of a running runtime (its tasks); a blocking-pool thread is not in the runtime. `porto.run` makes a `Runtime` itself, so `runtime()` is the same object either way.
 
 An entry point that takes a coroutine object and refuses it (`run` inside a running runtime or with an invalid config, `Scope.spawn` on a scope that is closed or not entered, a coroutine with arguments) MUST close it before raising, so the error is the only thing reported: no later "coroutine ... was never awaited".
 

@@ -484,7 +484,7 @@ def test_a_stream_of_an_earlier_run_is_refused_at_the_call() -> None:
         run(first())
 
         async def second() -> None:
-            with pytest.raises(RuntimeError, match="open the socket in the run that uses it"):
+            with pytest.raises(porto.RuntimeClosed, match="runtime that stopped"):
                 holder[0].read()
 
         run(second())
@@ -502,7 +502,8 @@ def test_a_stream_of_a_run_on_another_thread_is_refused_at_the_call() -> None:
     async def main() -> None:
         client, server, listener = await connected()
         async with client, server, listener:
-            thread = threading.Thread(target=run, args=(other_run(client),))
+            # `_run`, not `porto.run`: I1 refuses a second public run while one runs.
+            thread = threading.Thread(target=_core._run, args=(other_run(client),))
             thread.start()
             thread.join()
             await client.write(b"still works here")

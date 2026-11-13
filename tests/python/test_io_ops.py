@@ -543,9 +543,9 @@ def test_a_handle_of_an_earlier_run_is_refused_at_the_call() -> None:
 
         async def use_it() -> None:
             for call in (lambda: handle.read(8), lambda: handle.write(b"x")):
-                with pytest.raises(RuntimeError, match="open the socket in the run that uses it"):
+                with pytest.raises(porto.RuntimeClosed, match="runtime that stopped"):
                     call()
-            with pytest.raises(RuntimeError, match="open the socket in the run"):
+            with pytest.raises(porto.RuntimeClosed, match="runtime that stopped"):
                 handle.connect(("127.0.0.1", 1))
             handle.close()  # closing needs no run
 
@@ -565,7 +565,8 @@ def test_a_handle_of_a_run_on_another_thread_is_refused_at_the_call() -> None:
         left, right = socketpair()
         with left, right:
             handle = _core._IoHandle(right.fileno())
-            thread = threading.Thread(target=run, args=(other_run(handle),))
+            # `_run`, not `porto.run`: I1 refuses a second public run while one runs.
+            thread = threading.Thread(target=_core._run, args=(other_run(handle),))
             thread.start()
             thread.join()
             # Its own run still works.
@@ -586,5 +587,5 @@ def test_a_handle_used_outside_any_run_is_refused() -> None:
             return _core._IoHandle(right.fileno())
 
         handle = run(open_handle())
-        with pytest.raises(RuntimeError, match=r"inside porto\.run"):
+        with pytest.raises(porto.RuntimeClosed, match="runtime that stopped"):
             handle.read(8)
