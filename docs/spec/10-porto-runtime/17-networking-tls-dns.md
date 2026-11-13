@@ -83,9 +83,13 @@ tls_stream.alpn_protocol, tls_stream.peer_certificates(), tls_stream.tls_version
 - The crypto provider is `aws-lc-rs` by default (ADR-026). Feature `ring` is the alternative.
 
 ## 4. DNS
-- Default resolver: `getaddrinfo` on the blocking pool with a per-lane positive cache (TTL 30 s, since getaddrinfo exposes no TTL) and coalescing of concurrent identical lookups.
+- Default resolver: `socket.getaddrinfo` on the blocking pool (`porto.to_thread`'s pool, 19) with a positive cache (TTL 30 s, since getaddrinfo exposes no TTL) per run and per lane (one lane until M2) and coalescing of concurrent identical lookups.
 - Optional: `porto.net.Resolver.hickory(...)` (feature `hickory`) for async DNS with real TTLs.
-- `await porto.net.resolve(host, port=0, *, family=0) -> list[SockAddr]`.
+- `await porto.net.resolve(host: str, port: int = 0, *, family: int = 0) -> list[SockAddr]`. `SockAddr` is the shape of the `socket` module: `(host, port)` for IPv4, `(host, port, flowinfo, scope_id)` for IPv6 (`porto.net.SockAddr`). `family` is `0` (any), `socket.AF_INET` or `socket.AF_INET6`; the addresses are TCP ones, duplicates removed, in the order the OS ranks them (RFC 6724, which Happy Eyeballs, §1, then interleaves). `TypeError` for a `host` that is not a `str` or a `port` that is not an `int`, `ValueError` for an empty `host`, a `port` outside 0..=65535 or any other `family`; each message says what to pass.
+- **IP literals bypass the pool.** A `host` that is an IP literal (IPv4, IPv6, with or without a `%scope`) is converted on the lane with `AI_NUMERICHOST`, which does no network I/O: no thread hop, no cache entry. A literal of another family than `family` is a `socket.gaierror` (`EAI_NONAME`).
+- **Failure.** A name that does not resolve raises `socket.gaierror` (with the `EAI_*` code in `errno`); failures are never cached. Every task coalesced onto a failing lookup gets a `gaierror` of its own.
+- **Cache.** Key: the lowercased name, `port` and `family`. An entry is fresh for 30 s (`porto.net`'s clock is the monotonic OS clock; tests inject it, not the virtual clock: the TTL is about the outside world), at most 1024 entries (expired ones go first, then the oldest). Each call returns a new list, so a caller cannot change what the cache holds. A cache belongs to one run: it never outlives `porto.run`.
+- **Coalescing.** While a lookup of `(name, port, family)` is in flight, every other call with the same key waits for it instead of starting one: 100 concurrent connects to one host cost one `getaddrinfo`. The lookup belongs to the name, not to the call that started it. Cancelling that call (C1) abandons its wait only (the pool job cannot be interrupted, 19 §1): the lookup finishes on its thread, fills the cache, and the other waiters, and later callers, get the answer. A call cancelled before its job was queued hands the lookup to the next waiter.
 
 ## 5. Errors
 Socket errors map to builtin `OSError` subclasses (`ConnectionResetError`, `ConnectionRefusedError`, `BrokenPipeError`, `TimeoutError` for OS-level timeouts) with errno set. TLS errors raise `porto.tls.TLSError(OSError)` with a `.reason` code.

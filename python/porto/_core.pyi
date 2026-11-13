@@ -1409,6 +1409,10 @@ def _root_scope() -> Scope:
     its tasks outlive the scopes ``main`` opens, and one that fails cancels ``main``.
     ``porto.NoRuntimeError`` outside ``porto.run``."""
 
+def _run_id() -> int:
+    """The process-unique id of the running ``porto.run``: what a cache that belongs to one run
+    keys itself with. ``porto.NoRuntimeError`` outside a task of a porto runtime."""
+
 def _spawn(coro: Coroutine[Any, Any, object], /) -> None:
     """Starts ``coro`` as a task on the running runtime. An ``Exception`` it raises goes to
     ``sys.unraisablehook``; any other ``BaseException`` stops the run (``_run`` raises it)."""

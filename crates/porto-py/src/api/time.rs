@@ -31,6 +31,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(yield_trap, module)?)?;
     module.add_function(wrap_pyfunction!(trap_yield, module)?)?;
     module.add_function(wrap_pyfunction!(current_lane, module)?)?;
+    module.add_function(wrap_pyfunction!(run_id, module)?)?;
     module.add_function(wrap_pyfunction!(sleep_trap, module)?)
 }
 
@@ -208,6 +209,14 @@ fn current_lane() -> PyResult<u16> {
              call it from code that porto.run(main) runs",
         )
     })
+}
+
+/// `_run_id()`: the process-unique id of the running `porto.run`, which a cache that belongs to
+/// one run (the resolver's, 17 §4) keys itself with so that it never outlives the run.
+#[pyfunction(name = "_run_id")]
+fn run_id() -> PyResult<usize> {
+    require_lane("_run_id")?;
+    Ok(crate::driver::lane::run_id())
 }
 
 /// A trap that resumes the task `delay` seconds from now, never earlier. `inf` never resumes;

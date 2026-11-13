@@ -35,8 +35,9 @@ async def main() -> None:
         ...
 ```
 
-Sockets belong to the ``porto.run`` that opened them. Name resolution (``connect_tcp``,
-host names in ``listen_tcp``) arrives with the resolver; until then ``host`` is a numeric
+Sockets belong to the ``porto.run`` that opened them. ``resolve`` is the default resolver
+(``getaddrinfo`` on the blocking pool, cached for 30 s, concurrent identical lookups coalesced);
+host names in ``listen_tcp`` arrive with it, so until then ``listen_tcp``'s ``host`` is a numeric
 address.
 """
 
@@ -46,9 +47,10 @@ from typing import NoReturn, cast
 
 from porto import _core
 from porto._core import Semaphore, Started, TcpListener, TcpStream, scope
+from porto._dns import SockAddr, resolve
 from porto.errors import IncompleteReadError
 
-__all__ = ["TcpListener", "TcpStream", "listen_tcp", "serve_tcp"]
+__all__ = ["SockAddr", "TcpListener", "TcpStream", "listen_tcp", "resolve", "serve_tcp"]
 
 _logger = logging.getLogger("porto.net")
 
