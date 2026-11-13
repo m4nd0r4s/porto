@@ -489,11 +489,10 @@ class Buffer:
 
 _SocketAddress: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
 
-@final
-class TcpStream:
-    """A TCP connection: ``porto.net.TcpStream``, a ``porto.abc.ByteStream``. Open one with
-    ``porto.net.listen_tcp(...).accept()``. It belongs to the ``porto.run`` that opened it:
-    using it from another run raises ``RuntimeError`` at the call."""
+class _SocketStream:
+    """What ``porto.net.TcpStream`` and ``porto.net.UnixStream`` share: the ``porto.abc.ByteStream``
+    methods. A stream belongs to the ``porto.run`` that opened it: using it from another run
+    raises ``RuntimeError`` at the call."""
 
     def read(self, max: int | None = None, /) -> Awaitable[bytes]:
         """Receives at most ``max`` bytes (``max >= 1``; ``ValueError`` otherwise; ``None``, the
@@ -556,6 +555,15 @@ class TcpStream:
 
     def __aenter__(self) -> Awaitable[Self]: ...
     def __aexit__(self, *exception: object) -> Awaitable[None]: ...
+    def fileno(self) -> int:
+        """The OS file descriptor (the socket handle on Windows); the stream still owns it.
+        ``porto.ClosedResourceError`` once closed."""
+
+@final
+class TcpStream(_SocketStream):
+    """A TCP connection: ``porto.net.TcpStream``, a ``porto.abc.ByteStream``. Open one with
+    ``porto.net.connect_tcp`` or ``porto.net.listen_tcp(...).accept()``."""
+
     def set_nodelay(self, nodelay: bool, /) -> None:
         """``TCP_NODELAY``: send small writes at once instead of coalescing them."""
 
@@ -571,10 +579,6 @@ class TcpStream:
     @property
     def sockname(self) -> _SocketAddress:
         """This end's address, in the same shape."""
-
-    def fileno(self) -> int:
-        """The OS file descriptor (the socket handle on Windows); the stream still owns it.
-        ``porto.ClosedResourceError`` once closed."""
 
     @staticmethod
     def _connecting(

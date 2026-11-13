@@ -579,7 +579,7 @@ impl Completed {
                 // that refuses (the peer already reset it) is still handed over: its first
                 // read or write reports the real error.
                 let _ = tcp::set_nodelay(&connection, true);
-                Py::new(py, TcpStream::adopt(py, connection, Some(address))?)?.into_any()
+                Py::new(py, TcpStream::adopt(connection, Some(address))?)?.into_any()
             }
             Self::Received(bytes, address) => {
                 (PyBytes::new(py, &bytes), sockaddr::to_py(py, &address)?)

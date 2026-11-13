@@ -1,11 +1,13 @@
 //! `porto.net`: the TCP stream and listener (17-networking-tls-dns.md §1), over the same
 //! registered sockets and [`IoOp`](crate::io::op::IoOp)s as the `_IoHandle` test hook.
 //!
+//! - `stream`: `SocketStream`, the reads, writes and close of every connected stream socket;
 //! - `tcp_stream`: `TcpStream`, the `porto.abc.ByteStream` of a TCP connection;
 //! - `tcp_listener`: `TcpListener` and `listen_tcp`'s socket.
 //!
 //! The Python-free parts (the listening socket, accept, the options) are in `porto-net`.
 
+mod stream;
 mod tcp_listener;
 mod tcp_stream;
 
@@ -18,6 +20,7 @@ use socket2::Socket;
 pub(crate) use tcp_stream::TcpStream;
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<stream::SocketStream>()?;
     module.add_class::<TcpStream>()?;
     tcp_listener::register(module)
 }
