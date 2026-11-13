@@ -86,6 +86,9 @@ thread_local! {
     /// The runtime of the run on this thread while it is being dropped: code that runs as the
     /// drop cancels a task (a `finally`) can still ask it for the tasks left (`Scope.tasks`).
     static TEARDOWN: RefCell<Option<Handle>> = const { RefCell::new(None) };
+    /// The tasks whose coroutines awaited while they were closed at the end of the run: name and
+    /// stack of each (see `abandon.rs`).
+    static STUCK: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     /// Whether this thread is running a Python lane (inside [`run`]).
     static ON_PYTHON_LANE: Cell<bool> = const { Cell::new(false) };
     /// Whether the run on this thread is in debug mode (`RuntimeConfig.debug`): read only by
@@ -185,6 +188,7 @@ pub(crate) fn run<T>(
     TEARDOWN.replace(Some(runtime.handle().clone()));
     drop(runtime);
     drop(TEARDOWN.take());
+    super::abandon::warn_stuck(py);
     // Taken out first: dropping a waker may free its task and close its coroutine, which runs
     // Python code that may reach the lane state again.
     let state = LANE.take();
@@ -256,6 +260,22 @@ pub(crate) fn any_introspection() -> bool {
 /// Whether this thread is running a Python lane.
 pub(crate) fn is_active() -> bool {
     ON_PYTHON_LANE.get()
+}
+
+/// Whether the run on this thread is being dropped: tasks cancelled now are cancelled by the
+/// end of the run.
+pub(crate) fn tearing_down() -> bool {
+    TEARDOWN.with_borrow(Option::is_some)
+}
+
+/// Records a task whose coroutine could not be closed (see `abandon.rs`).
+pub(crate) fn record_stuck(name: String, stack: String) {
+    STUCK.with_borrow_mut(|stuck| stuck.push((name, stack)));
+}
+
+/// Takes the tasks recorded by [`record_stuck`].
+pub(crate) fn take_stuck() -> Vec<(String, String)> {
+    STUCK.take()
 }
 
 /// The runtime of the Python lane running on this thread, if any: where tasks are spawned.
@@ -361,6 +381,22 @@ pub(crate) fn arm_scheduler_panic() {
 /// run early: a signal handler that raises (`KeyboardInterrupt` on Ctrl-C), checked every
 /// [`SIGNAL_CHECK_INTERVAL`], and a [`fail`]ure. MUST be polled by the lane's `block_on`.
 pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -> TaskOutcome {
+    match watch_for_interrupt(main).await {
+        Interrupted::Done(outcome) => outcome,
+        Interrupted::Interrupt(exception) => TaskOutcome::Err(exception),
+    }
+}
+
+/// What [`watch_for_interrupt`] ended with.
+pub(crate) enum Interrupted<T> {
+    /// The future finished.
+    Done(T),
+    /// An exception stopped the run first.
+    Interrupt(Py<PyBaseException>),
+}
+
+/// [`main_or_interrupt`] for any future: the future's output, or what stopped the run first.
+pub(crate) async fn watch_for_interrupt<T>(main: impl Future<Output = T>) -> Interrupted<T> {
     let mut main = pin!(main);
     let mut ticker = pin!(sleep_until(Deadline::after(SIGNAL_CHECK_INTERVAL)));
     poll_fn(|cx| {
@@ -368,15 +404,15 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
             !SCHEDULER_PANIC_ARMED.replace(false),
             "test hook: a panic in the scheduler"
         );
-        if let Poll::Ready(outcome) = main.as_mut().poll(cx) {
-            return Poll::Ready(outcome);
+        if let Poll::Ready(output) = main.as_mut().poll(cx) {
+            return Poll::Ready(Interrupted::Done(output));
         }
         let failure = LANE.with_borrow_mut(|lane| {
             lane.root = Some(cx.waker().clone());
             lane.failure.take()
         });
         if let Some(exception) = failure {
-            return Poll::Ready(TaskOutcome::Err(exception));
+            return Poll::Ready(Interrupted::Interrupt(exception));
         }
         while ticker.as_mut().poll(cx).is_ready() {
             // SAFETY: the lane's `block_on` polls this future with the thread state attached
@@ -384,7 +420,7 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
             if unsafe { ffi::PyErr_CheckSignals() } < 0 {
                 // SAFETY: attached, see above.
                 let py = unsafe { Python::assume_attached() };
-                return Poll::Ready(TaskOutcome::Err(take_exception(py).unbind()));
+                return Poll::Ready(Interrupted::Interrupt(take_exception(py).unbind()));
             }
             ticker
                 .as_mut()

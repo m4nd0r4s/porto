@@ -94,8 +94,12 @@ class Runtime:
         the runtime runs: ``NoRuntimeError`` before, ``RuntimeClosed`` after."""
 
     def shutdown(self, *, timeout: float = 10.0) -> None:
-        """Stops a runtime that never started or already stopped (it cannot start afterwards).
-        Shutting down a runtime that runs is not supported yet: ``RuntimeError``."""
+        """Stops the runtime; it cannot start afterwards. A runtime that never started or already
+        stopped: nothing to do. One that runs shuts down in order: ``porto.lifecycle.
+        shutdown_requested()`` is set, main gets ``timeout`` seconds to finish by itself, then the
+        root scope is cancelled and given ``cancel_timeout``, and the tasks still alive are
+        abandoned. Called from another thread it returns once the runtime stopped; called from a
+        task of the runtime it returns at once and the shutdown goes on while main continues."""
 
     def __enter__(self) -> Runtime: ...
     def __exit__(self, *exception: object) -> None: ...
@@ -105,6 +109,9 @@ def runtime() -> Runtime:
 
 def in_runtime() -> bool:
     """Whether this code runs on the lane of a running runtime."""
+
+def _shutdown_requested() -> Event:
+    """``porto.lifecycle.shutdown_requested()``."""
 
 # Time
 

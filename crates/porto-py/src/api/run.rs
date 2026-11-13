@@ -8,10 +8,12 @@
 //! to `cancel_timeout` for the tasks still in it, then closes it (C7: no more spawns). It
 //! returns main's result, or raises main's exception as is; when tasks of the root scope
 //! failed, it raises a strict exception group of main's exception (first) and theirs.
+//!
+//! A shutdown request (`Runtime.shutdown()`, a signal) interrupts that: see [`supervise`].
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -20,7 +22,8 @@ use porto_core::config::RuntimeConfig;
 use porto_core::scope::CancelReason;
 use porto_core::time::{Deadline, sleep_until};
 use pyo3::exceptions::{
-    PyBaseException, PyException, PyRuntimeError, PyRuntimeWarning, PyTypeError,
+    PyBaseException, PyException, PyKeyboardInterrupt, PyRuntimeError, PyRuntimeWarning,
+    PyTypeError,
 };
 use pyo3::ffi;
 use pyo3::prelude::*;
@@ -28,6 +31,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 
 use super::config;
+use super::lifecycle::{Cause, Lifecycle};
 use super::runtime::{self, RunClaim, Runtime};
 use super::scope::{Scope, exception_group};
 use super::task::Task;
@@ -99,14 +103,19 @@ fn run_in_root_scope(
     let config = runtime_object.get().config();
     let cancel_timeout = config.cancel_timeout();
     let unstarted = coro.clone();
-    let (outcome, errors) = lane::run(py, config, |runtime| {
+    let (finished, errors) = lane::run(py, config, |runtime| {
         // The steps other features fill in (26 §2 step 1), undone when this block ends.
-        let _installed = startup::install(py, config, startup::on_main_thread(py))?;
+        let _installed = startup::install(
+            py,
+            config,
+            startup::on_main_thread(py),
+            runtime_object.get().lifecycle(),
+        )?;
         // Owned by no task: nobody enters or exits it.
         let node = PyScopeNode::new_root(0);
         let root = Py::new(py, Scope::root(py, node.clone()))?;
         let _published = RootScope::publish(root.clone_ref(py));
-        let _runtime_published = Runtime::publish(runtime_object, root.clone_ref(py));
+        let _runtime_published = Runtime::publish(runtime_object, root.clone_ref(py))?;
         let task = Py::new(py, Task::new(Some(main.clone().unbind()), false))?;
         let spawned = Spawned::Child {
             task: task.clone_ref(py),
@@ -115,27 +124,170 @@ fn run_in_root_scope(
         };
         let main = pytask::spawn(runtime.handle(), coro, spawned)?;
         task.get().bind(&main);
-        let abandoned = Cell::new(0);
-        let outcome = lane::block_on(
+        let waits = Waits {
+            graceful: config.graceful_timeout(),
+            cancel: cancel_timeout,
+        };
+        let lifecycle = runtime_object.get().lifecycle();
+        let event = runtime_object.get().shutdown_event(py);
+        let finished = lane::block_on(
             runtime,
-            lane::main_or_interrupt(async {
-                let outcome = pytask::join(main).await;
-                node.cancel(CancelReason::Shutdown);
-                abandoned.set(drain(&node, Deadline::after(cancel_timeout)).await);
-                outcome
-            }),
+            lane::watch_for_interrupt(supervise(
+                py,
+                pytask::join(main),
+                &node,
+                lifecycle,
+                event.as_ref(),
+                waits,
+            )),
         );
-        if abandoned.get() > 0 {
-            warn_abandoned(py, abandoned.get(), cancel_timeout)?;
+        let finished = match finished {
+            lane::Interrupted::Done(finished) => finished,
+            // Ctrl-C with Python's own handler, or a task nobody waits for that raised a
+            // `KeyboardInterrupt`: the run ends at once, the runtime drops what is left.
+            lane::Interrupted::Interrupt(exception) => Finished::interrupted(exception),
+        };
+        if finished.abandoned > 0 {
+            warn_abandoned(py, finished.abandoned, cancel_timeout)?;
         }
-        PyResult::Ok((outcome, root.get().close()))
+        PyResult::Ok((finished, root.get().close()))
     })
     .inspect_err(|_| {
         // The runtime did not start (its I/O driver did not open): close the coroutine, so
         // the caller sees that error and no "never awaited" warning.
         close_coroutine(&unstarted);
     })??;
-    root_outcome(py, outcome, errors)
+    root_outcome(py, finished, errors)
+}
+
+/// The waits of the shutdown sequence, from the configuration.
+#[derive(Clone, Copy)]
+struct Waits {
+    /// How long main may take to finish by itself once a shutdown was requested.
+    graceful: Duration,
+    /// How long the tasks of the root scope have to end once it is cancelled.
+    cancel: Duration,
+}
+
+/// How the supervised run ended.
+struct Finished {
+    /// How main ended; `None` if it was still running when it was abandoned.
+    outcome: Option<TaskOutcome>,
+    /// How many tasks of the root scope were abandoned (main among them if it never ended).
+    abandoned: u32,
+    /// What asked for the shutdown, if something did.
+    cause: Option<Cause>,
+}
+
+impl Finished {
+    fn interrupted(exception: Py<PyBaseException>) -> Self {
+        Self {
+            outcome: Some(TaskOutcome::Err(exception)),
+            abandoned: 0,
+            cause: None,
+        }
+    }
+}
+
+/// The runtime's life from main's start to the end of the root scope (26 §2 steps 2-5):
+///
+/// 1. RUNNING: wait for `main` to end, or for a shutdown request.
+/// 2. DRAINING (a request came while main runs): set `porto.lifecycle.shutdown_requested()` and
+///    give main the graceful period to end by itself.
+/// 3. CANCELLING: cancel the root scope (`Shutdown`) and give main `cancel_timeout` to end.
+/// 4. Once main ended, or was given up on: cancel the root scope, give the tasks still in it
+///    what is left of `cancel_timeout`, and abandon the rest.
+///
+/// A forced shutdown (a second Ctrl-C) stops every wait: the scope is cancelled and what is
+/// left is abandoned at once. MUST be polled by the lane's `block_on`.
+async fn supervise<J: Future<Output = TaskOutcome>>(
+    py: Python<'_>,
+    join: J,
+    node: &PyScopeNode,
+    lifecycle: &Lifecycle,
+    event: Option<&Py<PyAny>>,
+    waits: Waits,
+) -> Finished {
+    let mut join = pin!(join);
+    let mut outcome = main_or(
+        join.as_mut(),
+        poll_fn(|cx| lifecycle.poll_requested(cx).map(|_| ())),
+    )
+    .await;
+    let mut cause = None;
+    if outcome.is_none() {
+        let request = poll_fn(|cx| lifecycle.poll_requested(cx)).await;
+        cause = Some(request.cause);
+        if let Some(event) = event
+            && let Err(error) = event.bind(py).call_method0(pyo3::intern!(py, "set"))
+        {
+            error.write_unraisable(py, Some(event.bind(py)));
+        }
+        outcome = main_or(
+            join.as_mut(),
+            first_of(
+                sleep_until(Deadline::after(request.graceful.unwrap_or(waits.graceful))),
+                poll_fn(|cx| lifecycle.poll_forced(cx)),
+            ),
+        )
+        .await;
+    }
+    if outcome.is_none() {
+        node.cancel(CancelReason::Shutdown);
+        outcome = main_or(
+            join.as_mut(),
+            first_of(
+                sleep_until(Deadline::after(waits.cancel)),
+                poll_fn(|cx| lifecycle.poll_forced(cx)),
+            ),
+        )
+        .await;
+    }
+    node.cancel(CancelReason::Shutdown);
+    let deadline = if outcome.is_none() || lifecycle.is_forced() {
+        // Main never ended, or the shutdown is forced: nothing more to wait for.
+        Deadline::after(Duration::ZERO)
+    } else {
+        Deadline::after(waits.cancel)
+    };
+    let abandoned = drain(node, deadline).await;
+    Finished {
+        outcome,
+        abandoned,
+        cause,
+    }
+}
+
+/// Waits for `join` (main's outcome), or for `other`: `Some` with the outcome if main ended
+/// first.
+async fn main_or(
+    mut join: Pin<&mut impl Future<Output = TaskOutcome>>,
+    other: impl Future<Output = ()>,
+) -> Option<TaskOutcome> {
+    let mut other = pin!(other);
+    poll_fn(|cx| {
+        if let Poll::Ready(outcome) = join.as_mut().poll(cx) {
+            return Poll::Ready(Some(outcome));
+        }
+        if other.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Completes when either future does.
+async fn first_of(first: impl Future<Output = ()>, second: impl Future<Output = ()>) {
+    let mut first = pin!(first);
+    let mut second = pin!(second);
+    poll_fn(|cx| {
+        if first.as_mut().poll(cx).is_ready() || second.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    })
+    .await;
 }
 
 /// Waits until no task is left in `scope`, or `deadline` passed: the tasks still there are
@@ -182,14 +334,29 @@ fn warn_abandoned(py: Python<'_>, count: u32, cancel_timeout: Duration) -> PyRes
     PyErr::warn(py, &category, &std::ffi::CString::new(message)?, 1)
 }
 
-/// What `porto.run` returns or raises, given how main ended and the failures its root scope
-/// recorded (main's own failure among them): main's outcome when only main failed or nothing
-/// did, else a strict group of main's exception, first, and the others'.
+/// What `porto.run` returns or raises, given how the run finished and the failures its root
+/// scope recorded (main's own failure among them): after a shutdown a signal asked for, the
+/// signal's exception (`KeyboardInterrupt`, `porto.Terminated`), unless main failed with
+/// something of its own; else main's outcome when only main failed or nothing did, else a strict
+/// group of main's exception, first, and the others'.
 fn root_outcome(
     py: Python<'_>,
-    outcome: TaskOutcome,
+    finished: Finished,
     errors: Vec<Py<PyBaseException>>,
 ) -> PyResult<Py<PyAny>> {
+    let Finished { outcome, cause, .. } = finished;
+    let ended_by_the_shutdown = matches!(
+        outcome,
+        None | Some(TaskOutcome::Ok(_) | TaskOutcome::Cancelled(_))
+    );
+    if ended_by_the_shutdown
+        && errors.is_empty()
+        && let Some(exception) = cause.and_then(|cause| signal_exception(py, cause).transpose())
+    {
+        return Err(exception?);
+    }
+    // Main never ended (it was abandoned): it ended by the shutdown, as far as the caller sees.
+    let outcome = outcome.unwrap_or(TaskOutcome::Cancelled(None));
     // An interrupt (Ctrl-C, or `SystemExit`) ends `porto.run` bare, also when it arrived while
     // the root scope drained after main failed: it is not one more failure to group.
     if let TaskOutcome::Err(exception) = &outcome
@@ -216,6 +383,20 @@ fn root_outcome(
         exceptions.append(error)?;
     }
     Err(exception_group(py, "porto root scope failed", &exceptions)?)
+}
+
+/// What `porto.run` raises after a shutdown that `cause` asked for: `KeyboardInterrupt` for
+/// SIGINT, `porto.Terminated` (exit status 143, 128 + SIGTERM) for SIGTERM, nothing for
+/// `Runtime.shutdown()`.
+fn signal_exception(py: Python<'_>, cause: Cause) -> PyResult<Option<PyErr>> {
+    match cause {
+        Cause::Shutdown => Ok(None),
+        Cause::Interrupt => Ok(Some(PyKeyboardInterrupt::new_err(()))),
+        Cause::Terminate => {
+            let terminated = py.import("porto.errors")?.getattr("Terminated")?;
+            Ok(Some(PyErr::from_value(terminated.call1((143,))?)))
+        }
+    }
 }
 
 /// Publishes the root scope of the running `porto.run` for `_root_scope()` until dropped.

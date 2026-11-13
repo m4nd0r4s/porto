@@ -169,15 +169,6 @@ def test_leaving_the_context_manager_shuts_the_runtime_down() -> None:
         runtime.block_on(double(1))
 
 
-def test_a_runtime_that_runs_cannot_be_shut_down_yet() -> None:
-    async def main() -> str:
-        with pytest.raises(RuntimeError, match="not supported yet"):
-            porto.runtime().shutdown()
-        return str(porto.runtime())
-
-    assert porto.run(main) == "<porto.Runtime running>"
-
-
 def test_shutdown_refuses_a_bad_timeout() -> None:
     with pytest.raises(ValueError, match="timeout"):
         porto.Runtime().shutdown(timeout=-1)

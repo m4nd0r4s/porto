@@ -15,8 +15,9 @@
 //!   test_runtime.py` (task handles, scopes, channels, streams).
 
 use std::cell::{Cell, RefCell};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use porto_core::Handle;
 use porto_core::config::RuntimeConfig;
@@ -25,6 +26,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use super::config;
+use super::lifecycle::{Cause, Lifecycle, Request};
 use super::run::{closing_on_error, coroutine_from, run_claimed};
 use super::scope::Scope;
 use crate::driver::lane;
@@ -57,6 +59,12 @@ pub(crate) struct Runtime {
     state: AtomicU8,
     /// The root scope while the runtime runs.
     root: Mutex<Option<Py<Scope>>>,
+    /// What asks the runtime to shut down (26 §2 steps 3-4).
+    lifecycle: Arc<Lifecycle>,
+    /// `porto.lifecycle.shutdown_requested()` while the runtime runs.
+    shutdown_event: Mutex<Option<Py<PyAny>>>,
+    /// Whether the run ended (`STOPPED`), for `shutdown()` called from another thread.
+    stopped: (Mutex<bool>, Condvar),
 }
 
 impl Runtime {
@@ -65,11 +73,47 @@ impl Runtime {
             config,
             state: AtomicU8::new(NEW),
             root: Mutex::new(None),
+            lifecycle: Arc::new(Lifecycle::default()),
+            shutdown_event: Mutex::new(None),
+            stopped: (Mutex::new(false), Condvar::new()),
         }
     }
 
     pub(crate) fn config(&self) -> &RuntimeConfig {
         &self.config
+    }
+
+    pub(crate) fn lifecycle(&self) -> &Arc<Lifecycle> {
+        &self.lifecycle
+    }
+
+    /// The `shutdown_requested` event while the runtime runs.
+    pub(crate) fn shutdown_event(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.shutdown_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|event| event.clone_ref(py))
+    }
+
+    /// Blocks the calling thread, detached, until the run ended.
+    fn wait_stopped(&self, py: Python<'_>) -> PyResult<()> {
+        let (lock, condvar) = &self.stopped;
+        loop {
+            let stopped = py.detach(|| {
+                let guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (guard, _) = condvar
+                    .wait_timeout_while(guard, Duration::from_millis(100), |stopped| !*stopped)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard
+            });
+            if stopped {
+                return Ok(());
+            }
+            py.check_signals()?;
+        }
     }
 
     /// Takes the right to run: the runtime is `NEW`, and no other runtime runs in the process.
@@ -105,13 +149,26 @@ impl Runtime {
 
     /// Publishes the root scope and the runtime for `runtime()` and `root_scope`, on the lane
     /// thread, until the guard drops.
-    pub(crate) fn publish(slf: &Bound<'_, Self>, root: Py<Scope>) -> Published {
+    ///
+    /// # Errors
+    /// When the `shutdown_requested` event cannot be made.
+    pub(crate) fn publish(slf: &Bound<'_, Self>, root: Py<Scope>) -> PyResult<Published> {
+        let event = slf
+            .py()
+            .import("porto._core")?
+            .getattr("Event")?
+            .call0()?
+            .unbind();
+        *slf.get()
+            .shutdown_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
         *slf.get().lock_root() = Some(root);
         let previous = CURRENT.replace(Some(slf.clone().unbind()));
         drop(previous);
-        Published {
+        Ok(Published {
             runtime: slf.clone().unbind(),
-        }
+        })
     }
 }
 
@@ -123,7 +180,13 @@ pub(crate) struct RunClaim {
 impl Drop for RunClaim {
     fn drop(&mut self) {
         PROCESS_RUN.store(false, Ordering::Release);
-        self.runtime.get().state.store(STOPPED, Ordering::Release);
+        let runtime = self.runtime.get();
+        runtime.state.store(STOPPED, Ordering::Release);
+        let (lock, condvar) = &runtime.stopped;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        condvar.notify_all();
     }
 }
 
@@ -136,9 +199,17 @@ impl Drop for Published {
     fn drop(&mut self) {
         let current = CURRENT.take();
         let root = self.runtime.get().lock_root().take();
+        let event = self
+            .runtime
+            .get()
+            .shutdown_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // Dropped after the lock: dropping a scope may run Python code.
         drop(current);
         drop(root);
+        drop(event);
     }
 }
 
@@ -232,10 +303,15 @@ impl Runtime {
     }
 
     /// Stops the runtime. Nothing to do for one that never started or already stopped; it
-    /// cannot start afterwards. A runtime that runs cannot be shut down from here yet: return
-    /// from main, or cancel the root scope.
+    /// cannot start afterwards.
+    ///
+    /// A runtime that runs is shut down in order (26 §2): `porto.lifecycle.shutdown_requested()`
+    /// is set, main gets `timeout` seconds to finish by itself, then the root scope is cancelled
+    /// and given `cancel_timeout`, and what is left is abandoned. Called from another thread, it
+    /// returns once the runtime stopped; called from a task of the runtime itself it returns at
+    /// once, and the shutdown goes on while main continues.
     #[pyo3(signature = (*, timeout=10.0))]
-    fn shutdown(&self, timeout: f64) -> PyResult<()> {
+    fn shutdown(&self, py: Python<'_>, timeout: f64) -> PyResult<()> {
         if !timeout.is_finite() || timeout < 0.0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "porto: Runtime.shutdown(timeout={timeout}) must be a finite number of seconds, \
@@ -247,11 +323,16 @@ impl Runtime {
             .compare_exchange(NEW, STOPPED, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) | Err(STOPPED) => Ok(()),
-            Err(_) => Err(PyRuntimeError::new_err(
-                "porto: Runtime.shutdown() of a runtime that is running is not supported yet; \
-                 return from main to stop it, or cancel its root scope \
-                 (`runtime.root_scope.cancel()`) and let main finish",
-            )),
+            Err(_) => {
+                self.lifecycle.request(Request {
+                    cause: Cause::Shutdown,
+                    graceful: Some(Duration::try_from_secs_f64(timeout).unwrap_or(Duration::MAX)),
+                });
+                if lane::is_active() {
+                    return Ok(());
+                }
+                self.wait_stopped(py)
+            }
         }
     }
 
@@ -260,8 +341,8 @@ impl Runtime {
     }
 
     #[pyo3(signature = (*_exception))]
-    fn __exit__(&self, _exception: &Bound<'_, PyTuple>) -> PyResult<()> {
-        self.shutdown(10.0)
+    fn __exit__(&self, py: Python<'_>, _exception: &Bound<'_, PyTuple>) -> PyResult<()> {
+        self.shutdown(py, 10.0)
     }
 
     fn __repr__(&self) -> String {
@@ -280,14 +361,17 @@ impl Runtime {
 /// `NoRuntimeError` outside a task of a running runtime.
 #[pyfunction]
 fn runtime(py: Python<'_>) -> PyResult<Py<Runtime>> {
-    let current =
-        CURRENT.with_borrow(|runtime| runtime.as_ref().map(|runtime| runtime.clone_ref(py)));
-    current.ok_or_else(|| {
+    current(py).ok_or_else(|| {
         NoRuntimeError::new_err(
             "porto: porto.runtime() must be called from code that porto.run(main) or \
              Runtime.block_on(main) runs; from another thread, use `porto.from_thread`",
         )
     })
+}
+
+/// The runtime whose lane this thread is, if any.
+pub(crate) fn current(py: Python<'_>) -> Option<Py<Runtime>> {
+    CURRENT.with_borrow(|runtime| runtime.as_ref().map(|runtime| runtime.clone_ref(py)))
 }
 
 /// `porto.in_runtime()`: whether this code runs on the lane of a running runtime.

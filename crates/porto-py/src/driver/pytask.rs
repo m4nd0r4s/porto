@@ -37,7 +37,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 
 use super::pending::{Kind, Payload, Pending};
-use super::{lane, step};
+use super::{abandon, lane, step};
 use crate::api::run::close_coroutine;
 use crate::api::task::Task;
 use crate::errors::{Cancelled, RuntimeClosed};
@@ -680,7 +680,9 @@ impl TaskBody for PyTask {
         // dropped by the runtime) or a wake after the runtime ended, with no lane left to
         // route to: off a Python thread pyo3 defers the release to the next attached one.
         this.release_wait();
-        drop(this.coro.take().map(PyObj::into_unchecked));
+        if let Some(coro) = this.coro.take() {
+            abandon::close_for_teardown(this.py_handle.as_ref(), coro.into_unchecked());
+        }
         if let Some(task) = this.py_handle.take() {
             // Its scope's exit, or whoever holds the `porto.Task`, learns how it ended.
             task.get().finish(TaskOutcome::Cancelled(None));

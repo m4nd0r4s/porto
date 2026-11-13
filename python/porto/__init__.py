@@ -19,7 +19,7 @@ print(porto.run(main))
 ```
 """
 
-from porto import abc, lowlevel, net
+from porto import abc, lifecycle, lowlevel, net
 from porto._channel import broadcast, channel, oneshot, unbounded_channel, watch
 from porto._config import DeterministicConfig, RuntimeConfig
 from porto._core import (
@@ -128,6 +128,7 @@ __all__ = [
     "current_task",
     "current_time",
     "in_runtime",
+    "lifecycle",
     "lowlevel",
     "monotonic",
     "move_on_after",

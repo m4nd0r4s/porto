@@ -14,10 +14,12 @@ class Runtime:
     @property
     def root_scope(self) -> Scope            # escape hatch (ADR-007); only valid while running
     def portal(self) -> Portal                # arrives with porto.from_thread (not implemented yet)
-    def shutdown(self, *, timeout: float = 10.0) -> None   # a running runtime: not supported yet (26 §2)
+    def shutdown(self, *, timeout: float = 10.0) -> None   # a running runtime shuts down in order: 26 §2 steps 3-6
     def __enter__(self) -> Runtime; def __exit__(self, *exc) -> None    # shutdown on exit
 def runtime() -> Runtime                     # current runtime or NoRuntimeError
 def in_runtime() -> bool
+# porto.lifecycle (26 §2)
+def lifecycle.shutdown_requested() -> Event   # set once the runtime was asked to shut down; NoRuntimeError outside one
 ```
 
 A `Runtime` runs once (`NEW → RUNNING → STOPPED`, 26 §2); `block_on` on one that ran or was shut down raises `RuntimeClosed`, `root_scope` raises `NoRuntimeError` before the run and `RuntimeClosed` after. `runtime()` and `in_runtime()` answer for code on the lane of a running runtime (its tasks); a blocking-pool thread is not in the runtime. `porto.run` makes a `Runtime` itself, so `runtime()` is the same object either way.

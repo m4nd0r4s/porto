@@ -6,10 +6,12 @@
 //! hook of 25 §6) fill their step in; until then it installs nothing, so a run does exactly what
 //! it did before. What ran, in which order, is kept for the `_startup_trace` test hook.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use porto_core::config::RuntimeConfig;
 use pyo3::prelude::*;
+
+use crate::api::lifecycle::Lifecycle;
 
 /// What a step may look at when it decides and installs.
 pub(crate) struct StartContext<'a, 'py> {
@@ -19,6 +21,12 @@ pub(crate) struct StartContext<'a, 'py> {
     /// Whether the thread that starts the runtime (lane 0) is the process's main thread, the only
     /// one Python delivers signals to.
     pub(crate) on_main_thread: bool,
+    /// What the signal receiver asks to shut the runtime down.
+    #[allow(
+        dead_code,
+        reason = "read by the signal step once its owner fills it in"
+    )]
+    pub(crate) lifecycle: &'a Arc<Lifecycle>,
 }
 
 /// Undoes what one step installed.
@@ -93,6 +101,7 @@ pub(crate) fn install(
     py: Python<'_>,
     config: &RuntimeConfig,
     on_main_thread: bool,
+    lifecycle: &Arc<Lifecycle>,
 ) -> PyResult<Installed> {
     TRACE
         .lock()
@@ -102,6 +111,7 @@ pub(crate) fn install(
         py,
         config,
         on_main_thread,
+        lifecycle,
     };
     let mut installed = Installed { undo: Vec::new() };
     for step in &STEPS {

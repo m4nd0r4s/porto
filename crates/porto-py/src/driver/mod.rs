@@ -10,6 +10,7 @@
 //! - `freelist`: the lock-free freelist of the hot awaitables on GIL builds; `fast_new`: making
 //!   them over it without pyo3's generic path.
 
+pub(crate) mod abandon;
 pub(crate) mod fast_new;
 pub(crate) mod freelist;
 pub(crate) mod lane;
