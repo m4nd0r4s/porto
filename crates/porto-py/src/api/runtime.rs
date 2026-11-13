@@ -424,9 +424,19 @@ fn in_runtime() -> bool {
 /// a runtime whose threads are gone (25 §6, ST-14).
 #[pyfunction(name = "_before_fork")]
 fn before_fork(py: Python<'_>) -> PyResult<()> {
-    // Held across the fork, so the child never inherits the signal table locked mid-update.
+    let warned = warn_about_fork(py);
+    // Last, once nothing can release the GIL any more: the signal table's lock is held across
+    // the fork, so the child never inherits it locked mid-update. Waiting for it with the GIL
+    // held could deadlock against a holder that needs the GIL, so wait with it released.
     #[cfg(unix)]
-    porto_io::signal::prepare_fork();
+    while !porto_io::signal::try_prepare_fork() {
+        py.detach(|| std::thread::sleep(Duration::from_millis(1)));
+    }
+    warned
+}
+
+/// The `RuntimeWarning` of [`before_fork`].
+fn warn_about_fork(py: Python<'_>) -> PyResult<()> {
     if !PROCESS_RUN.load(Ordering::Acquire) {
         return Ok(());
     }
@@ -459,6 +469,9 @@ fn after_fork_in_parent() {
 fn after_fork_in_child() {
     PROCESS_RUN.store(false, Ordering::Release);
     FORK_EPOCH.fetch_add(1, Ordering::AcqRel);
+    // The forking thread is the child's only thread: if it was a blocking-pool worker it is
+    // none now, and may start a fresh runtime.
+    ON_BLOCKING_WORKER.set(false);
     lane::forget_inherited_lane();
     super::signals::forget_in_child();
     super::run::forget_in_child();

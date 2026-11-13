@@ -189,3 +189,30 @@ def test_a_signal_in_the_child_is_not_delivered_to_the_parents_runtime() -> None
     )
     assert done.returncode == 0, done.stderr
     assert f"child: {-15} requested: False" in done.stdout
+
+
+def test_the_child_of_a_fork_from_a_blocking_pool_worker_can_start_a_runtime() -> None:
+    done = run_program(
+        """
+        warnings.simplefilter("ignore")
+
+        async def fresh():
+            return 9
+
+        def forker():
+            pid = os.fork()
+            if pid == 0:
+                print("fresh:", porto.run(fresh), flush=True)
+                os._exit(0)
+            _, status = os.waitpid(pid, 0)
+            return os.waitstatus_to_exitcode(status)
+
+        async def main():
+            print("child status", await porto.to_thread(forker), flush=True)
+
+        porto.run(main)
+        """
+    )
+    assert done.returncode == 0, done.stderr
+    assert "fresh: 9" in done.stdout
+    assert "child status 0" in done.stdout

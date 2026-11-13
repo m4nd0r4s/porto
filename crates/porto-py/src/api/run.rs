@@ -344,8 +344,20 @@ fn warn_abandoned(
     cancel_timeout: Duration,
     finished: &Finished,
 ) -> PyResult<()> {
-    let waited = finished.waited.as_secs_f64();
-    let message = if finished.forced {
+    let message = abandoned_message(count, cancel_timeout, finished.waited, finished.forced);
+    let category = py.get_type::<PyRuntimeWarning>();
+    PyErr::warn(py, &category, &std::ffi::CString::new(message)?, 1)
+}
+
+/// The text of the warning about `count` abandoned tasks.
+fn abandoned_message(
+    count: u32,
+    cancel_timeout: Duration,
+    waited: Duration,
+    forced: bool,
+) -> String {
+    let waited = waited.as_secs_f64();
+    if forced {
         format!(
             "porto.run: {count} task(s) of the root scope were abandoned: the shutdown was forced \
              (a second Ctrl-C) {waited:.3} s after the root scope was cancelled, and they were \
@@ -359,9 +371,7 @@ fn warn_abandoned(
              raise cancel_timeout",
             cancel_timeout.as_secs_f64()
         )
-    };
-    let category = py.get_type::<PyRuntimeWarning>();
-    PyErr::warn(py, &category, &std::ffi::CString::new(message)?, 1)
+    }
 }
 
 /// What `porto.run` returns or raises, given how the run finished and the failures its root
@@ -636,4 +646,28 @@ fn expect_coroutine(object: &Bound<'_, PyAny>, function: &str) -> PyResult<()> {
     Err(PyTypeError::new_err(format!(
         "porto: {function}() expects a coroutine object, got {type_name}{hint}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_abandon_warning_says_how_long_it_waited_and_whether_the_exit_was_forced() {
+        let timeout = Duration::from_secs(5);
+        let waited = Duration::from_millis(1500);
+        let plain = abandoned_message(2, timeout, waited, false);
+        assert!(
+            plain.contains("2 task(s) of the root scope still ran 1.500 s"),
+            "{plain}"
+        );
+        assert!(plain.contains("cancel_timeout is 5.000 s"), "{plain}");
+        assert!(!plain.contains("forced"), "{plain}");
+        let forced = abandoned_message(1, timeout, waited, true);
+        assert!(
+            forced.contains("the shutdown was forced (a second Ctrl-C) 1.500 s"),
+            "{forced}"
+        );
+        assert!(!forced.contains("cancel_timeout is"), "{forced}");
+    }
 }

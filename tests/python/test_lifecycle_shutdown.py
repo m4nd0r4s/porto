@@ -224,7 +224,9 @@ def test_the_root_scope_gets_one_cancel_timeout_in_all_not_one_after_main_ended(
     elapsed = time.monotonic() - started
     assert any("1 task(s) of the root scope" in message for message in messages), messages
     # 0.1 graceful + 1.0 cancel_timeout in all (main ended 0.7 s into it), not 0.8 + 1.0 more.
-    assert elapsed < 1.6, f"the drain got a second cancel_timeout: {elapsed:.2f} s"
+    assert 1.05 <= elapsed < 1.6, f"the drain got a second cancel_timeout: {elapsed:.2f} s"
+    assert any("cancel_timeout is 1.000 s" in message for message in messages), messages
+    assert not any("forced" in message for message in messages), messages
 
 
 def test_block_on_raises_cancelled_when_another_thread_shut_the_runtime_down_on_a_stuck_main() -> (
