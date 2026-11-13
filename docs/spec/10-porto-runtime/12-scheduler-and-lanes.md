@@ -110,8 +110,8 @@ Soft affinity (ST-4): wakes prefer the task's `owner_lane` inbox, so tasks stay 
 
 ## 11. Shutdown of the scheduler
 1. `Shared.shutdown = true`.
-2. Lanes finish the current task, then drain: they cancel all remaining tasks by dropping them (Rust tasks) or by throwing `Cancelled` and running to completion with a 2 s budget (Python tasks; see §26 for the full sequence).
-3. The task registry (23 §1) closes, then cancels every task still linked in it, until none is left: this is what ends tasks kept alive only by wakers.
+2. Lanes finish the current task, then drain: the queues are dropped, which cancels the tasks in them (a Rust task's future is dropped, a Python task's coroutine is closed).
+3. The task registry (23 §1) closes, then cancels every task still linked in it, until none is left: this is what ends tasks kept alive only by wakers. A cancelled Python task is **closed**, not thrown `Cancelled`: a synchronous `finally` runs (and may read `Scope.tasks`, which the closed registry answers), but an `await` in it cannot (a close that awaits is a `RuntimeError`, 26 §2 step 5). The graceful phase, `Cancelled` thrown into every task with up to `cancel_timeout` to finish, is `porto.run`'s CANCELLING step (26 §2), before the runtime is dropped.
 4. Lanes join.
 5. Driver closed.
 
