@@ -11,6 +11,7 @@ import porto
 async def main() -> str:
     assert porto.in_runtime()
     assert porto.runtime() is runtime
+    answer = 0  # bound before the block: Scope.__aexit__ may suppress, as far as pyright knows
     async with porto.scope() as scope:
         answer = await scope.spawn(double, 21)
     return f"answer: {answer}"

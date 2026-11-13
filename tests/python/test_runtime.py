@@ -6,6 +6,7 @@ I1: one runtime runs per process at a time. I4: what belongs to a runtime answer
 """
 
 import contextlib
+import sys
 import threading
 import warnings
 from typing import Any
@@ -298,6 +299,7 @@ def test_a_scope_that_never_ran_is_a_no_runtime_error_not_a_closed_runtime() -> 
         scope.spawn(double, 1)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="porto has no sockets on Windows yet (IOCP)")
 def test_a_socket_of_a_stopped_runtime_raises_runtime_closed() -> None:
     kept: list[Any] = []
 
