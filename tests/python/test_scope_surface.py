@@ -507,6 +507,59 @@ def test_tasks_of_an_open_scope_cannot_be_read_off_the_lane() -> None:
     porto.run(main)
 
 
+def test_tasks_still_answers_while_the_runtime_cancels_what_is_left() -> None:
+    """The ``finally`` of an abandoned task runs as the runtime is dropped: it may list the tasks
+    of a scope that is still open (the registry answers while it shuts down)."""
+    import warnings
+
+    seen: list[tuple[str, ...]] = []
+
+    async def stubborn(s: porto.Scope | None = None) -> None:
+        try:
+            while True:
+                with contextlib.suppress(porto.Cancelled):
+                    await porto.sleep(0.001)
+        finally:
+            if s is not None:
+                seen.append(tuple(task.name for task in s.tasks))
+
+    async def parent() -> None:
+        # Entered by hand and never exited, so tearing the parent down does not close the scope.
+        s = porto.scope()
+        await s.__aenter__()
+        s.spawn(stubborn, s, name="c1")
+        s.spawn(stubborn, s, name="c2")
+        await stubborn()
+
+    async def main() -> None:
+        _core._root_scope().spawn(parent)  # pyright: ignore[reportPrivateUsage]
+        for _ in range(5):
+            await porto.checkpoint()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        porto.run(main, cancel_timeout=0.01)
+    # One of the two is torn down first and sees the other still alive; the second sees none.
+    assert len(seen) == 2
+    assert sorted(seen)[0] == ()
+    assert sorted(seen)[1] in {("c1",), ("c2",)}
+
+
+def test_tasks_of_a_scope_of_another_run_raises_instead_of_answering_empty() -> None:
+    async def enter_and_leave_open() -> porto.Scope:
+        s = porto.scope()
+        await s.__aenter__()  # never exited: the scope stays open after its run
+        return s
+
+    scope = porto.run(enter_and_leave_open)
+
+    async def read_it() -> None:
+        with pytest.raises(RuntimeError, match=r"another porto\.run"):
+            scope.tasks  # noqa: B018
+
+    porto.run(read_it)
+
+
 def test_a_task_that_outlives_its_scope_object_is_unlisted_safely() -> None:
     """The root scope is closed with abandoned tasks still running: they end afterwards."""
     import gc

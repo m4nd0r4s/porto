@@ -51,7 +51,16 @@ static DEBUG_RUNS: AtomicUsize = AtomicUsize::new(0);
 /// How many runs in the process have the introspection switch on (tasks record their timing).
 static INTROSPECTION_RUNS: AtomicUsize = AtomicUsize::new(0);
 
+/// The id of the next run: a scope remembers the run it was entered in.
+static NEXT_RUN: AtomicUsize = AtomicUsize::new(1);
+
 thread_local! {
+    /// The id of the run on this thread, 0 outside one (from [`run`] until it returns, teardown
+    /// included).
+    static RUN: Cell<usize> = const { Cell::new(0) };
+    /// The runtime of the run on this thread while it is being dropped: code that runs as the
+    /// drop cancels a task (a `finally`) can still ask it for the tasks left (`Scope.tasks`).
+    static TEARDOWN: RefCell<Option<Handle>> = const { RefCell::new(None) };
     /// Whether this thread is running a Python lane (inside [`run`]).
     static ON_PYTHON_LANE: Cell<bool> = const { Cell::new(false) };
     /// Whether the run on this thread is in debug mode (`RuntimeConfig.debug`): read only by
@@ -133,11 +142,17 @@ pub(crate) fn run<T>(
         .driver(open_driver(py, config)?)
         .introspection(config.introspection())
         .build();
+    RUN.set(NEXT_RUN.fetch_add(1, Ordering::Relaxed));
+    let _run = RunScope;
     let output = {
         let _lane = OnPythonLane::enter(config.debug(), config.introspection());
         body(&runtime)
     };
+    // Dropping the runtime cancels what is left: the tasks' `finally` blocks run in it, and
+    // may list a scope's tasks, which the registry answers while it shuts down.
+    TEARDOWN.replace(Some(runtime.handle().clone()));
     drop(runtime);
+    drop(TEARDOWN.take());
     // Taken out first: dropping a waker may free its task and close its coroutine, which runs
     // Python code that may reach the lane state again.
     let state = LANE.take();
@@ -185,6 +200,17 @@ pub(crate) fn debug() -> bool {
 #[inline]
 pub(crate) fn any_debug() -> bool {
     DEBUG_RUNS.load(Ordering::Relaxed) != 0
+}
+
+/// The id of the run on this thread (inside [`run`], teardown included), 0 outside one.
+pub(crate) fn run_id() -> usize {
+    RUN.get()
+}
+
+/// The runtime of the run on this thread while it is being dropped: its registry is closed and
+/// answers walks under its lock.
+pub(crate) fn teardown_handle() -> Option<Handle> {
+    TEARDOWN.with_borrow(Clone::clone)
 }
 
 /// Whether any run in the process has introspection on: one relaxed load per poll, which is all
@@ -301,6 +327,16 @@ pub(crate) async fn main_or_interrupt(main: impl Future<Output = TaskOutcome>) -
         Poll::Pending
     })
     .await
+}
+
+/// Ends the run id of [`run`] when it returns, unwinding included.
+struct RunScope;
+
+impl Drop for RunScope {
+    fn drop(&mut self) {
+        RUN.set(0);
+        drop(TEARDOWN.take());
+    }
 }
 
 /// Marks this thread as a Python lane until dropped.

@@ -248,6 +248,13 @@ pub(crate) fn running_handle_of(header: &Header) -> Option<*mut ffi::PyObject> {
     ptr::eq(running.header, header).then(|| running.handle.get())
 }
 
+/// The header of the task running on this thread, if a task is running.
+pub(crate) fn running_header<'a>() -> Option<&'a Header> {
+    // SAFETY: `poll` publishes `Running` only while it polls the task behind `header`, alive for
+    // that whole time (the run reference).
+    running().map(|running| unsafe { &*running.header })
+}
+
 /// Whether the task running on this thread is pinned (its header's `PIN` flag): what a task it
 /// spawns inherits when the spawn does not say (spec 03: pinning is inherited by the subtree).
 /// `false` outside a task.

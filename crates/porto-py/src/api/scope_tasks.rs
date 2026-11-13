@@ -14,7 +14,9 @@
 //! The running one (the reader itself, when it is a child of the scope) is read through the
 //! step driver's record of it instead, since its poll holds the body.
 
+use porto_core::LiveTask;
 use pyo3::Borrowed;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
@@ -24,35 +26,66 @@ use crate::errors::NoRuntimeError;
 use porto_core::task::TaskFlags;
 
 /// The `porto.Task` of every live task spawned into `scope` (or moved into it), oldest first.
+/// `run` is the id of the run that entered the scope.
+///
+/// The walk stops once it has seen as many tasks of the scope as the scope counts
+/// (`live_children`), and a scope with none skips it, so the cost is the distance to the scope's
+/// oldest live task from the newest in the registry: O(live tasks of the run) at worst (about 30 ns
+/// each), a few tasks for a scope of recent children.
+///
+/// While the runtime is dropped (a `finally` of a task it cancels reads `tasks`) the registry is
+/// closed and walked under its lock instead.
 ///
 /// # Errors
-/// `NoRuntimeError` when the caller is not on the lane of the run (a task, or `main`): the lane
-/// owns the registry.
+/// `NoRuntimeError` when the caller is not in a run (the lane owns the registry), and
+/// `RuntimeError` when the scope belongs to another run.
 pub(super) fn scope_tasks<'py>(
     py: Python<'py>,
     scope: &PyScopeRef,
+    run: usize,
 ) -> PyResult<Bound<'py, PyTuple>> {
-    let handle = lane::current().ok_or_else(not_on_the_lane)?;
+    let current = lane::run_id();
+    if current == 0 {
+        return Err(not_on_the_lane());
+    }
+    if run != current {
+        return Err(PyRuntimeError::new_err(
+            "porto: this scope was entered in another porto.run(), so its tasks are not in this \
+             run's registry: read Scope.tasks from a task of the run that entered the scope",
+        ));
+    }
+    let live = scope.lock_state().live_children;
+    if live == 0 {
+        return Ok(PyTuple::empty(py));
+    }
+    let handle = lane::current()
+        .or_else(lane::teardown_handle)
+        .ok_or_else(not_on_the_lane)?;
     let mut found: Vec<(u64, Bound<'py, PyAny>)> = Vec::new();
-    let walked = handle.with_live_tasks(|task| {
+    let mut in_scope = 0;
+    let mut visit = |task: LiveTask<'_>| {
         if !task.flags().contains(TaskFlags::PYTHON) || !task.is_in_scope(scope) {
-            return;
+            return true;
         }
+        in_scope += 1;
         let object = match step::running_handle_of(task.header()) {
             Some(running) => running,
             // SAFETY: a `PYTHON` task's body is a `PyTask`, and a task that is not the running
-            // one is between polls (the walk is on the lane, whose polls do not nest).
+            // one is between polls (the walk is on the lane, whose polls do not nest; at
+            // shutdown the registry skips tasks another thread polls).
             None => unsafe { PyTask::handle_ptr(task.body::<PyTask>()) },
         };
-        if object.is_null() {
-            // An internal spawn: it has no handle to list.
-            return;
+        // An internal spawn has no handle to list.
+        if !object.is_null() {
+            // SAFETY: a borrowed pointer to the `porto.Task` the body (or the running poll)
+            // holds for as long as the task lives; the new reference outlives the walk.
+            let object = unsafe { Borrowed::from_ptr(py, object) }.to_owned();
+            found.push((task.id(), object));
         }
-        // SAFETY: a borrowed pointer to the `porto.Task` the body (or the running poll) holds
-        // for as long as the task lives; the new reference outlives the walk.
-        let object = unsafe { Borrowed::from_ptr(py, object) }.to_owned();
-        found.push((task.id(), object));
-    });
+        in_scope < live
+    };
+    let walked = handle.with_live_tasks_while(&mut visit)
+        || handle.with_live_tasks_at_shutdown(step::running_header(), &mut visit);
     if !walked {
         return Err(not_on_the_lane());
     }

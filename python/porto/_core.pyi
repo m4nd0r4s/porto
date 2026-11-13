@@ -232,7 +232,9 @@ class Scope:
         """A snapshot (a tuple) of the tasks spawned into this scope that have not ended, in
         spawn order: those ``spawn`` returned, and those ``start`` moved here when they called
         ``started.set``. Tasks of nested scopes are not listed. Empty before the block is
-        entered and once it exited."""
+        entered and once it exited. Read it from a task of the run that entered the scope: it
+        walks the run's task registry, up to O(live tasks of the run) (about 30 ns each), so do
+        not read it in a hot loop."""
 
     @property
     def deadline(self) -> float:

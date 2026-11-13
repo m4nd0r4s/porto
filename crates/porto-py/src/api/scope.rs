@@ -42,7 +42,7 @@
 //!
 //! Not yet: spawning from other lanes or threads (C10).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use porto_core::Handle;
@@ -182,6 +182,9 @@ fn move_on_after(seconds: f64) -> PyResult<Scope> {
 pub struct Scope {
     /// The scope's node in the tree, set when the block is entered.
     node: SetOnce<PyScopeNode>,
+    /// The id of the run that entered the scope (`lane::run_id`), set with the node: `tasks` only
+    /// answers in that run, whose registry holds the scope's tasks.
+    run: AtomicUsize,
     /// [`ScopeFlags`]. A cancel before the block is entered reaches the node through them:
     /// `cancel` sets `CANCEL_REQUESTED` and `__aenter__` sets `ENTERED` (after `node`), both
     /// with one read-modify-write, so the later one sees the other and cancels the node.
@@ -598,13 +601,17 @@ impl Scope {
     /// The tasks spawned into this scope that have not ended, in spawn order: a snapshot (a
     /// tuple), taken now. Tasks of nested scopes are not listed, nor is a task `start()` has
     /// not yet moved here (before `started.set`).
+    ///
+    /// Read it from a task of the run that entered the scope. It walks the run's task registry,
+    /// so it costs up to O(live tasks of the run), about 30 ns per task: do not read it in a hot
+    /// loop (spec 20).
     #[getter]
     fn tasks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         // Not entered, or closed (every child ended, C5): nothing to list.
         let (Phase::Open, Some(node)) = (self.phase(), self.node.get_arc()) else {
             return Ok(PyTuple::empty(py));
         };
-        scope_tasks(py, &node)
+        scope_tasks(py, &node, self.run.load(Ordering::Relaxed))
     }
 
     fn __repr__(&self) -> String {
@@ -646,6 +653,7 @@ impl Scope {
     pub(crate) fn root(py: Python<'_>, node: PyScopeRef) -> Self {
         let mut scope = Self::new(None, None, false);
         scope.name = Some(PyString::intern(py, "root").unbind());
+        scope.run.store(lane::run_id(), Ordering::Relaxed);
         let _unset = scope.node.set(node);
         scope
             .flags
@@ -664,6 +672,7 @@ impl Scope {
     fn new(timeout: Option<f64>, deadline: Option<f64>, raise_on_timeout: bool) -> Self {
         Self {
             node: SetOnce::new(),
+            run: AtomicUsize::new(0),
             flags: AtomicU8::new(0),
             cancel_reason: OnceLock::new(),
             shield_lock: Mutex::new(()),
@@ -785,6 +794,7 @@ impl Scope {
                  `async with porto.scope() as s:` in code that porto.run() runs",
             )
         })?;
+        self.run.store(lane::run_id(), Ordering::Relaxed);
         if self.node.set(node.clone()).is_err() {
             // Another task entered it at the same time.
             step::exit_cancel_scope(&node);
