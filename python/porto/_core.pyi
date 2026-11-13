@@ -522,7 +522,9 @@ class TcpStream:
         ``porto.ClosedResourceError`` once closed."""
 
     @staticmethod
-    def _connecting(address: _SocketAddress, /) -> TcpStream: ...
+    def _connecting(
+        address: _SocketAddress, local_address: _SocketAddress | None = None, /
+    ) -> TcpStream: ...
     def _finish_connect(self) -> Awaitable[None]: ...
 
 @final

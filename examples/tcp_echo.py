@@ -1,13 +1,13 @@
-"""TCP: ``porto.net.listen_tcp``, ``serve_tcp``, ``TcpListener`` and ``TcpStream``.
+"""TCP: ``porto.net.connect_tcp``, ``listen_tcp``, ``serve_tcp``, ``TcpListener`` and ``TcpStream``.
 
     uv run python examples/tcp_echo.py
 
 An echo server over loopback. The server is porto: ``listen_tcp`` opens the listener (port 0
 picks a free port, ``listener.port`` reports it), ``async for`` accepts connections, and each
-one is served by its own task in a scope. The clients are plain blocking sockets in OS threads,
-the way a program that knows nothing about porto would connect (``porto.net.connect_tcp`` comes
-later); each thread sets a ``porto.Event`` when it is done, which is how the async side waits
-for a thread without blocking its lane.
+one is served by its own task in a scope. The clients are tasks too: ``connect_tcp(host, port)``
+resolves the host (a name or an IP address), races the addresses it finds as Happy Eyeballs
+(RFC 8305) prescribes and returns the first ``TcpStream`` that connects. It has no timeout of its
+own: put it in ``porto.timeout()`` or ``porto.move_on_after()`` for one.
 
 A ``TcpStream`` reads and writes bytes: ``read`` returns ``b""`` at the end of the stream (the
 peer closed, or half-closed with ``shutdown``), ``write`` sends all of its data, waiting while the
@@ -22,9 +22,7 @@ unterminated last line) and ``read_exact`` (a fixed-size frame); the buffered re
 stream's receive buffer, so lines that arrive split or glued together come out the same.
 """
 
-import socket
 import sys
-import threading
 
 import porto
 from porto import net
@@ -58,41 +56,25 @@ async def serve(listener: net.TcpListener, connections: int) -> None:
                 break
 
 
-def blocking_client(port: int, number: int, replies: list[bytes], done: porto.Event) -> None:
-    """A client that is not porto: connect, send, half-close, read the reply until EOF."""
-    try:
-        with socket.create_connection(("127.0.0.1", port)) as client:
-            client.sendall(MESSAGE % number)
-            client.shutdown(socket.SHUT_WR)
-            reply = b""
-            while chunk := client.recv(4096):
-                reply += chunk
-            replies[number] = reply
-    finally:
-        done.set()  # Event.set() is safe from any thread
+async def client(port: int, number: int) -> bytes:
+    """A client: connect, send, half-close, read the reply until the server closes."""
+    async with await net.connect_tcp("localhost", port) as stream:  # a name, resolved first
+        await stream.write(MESSAGE % number)
+        await stream.shutdown_write()
+        return await stream.read_to_end(limit=4096)
 
 
 async def echo_over_loopback() -> None:
     async with await net.listen_tcp("127.0.0.1") as listener:  # port 0: any free port
         assert listener.port != 0
         assert listener.sockname == ("127.0.0.1", listener.port)
-        replies: list[bytes] = [b""] * CLIENTS
-        finished = [porto.Event() for _ in range(CLIENTS)]
-        threads = [
-            threading.Thread(target=blocking_client, args=(listener.port, n, replies, finished[n]))
-            for n in range(CLIENTS)
-        ]
+        clients: list[porto.Task[bytes]] = []
         async with porto.scope() as s:
             s.spawn(serve(listener, CLIENTS))
-            for thread in threads:
-                thread.start()
-            for event in finished:
-                await event.wait()
-        for thread in threads:
-            thread.join()
-    for number, reply in enumerate(replies):
+            clients.extend(s.spawn(client, listener.port, n) for n in range(CLIENTS))
+    for number, task in enumerate(clients):
         message = MESSAGE % number
-        assert reply == message + b"|echoed " + str(len(message)).encode(), reply
+        assert task.result() == message + b"|echoed " + str(len(message)).encode(), task.result()
 
 
 async def closing_a_listener() -> None:
@@ -129,32 +111,23 @@ async def shout(stream: net.TcpStream) -> None:
             assert error.partial == b""
 
 
-def blocking_lines_client(port: int, replies: list[bytes], done: porto.Event) -> None:
-    """A client that is not porto: lines sent in awkward pieces, then half-close and read all."""
-    try:
-        with socket.create_connection(("127.0.0.1", port)) as client:
-            for piece in (b"hel", b"lo\nwor", b"ld\nfra", b"me\nabcd", b"done\n"):
-                client.sendall(piece)
-            client.shutdown(socket.SHUT_WR)
-            reply = b""
-            while chunk := client.recv(4096):
-                reply += chunk
-            replies.append(reply)
-    finally:
-        done.set()
+async def lines_client(port: int) -> bytes:
+    """A client that sends lines in awkward pieces, then half-closes and reads all."""
+    async with await net.connect_tcp("127.0.0.1", port) as stream:
+        for piece in (b"hel", b"lo\nwor", b"ld\nfra", b"me\nabcd", b"done\n"):
+            await stream.write(piece)
+            await porto.sleep(0.001)  # let the server see the pieces apart
+        await stream.shutdown_write()
+        return await stream.read_to_end(limit=4096)
 
 
 async def serving_with_serve_tcp() -> None:
-    replies: list[bytes] = []
-    finished = porto.Event()
+    reply = b""
     async with porto.scope() as s:
         port = await s.start(net.serve_tcp, shout, "127.0.0.1")  # port 0: any free port
-        thread = threading.Thread(target=blocking_lines_client, args=(port, replies, finished))
-        thread.start()
-        await finished.wait()
-        thread.join()
+        reply = await lines_client(port)
         s.cancel()  # serve_tcp runs forever: cancelling the scope stops it and closes connections
-    assert replies == [b"HELLO\nWORLD\nabcdDONE\n"], replies
+    assert reply == b"HELLO\nWORLD\nabcdDONE\n", reply
 
 
 async def main() -> None:

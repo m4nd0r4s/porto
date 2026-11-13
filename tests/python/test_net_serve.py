@@ -1,6 +1,6 @@
 """``porto.net.serve_tcp`` (17-networking-tls-dns.md §1): one scope per connection, ``started``,
 ``max_connections``, handler errors that do not stop the server, and cancelling it. Over loopback
-with porto clients (``_connect_tcp_numeric``); I/O needs the Unix backends.
+with porto clients (``connect_tcp``); I/O needs the Unix backends.
 """
 
 import errno
@@ -29,7 +29,7 @@ def run(coro: Coroutine[Any, Any, Any]) -> Any:
 
 
 async def connect(port: int) -> net.TcpStream:
-    return await net._connect_tcp_numeric(LOOPBACK, port)  # pyright: ignore[reportPrivateUsage]
+    return await net.connect_tcp(LOOPBACK, port)
 
 
 class Serving:

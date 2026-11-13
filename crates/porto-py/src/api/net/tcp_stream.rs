@@ -433,11 +433,18 @@ impl TcpStream {
     }
 
     /// A TCP socket for `address`'s family, registered with this run's driver and connecting
-    /// to `address` (a numeric `(host, port)`): await `_finish_connect()` for the result.
-    /// What `porto.net.connect_tcp` builds on (szb.69), private until then.
+    /// to `address` (a numeric `(host, port)`), bound to `local_address` first when one is given
+    /// (the same shape, of the same family): await `_finish_connect()` for the result. What
+    /// `porto.net.connect_tcp` builds on.
     #[staticmethod]
-    fn _connecting(py: Python<'_>, address: &Bound<'_, PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (address, local_address=None))]
+    fn _connecting(
+        py: Python<'_>,
+        address: &Bound<'_, PyAny>,
+        local_address: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let address = sockaddr::from_py(address)?;
+        let local = local_address.map(sockaddr::from_py).transpose()?;
         let socket = Socket::new(
             Domain::from(i32::from(address.family())),
             Type::STREAM,
@@ -447,6 +454,9 @@ impl TcpStream {
         socket
             .set_nonblocking(true)
             .map_err(|error| os_error(&error))?;
+        if let Some(local) = local {
+            socket.bind(&local).map_err(|error| os_error(&error))?;
+        }
         let stream = Self::adopt(py, socket, None)?;
         start_connect(py, &stream.registration, &address)?;
         Ok(stream)

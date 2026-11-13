@@ -50,7 +50,7 @@ def message(connection: int, round_number: int) -> bytes:
 
 def test_a_hundred_porto_clients_get_their_1_kib_messages_back() -> None:
     async def client(port: int, connection: int) -> int:
-        async with await net._connect_tcp_numeric(LOOPBACK, port) as stream:  # pyright: ignore[reportPrivateUsage]
+        async with await net.connect_tcp(LOOPBACK, port) as stream:
             for round_number in range(ROUNDS):
                 sent = message(connection, round_number)
                 await stream.write(sent)
@@ -120,7 +120,7 @@ def test_messages_that_arrive_in_pieces_or_glued_together_are_echoed_whole() -> 
     async def main() -> tuple[bytes, bytes]:
         async with porto.scope() as s:
             port = await s.start(net.serve_tcp, echo, LOOPBACK)
-            async with await net._connect_tcp_numeric(LOOPBACK, port) as stream:  # pyright: ignore[reportPrivateUsage]
+            async with await net.connect_tcp(LOOPBACK, port) as stream:
                 first, second = message(1, 1), message(2, 2)
                 async with porto.scope() as sending:
                     sending.spawn(_dribble, stream, first)

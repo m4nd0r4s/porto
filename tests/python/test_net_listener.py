@@ -105,7 +105,7 @@ def test_accept_waits_for_a_connection() -> None:
 
             async def connect_later() -> None:
                 await porto.sleep(0.02)
-                client = await net._connect_tcp_numeric(LOOPBACK, listener.port)  # pyright: ignore[reportPrivateUsage]
+                client = await net.connect_tcp(LOOPBACK, listener.port)
                 async with client:
                     await client.write(b"late")
                     await porto.sleep(0.05)
@@ -239,7 +239,7 @@ def test_accepted_and_listening_sockets_are_close_on_exec() -> None:
 
     async def main() -> tuple[bool, bool, bool, bool]:
         async with await net.listen_tcp(LOOPBACK) as listener:
-            client = await net._connect_tcp_numeric(LOOPBACK, listener.port)  # pyright: ignore[reportPrivateUsage]
+            client = await net.connect_tcp(LOOPBACK, listener.port)
             async with client, await listener.accept() as accepted:
                 return (
                     close_on_exec(listener.fileno()),

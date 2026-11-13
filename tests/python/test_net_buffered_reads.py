@@ -29,7 +29,7 @@ def run(coro: Coroutine[Any, Any, Any]) -> Any:
 async def connected() -> tuple[net.TcpStream, net.TcpStream, net.TcpListener]:
     """A client, the stream the listener accepted for it, and the listener."""
     listener = await net.listen_tcp(LOOPBACK)
-    client = await net._connect_tcp_numeric(LOOPBACK, listener.port)  # pyright: ignore[reportPrivateUsage]
+    client = await net.connect_tcp(LOOPBACK, listener.port)
     server = await listener.accept()
     return client, server, listener
 
@@ -595,7 +595,7 @@ def test_reads_that_waited_and_gave_up_leave_no_storage_with_the_stream() -> Non
     async def main() -> tuple[int, int]:
         listener = await net.listen_tcp(LOOPBACK)
         async with listener:
-            clients = [await net._connect_tcp_numeric(LOOPBACK, listener.port) for _ in range(50)]  # pyright: ignore[reportPrivateUsage]
+            clients = [await net.connect_tcp(LOOPBACK, listener.port) for _ in range(50)]
             servers = [await listener.accept() for _ in range(50)]
             before = sum(row[3] for row in _core._buffer_pool_stats())  # pyright: ignore[reportPrivateUsage]
 

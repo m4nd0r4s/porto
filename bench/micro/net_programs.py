@@ -10,10 +10,10 @@ from the moment all connections are open to the moment the last echo arrived. So
 its own GIL and its own core, nothing but the server's speed limits the number as long as the
 generator is faster than the server (it is, by a wide margin: see the results), and the ratio of
 two servers' times is the ratio of their throughputs. The alternatives were worse: porto clients
-(``porto.net._connect_tcp_numeric``) in the same run would make the number half client; asyncio
+(``porto.net.connect_tcp``) in the same run would make the number half client; asyncio
 clients on the same loop would charge uvloop for its own client side, and no client at all in the
 server's process, in threads, would fight it for the GIL. Clients that are *not* in the server's
-run also keep the comparison honest where porto has no public ``connect_tcp`` yet (porto-szb.69).
+run also keep the comparison honest: every server faces the same generator.
 
 The servers, all echoing 1 KiB messages with the idiom of their library:
 

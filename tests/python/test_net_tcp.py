@@ -1,6 +1,6 @@
 """``porto.net.TcpStream`` (17-networking-tls-dns.md §1.1, 13-io-driver.md §5) over loopback.
 
-Clients are made with ``porto.net._connect_tcp_numeric`` (the core of ``connect_tcp``) or with
+Clients are made with ``porto.net.connect_tcp`` or with
 the standard library's sockets, the way a foreign peer would connect. Registering raw sockets
 needs the AFD backend on Windows, which is not written yet, so these tests run on Unix.
 """
@@ -34,7 +34,7 @@ def run(coro: Coroutine[Any, Any, Any]) -> Any:
 async def connected() -> tuple[net.TcpStream, net.TcpStream, net.TcpListener]:
     """A client, the stream the listener accepted for it, and the listener."""
     listener = await net.listen_tcp(LOOPBACK)
-    client = await net._connect_tcp_numeric(LOOPBACK, listener.port)  # pyright: ignore[reportPrivateUsage]
+    client = await net.connect_tcp(LOOPBACK, listener.port)
     server = await listener.accept()
     return client, server, listener
 
@@ -304,7 +304,7 @@ def test_a_refused_connection_is_a_connection_refused_error() -> None:
         port = listener.port
         await listener.aclose()
         with pytest.raises(ConnectionRefusedError) as caught:
-            await net._connect_tcp_numeric(LOOPBACK, port)  # pyright: ignore[reportPrivateUsage]
+            await net.connect_tcp(LOOPBACK, port)
         assert caught.value.errno == errno.ECONNREFUSED
 
     run(main())
@@ -479,7 +479,7 @@ def test_a_stream_of_an_earlier_run_is_refused_at_the_call() -> None:
 
         async def first() -> None:
             listener = await net.listen_tcp(LOOPBACK)
-            holder.append(await net._connect_tcp_numeric(LOOPBACK, listener.port))  # pyright: ignore[reportPrivateUsage]
+            holder.append(await net.connect_tcp(LOOPBACK, listener.port))
 
         run(first())
 

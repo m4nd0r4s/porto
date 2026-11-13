@@ -1,5 +1,5 @@
-"""TCP networking (17-networking-tls-dns.md §1): ``listen_tcp`` and ``serve_tcp``, and the
-``TcpListener`` and ``TcpStream`` they produce.
+"""TCP networking (17-networking-tls-dns.md §1): ``connect_tcp``, ``listen_tcp`` and ``serve_tcp``,
+and the ``TcpListener`` and ``TcpStream`` they produce.
 
 ```python
 import porto
@@ -46,11 +46,20 @@ from collections.abc import Awaitable, Callable
 from typing import NoReturn, cast
 
 from porto import _core
+from porto._connect import connect_tcp
 from porto._core import Semaphore, Started, TcpListener, TcpStream, scope
 from porto._dns import SockAddr, resolve
 from porto.errors import IncompleteReadError
 
-__all__ = ["SockAddr", "TcpListener", "TcpStream", "listen_tcp", "resolve", "serve_tcp"]
+__all__ = [
+    "SockAddr",
+    "TcpListener",
+    "TcpStream",
+    "connect_tcp",
+    "listen_tcp",
+    "resolve",
+    "serve_tcp",
+]
 
 _logger = logging.getLogger("porto.net")
 
@@ -84,23 +93,6 @@ async def listen_tcp(
             "leave tls=None and terminate TLS in front of the program, or wait for porto.tls"
         )
     return _core._listen_tcp(host, port, backlog, reuse_port, dual_stack)  # pyright: ignore[reportPrivateUsage]
-
-
-async def _connect_tcp_numeric(  # pyright: ignore[reportUnusedFunction]
-    host: str, port: int, *, nodelay: bool = True
-) -> TcpStream:
-    """Connects to a numeric address: the core of ``connect_tcp`` (name resolution and
-    Happy Eyeballs, porto-szb.69, build on it). Private until then."""
-    address: tuple[str, int] = (host, port)
-    stream = TcpStream._connecting(address)  # pyright: ignore[reportPrivateUsage]
-    try:
-        await stream._finish_connect()  # pyright: ignore[reportPrivateUsage]
-        if nodelay:
-            stream.set_nodelay(True)
-    except BaseException:
-        await stream.aclose()
-        raise
-    return stream
 
 
 async def serve_tcp(
