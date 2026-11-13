@@ -58,12 +58,14 @@ async def connected(kind: str, unix_path: str) -> tuple[Stream, Stream, Listener
 
 
 async def read_exactly(stream: abc.ByteStream, count: int) -> bytes:
-    data = b""
+    # A bytearray: `data += chunk` on bytes copies everything received so far, which over a
+    # socket that delivers 8 KiB at a time (macOS Unix sockets) made a 64 MiB read take 30 s.
+    data = bytearray()
     while len(data) < count:
         chunk = await stream.read(count - len(data))
         assert chunk, "the stream ended early"
         data += chunk
-    return data
+    return bytes(data)
 
 
 @pytest.fixture(params=KINDS)
