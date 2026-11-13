@@ -50,15 +50,25 @@ pub(crate) fn interpreter_is_finalizing() -> bool {
     unsafe { py_is_finalizing() != 0 }
 }
 
-/// `Py_IsFinalizing` is public from 3.13; 3.11 and 3.12 export the same query as
-/// `_Py_IsFinalizing` (`cpython/pylifecycle.h`).
+/// `Py_IsFinalizing` is public from 3.13; 3.11 and 3.12 have the same query as
+/// `_Py_IsFinalizing` (`cpython/pylifecycle.h`), which their Windows import libraries do not
+/// export.
 #[cfg(Py_3_13)]
 use ffi::Py_IsFinalizing as py_is_finalizing;
 
-#[cfg(not(Py_3_13))]
+#[cfg(all(not(Py_3_13), not(windows)))]
 unsafe extern "C" {
     #[link_name = "_Py_IsFinalizing"]
     fn py_is_finalizing() -> std::ffi::c_int;
+}
+
+/// Windows before 3.13: no finalizing query is exported, so this only sees the end of
+/// finalization (the interpreter no longer initialized). A worker detached at shutdown there
+/// may touch Python during the finalization itself (19 §1, the narrow window it documents).
+#[cfg(all(not(Py_3_13), windows))]
+unsafe fn py_is_finalizing() -> std::ffi::c_int {
+    // SAFETY: a plain query, callable from any thread, also after the interpreter ended.
+    std::ffi::c_int::from(unsafe { ffi::Py_IsInitialized() } == 0)
 }
 
 /// A Python reference owned by code that always runs attached (P1 a, b). Same size as `Py<T>`.
